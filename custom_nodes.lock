@@ -1,0 +1,13 @@
+{
+  "comfyui": {
+    "repository": "https://github.com/Comfy-Org/ComfyUI.git",
+    "ref": "v0.34.0",
+    "resolved_commit": "12d5279438bfefc058a269eae805ceab6047777f"
+  },
+  "optional_multigpu_node": {
+    "repository": "https://github.com/buqi-code/buqi-minimax-h3-multigpu.git",
+    "ref": "main",
+    "resolved_commit": "bce083929c135bdabd41679da3ddf6f409336ed3",
+    "purpose": "Optional H3 sequence/head sharding in ComfyUI; not installed by default because the replicated DiT exceeds the T4 safety profile."
+  }
+}

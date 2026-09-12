@@ -1,0 +1,103 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from kaggle_h3.bootstrap import (
+    comfy_launch_command,
+    configure_comfyui_model_paths,
+    ensure_github_checkout,
+    model_file_status,
+    required_model_files,
+    start_comfyui,
+)
+
+
+class BootstrapTests(unittest.TestCase):
+    def test_public_tunnel_mode_adds_explicit_cors_flag(self):
+        command = comfy_launch_command(
+            Path("/tmp/ComfyUI"),
+            8188,
+            listen_host="0.0.0.0",
+            enable_cors_header="*",
+        )
+        self.assertEqual(command[-2:], ["--enable-cors-header", "*"])
+
+    def test_external_model_tree_is_used_for_status_and_comfy_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            comfy_root = root / "ComfyUI"
+            models_root = root / "scratch" / "models"
+            for directory, filename in required_model_files("FL2VA").values():
+                path = models_root / directory / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"test")
+
+            status = model_file_status(comfy_root, "FL2VA", models_root=models_root)
+            self.assertTrue(status["all_present"])
+            self.assertTrue(all(item["path"].startswith(str(models_root)) for item in status["files"].values()))
+
+            result = configure_comfyui_model_paths(comfy_root, models_root)
+            self.assertEqual(result["status"], "written")
+            config = (comfy_root / "extra_model_paths.yaml").read_text(encoding="utf-8")
+            self.assertIn("base_path: " + str(models_root.parent).replace("\\", "/"), config)
+            self.assertIn("diffusion_models: models/diffusion_models/", config)
+            self.assertIn("text_encoders: models/text_encoders/", config)
+            self.assertIn("vae: models/vae/", config)
+
+    def test_github_checkout_dry_run_does_not_need_network(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "kaggle_h3_github"
+            result = ensure_github_checkout(
+                "https://github.com/example/kaggle_h3.git",
+                destination,
+                ref="main",
+                dry_run=True,
+            )
+        self.assertEqual(result["status"], "would_clone")
+        self.assertEqual(result["requested_ref"], "main")
+
+    def test_github_checkout_refuses_non_git_existing_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "kaggle_h3_github"
+            destination.mkdir()
+            (destination / "old.txt").write_text("preserve", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "non-empty path"):
+                ensure_github_checkout(
+                    "https://github.com/example/kaggle_h3.git", destination
+                )
+
+
+    def test_phase_launch_keeps_gpu_vae_opt_in_and_fallback_cpu_vae_explicit(self):
+        comfy_root = Path("/kaggle/working/ComfyUI")
+        phase_command = comfy_launch_command(
+            comfy_root,
+            8188,
+            visible_device_ids=[0, 1],
+        )
+        fallback_command = comfy_launch_command(
+            comfy_root,
+            8188,
+            visible_device_ids=[0],
+            cpu_vae=True,
+        )
+        self.assertNotIn("--cpu-vae", phase_command)
+        self.assertIn("--cpu-vae", fallback_command)
+        self.assertIn("--cuda-device", phase_command)
+        self.assertIn("0,1", phase_command)
+
+    def test_dry_run_records_two_gpu_visibility_for_comfyui(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result = start_comfyui(
+                Path(temporary) / "ComfyUI",
+                execution_plan={"visible_device_ids": [0, 1]},
+                log_dir=Path(temporary) / "logs",
+                dry_run=True,
+            )
+        self.assertEqual(result["cuda_visible_devices"], "0,1")
+        self.assertEqual(result["visible_device_ids"], [0, 1])
+        cuda_index = result["command"].index("--cuda-device")
+        self.assertEqual(result["command"][cuda_index + 1], "0,1")
+
+
+if __name__ == "__main__":
+    unittest.main()

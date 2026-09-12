@@ -1,0 +1,5 @@
+requests>=2.31,<3
+psutil>=5.9,<7
+huggingface_hub>=0.24,<1
+# Native phase-aware ComfyUI H3 dispatch uses Accelerate at generation time.
+accelerate>=1.8,<2

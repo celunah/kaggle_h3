@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kaggle_h3"
+version = "0.1.0"
+description = "Reusable MiniMax H3 Kaggle/ComfyUI orchestration helpers"
+requires-python = ">=3.10"
+dependencies = [
+  "requests>=2.31,<3",
+  "psutil>=5.9,<7",
+  "huggingface_hub>=0.24,<1",
+  "accelerate>=1.8,<2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

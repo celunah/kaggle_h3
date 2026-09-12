@@ -1,0 +1,5 @@
+# Optional experimental backend. Install this in addition to
+# requirements-kaggle.txt when a real Diffusers block-dispatch run is desired.
+accelerate>=1.8,<2
+diffusers>=0.35.1
+transformers>=4.50,<6

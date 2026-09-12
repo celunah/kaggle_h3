@@ -1,0 +1,22 @@
+# Kaggle/runtime state
+ComfyUI/
+results/
+logs/
+*.log
+.env
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Downloaded model material must remain outside GitHub.
+*.safetensors
+*.ckpt
+*.pth
+*.bin
+models/
+minimax-h3-models/
