@@ -1,6 +1,12 @@
+import sys
+import types
 import unittest
+from unittest.mock import patch
 
 from kaggle_h3.layer_sharding import (
+    _install_synchronous_comfy_quantized_copies,
+    _move_h3_arguments_synchronously,
+    _synchronize_h3_transfer,
     find_dispatchable_layers,
     find_dispatchable_text_encoder_layers,
     inspect_dispatched_map,
@@ -60,6 +66,88 @@ class _FakeModule:
 
 
 class LayerShardingTests(unittest.TestCase):
+    def test_activation_transfer_barrier_orders_source_then_destination(self):
+        import torch
+
+        with patch("kaggle_h3.layer_sharding._cuda_devices_in_tree", return_value=[torch.device("cuda:0")]), patch(
+            "kaggle_h3.layer_sharding._synchronize_h3_device"
+        ) as synchronize:
+            _synchronize_h3_transfer(object(), torch.device("cuda:1"))
+
+        self.assertEqual(
+            synchronize.call_args_list,
+            [
+                ((torch.device("cuda:0"),), {}),
+                ((torch.device("cuda:1"),), {}),
+            ],
+        )
+
+    def test_activation_arguments_use_blocking_copy_and_consumer_barrier(self):
+        import torch
+
+        tensor = torch.ones((1, 2), dtype=torch.float32)
+        with patch("kaggle_h3.layer_sharding._synchronize_h3_device") as synchronize, patch(
+            "kaggle_h3.layer_sharding._move_tensor_tree",
+            side_effect=lambda value, _device, **kwargs: value,
+        ) as move:
+            args, kwargs = _move_h3_arguments_synchronously(
+                (tensor,), {"conditioning": tensor}, torch.device("cuda:1")
+            )
+
+        self.assertIs(args[0], tensor)
+        self.assertIs(kwargs["conditioning"], tensor)
+        self.assertEqual(move.call_count, 2)
+        for call in move.call_args_list:
+            self.assertFalse(call.kwargs["non_blocking"])
+        self.assertEqual(synchronize.call_count, 2)
+
+    def test_comfy_quantized_copy_wrappers_force_blocking_and_restore(self):
+        import torch
+
+        comfy = types.ModuleType("comfy")
+        comfy.__path__ = []
+        management = types.ModuleType("comfy.model_management")
+        calls = []
+
+        def cast_to(*args, **kwargs):
+            calls.append(("cast_to", args, kwargs))
+            return args[0] if args else kwargs["weight"]
+
+        def cast_to_gathered(*args, **kwargs):
+            calls.append(("cast_to_gathered", args, kwargs))
+            return None
+
+        management.cast_to = cast_to
+        management.cast_to_gathered = cast_to_gathered
+        with patch.dict(
+            sys.modules,
+            {"comfy": comfy, "comfy.model_management": management},
+        ):
+            handles = _install_synchronous_comfy_quantized_copies(management)
+            try:
+                source = torch.ones((2,), dtype=torch.float32)
+                management.cast_to(
+                    source,
+                    device="cpu",
+                    non_blocking=True,
+                    stream=None,
+                )
+                management.cast_to_gathered(
+                    [source],
+                    torch.zeros_like(source),
+                    non_blocking=True,
+                    stream=None,
+                )
+            finally:
+                for handle in handles:
+                    handle.remove()
+
+        self.assertEqual([item[0] for item in calls], ["cast_to", "cast_to_gathered"])
+        self.assertFalse(calls[0][2]["non_blocking"])
+        self.assertFalse(calls[1][2]["non_blocking"])
+        self.assertIs(management.cast_to, cast_to)
+        self.assertIs(management.cast_to_gathered, cast_to_gathered)
+
     def test_discovers_top_level_h3_blocks(self):
         token_refiner = _FakeModule([_FakeModule(parameter_bytes=1)] * 2)
         blocks = _FakeModule([_FakeModule(parameter_bytes=100)] * 4)

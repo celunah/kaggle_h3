@@ -41,8 +41,9 @@ The final Kaggle report must be read from the run manifest. It must not claim bo
 - `workflows/kaggle_h3_ref2va.json`: reference-conditioned API-format graph.
 - `workflows/kaggle_h3_fl2va.json`: first/last-frame API-format graph.
 - `workflows/kaggle_h3_t2va.json`: text-to-video/audio API-format graph.
-- `workflows/kaggle_h3_turbo_smoke.json`: Ref2VA 360p/16:9, 5-second, 4-step adapter smoke graph using generic reference placeholders.
-- `custom_nodes/kaggle_h3_adapters.py`: the seconds/preset Ref2VA conditioner, explicit H3 diffusion/text-encoder/VAE loaders, a conditioning-complete phase barrier, `H3 Adapter Stack`, phase-aware H3 sampler, and GPU0/GPU1 audio/video VAE decode nodes.
+- `workflows/kaggle_h3_turbo_smoke.json`: Ref2VA 360p/16:9, 5-second, 4-step adapter smoke graph using the checked-in character and scene reference images.
+- `custom_nodes/kaggle_h3_adapters.py`: the auto-resolved smoke reference loader, seconds/preset Ref2VA conditioner, just-in-time diffusion auto-loader, explicit H3 text-encoder/VAE loaders, a conditioning-complete phase barrier, `H3 Adapter Stack`, phase-aware H3 sampler, and GPU0/GPU1 audio/video VAE decode nodes.
+- `src/kaggle_h3/model_manager.py`: pinned, one-variant-at-a-time H3 diffusion download and exact inactive-checkpoint removal used by the ComfyUI loader.
 - `src/kaggle_h3/ref2va.py`: shared Ref2VA seconds, 17*k+5 frame alignment, and 32-pixel canvas-preset rules.
 - `src/kaggle_h3/phase_runtime.py`: phase orchestration, automatic Qwen language-layer dispatch/release, Accelerate dispatch verification, GPU/RAM monitoring, transformer release, and per-VAE device placement.
 - `custom_nodes/kaggle_h3_adapter_catalog.json`: pinned built-in adapter metadata and registration surface.
@@ -63,7 +64,7 @@ without relying on their internal node IDs.
 2. Enable Internet only if ComfyUI, Python packages, or public Hugging Face model files need to be downloaded. Public files do not require a token. If a gated mirror is used, create a Kaggle secret named `HF_TOKEN`; the notebook reads it without printing it. The dependency cell installs the optional layer-dispatch stack by default; set `INSTALL_LAYER_SHARDED_BACKEND = False` there for a ComfyUI-only session.
 3. Run the dependency and hardware cells. They print every detected CUDA device, model capacity, CPU RAM, and all backend decisions, including the explicit fallback.
 4. The notebook performs the hardware/backend preflight automatically. Its direct ComfyUI frontend exposes both visible T4s, sets `KAGGLE_H3_PHASE_SHARDING=auto`, and lets the custom H3 loader/barrier apply the phase-aware two-GPU path. The loader and sampler refuse to disguise a one-GPU map as sharded; set `KAGGLE_H3_PHASE_SHARDING=off` only for the explicit fallback.
-5. The startup cell starts ComfyUI, clones the pinned checkout when needed, installs its `requirements.txt`, downloads the active H3 diffusion partition into `/kaggle/tmp/minimax-h3-models`, configures ComfyUI to read that external model tree, and installs the H3 adapter node. It does not construct or queue a generation request. The entrypoint's `ACTIVE_H3_MODE` defaults to `Ref2VA`; change it to `FL2VA` (which also serves T2VA) and rerun the cell when switching modes. The inactive exact diffusion checkpoint is pruned so the session stays below the scratch soft limit. `/kaggle/tmp` is scratch storage and must be repopulated after a new session.
+5. The startup cell starts ComfyUI, clones the pinned checkout when needed, installs its `requirements.txt`, downloads only the shared H3 text/audio/video assets into `/kaggle/tmp/minimax-h3-models`, configures ComfyUI to read that external model tree, installs the H3 adapter node, and stages the smoke references into ComfyUI's `input/` directory. The smoke graph also uses the package's semantic reference loader, so it can resolve the checked-in images from either the project checkout or ComfyUI's `input/` directory. It does not pre-download a diffusion checkpoint, construct a workflow, or queue a request. Choose `FL2VA` or `Ref2VA` in the `Kaggle H3 | Diffusion Auto Loader` node; that node removes only the other known H3 diffusion filename and streams the selected pinned checkpoint when the workflow executes. `/kaggle/tmp` is scratch storage and must be repopulated after a new session.
 6. ComfyUI is started on internal port `8188` with `0.0.0.0` binding for the notebook environment. When two GPUs are in the preflight plan, the launcher explicitly sets `CUDA_VISIBLE_DEVICES=0,1` and passes `--cuda-device 0,1`; it then checks `/system_stats` and stops before loading a workflow if ComfyUI exposes fewer than two devices. The startup output must therefore show both devices and roughly 29 GiB total VRAM, rather than only `cuda:0`. If it reports one device, stop the old ComfyUI process and rerun the updated startup cell; changing environment variables cannot change an already-running process. The notebook reloads the bootstrap module when that cell is rerun, so a full kernel reset is not required unless an older ComfyUI child remains alive. The notebook then prints the local runtime address and leaves public exposure optional. To test remote access, run the optional public-tunnel cell in the entrypoint; it restarts ComfyUI with `--enable-cors-header *` for the dynamic tunnel hostname, downloads `cloudflared` into `/kaggle/tmp`, starts a temporary tunnel to `http://127.0.0.1:8188`, and prints the generated URL if Kaggle permits it. This public mode disables ComfyUI's origin protection, so anyone with the URL can access the unauthenticated instance. The phase sampler prints an observed map and per-device peak memory during each generation.
 7. Build or import an H3 graph in the web interface. For Turbo, use `H3 Adapter Stack` followed by `H3 Turbo Sampler`; select the matching 4-step or 8-step adapter and sampler configuration. The node downloads its selected LoRA into `ComfyUI/models/loras/` on first use.
 
@@ -81,7 +82,9 @@ seconds. A nominal 720p/16:9 request becomes 1280x704 because H3 requires a
 The web interface remains the ComfyUI workflow frontend. The direct graphs
 use `KaggleH3TurboSampler` even for base H3 so transformer dispatch/release is
 owned by one node. Native workflows now use `KaggleH3ShardedDiffusionLoader`,
-which leaves the H3 model CPU-owned until `KaggleH3PhaseDispatch` runs after
+which selects and downloads one H3 diffusion variant through ComfyUI's
+configured model tree, then leaves the H3 model CPU-owned until
+`KaggleH3PhaseDispatch` runs after
 conditioning. That barrier applies and verifies the intact-block map across
 GPU0/GPU1, while the sampler suppresses ComfyUI's subsequent GPU0-only reload.
 `KaggleH3TextEncoderLoader` places the text encoder on GPU0 for conditioning;
@@ -102,7 +105,7 @@ kaggle_h3/results/<run_id>/telemetry_attempt_01.jsonl
 
 ## Model and ComfyUI files
 
-The default ComfyUI profile pins the `v0.34.0` ComfyUI release and downloads the selected diffusion mode plus the shared video/audio VAE and Qwen text encoder from `Comfy-Org/MiniMax-H3`. The files are stored under `/kaggle/tmp/minimax-h3-models/models` so the 20 GiB persistent `/kaggle/working` output limit is not consumed. Keeping one diffusion partition at a time is intentional: storing both variants, shared files, and the Turbo adapter is about 61 GiB before cache overhead.
+The default ComfyUI profile pins the `v0.34.0` ComfyUI release and downloads the shared video/audio VAE and Qwen text encoder from `Comfy-Org/MiniMax-H3`. The files are stored under `/kaggle/tmp/minimax-h3-models/models` so the 20 GiB persistent `/kaggle/working` output limit is not consumed. The diffusion checkpoint is intentionally deferred to the ComfyUI loader. Only one of the two large diffusion variants is present at a time; switching the loader selection removes the other exact known H3 filename before downloading the replacement.
 
 - `diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors` for Ref2VA;
 - `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` for FL2VA/T2VA;
@@ -123,6 +126,7 @@ LightX2V ComfyUI safetensors pinned to HF revision
 - FL2VA/T2VA Turbo 4-step v1.0 768p: 4 NFE, Euler, video/audio shifts `6/3`.
 - FL2VA/T2VA Turbo 8-step v1.0 768p: 8 NFE, Euler, video/audio shifts `6/3`.
 - Ref2VA Turbo 4-step v0.1: 4 NFE, Euler, video/audio shifts `12/3`.
+- Ref2VA Turbo 8-step v1.0 768p: 8 NFE, Euler, video/audio shifts `6/3`.
 
 `H3 Adapter Stack` detects the H3 variant from the incoming Comfy model,
 resolves T2VA/FL2VA/Ref2VA from H3 conditioning metadata when the optional
@@ -203,10 +207,14 @@ that hook reconstructs `comfy_kitchen.QuantizedTensor` with an unsupported
 ComfyUI's native quantized `_apply` path, CPU/disk-tier blocks remain
 CPU-owned, and activation arguments are routed to the assigned GPU. The
 quantized final/output path stays on the primary GPU so its internal dtype
-conversion never crosses a live device boundary. H3 activation and
-quantized-weight transfers are synchronous, and the launcher disables
-`cudaMallocAsync` for this phase to avoid allocator/stream races. The
-report records both the physical parameter map and the actual execution map.
+conversion never crosses a live device boundary. The router uses deliberate
+CUDA barriers at block outputs, activation transfers, final-layer handoff,
+and ComfyUI's `cast_to`/`cast_to_gathered` quantized-weight copy boundaries;
+copies retain ComfyUI's native stream/allocation path but force
+`non_blocking=False` and synchronize the producer and consumer devices. The
+launcher also disables `cudaMallocAsync` for this phase to avoid
+allocator/stream races. The report records both the physical parameter map
+and the actual execution map.
 The sampler preserves that map by filtering the already-dispatched H3 model
 out of ComfyUI's subsequent global `load_models_gpu()` call. A lightweight
 monitor logs peak used/allocated/reserved memory for both GPUs and minimum CPU

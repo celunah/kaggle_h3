@@ -2,12 +2,12 @@
   "unet": {
     "class_type": "KaggleH3ShardedDiffusionLoader",
     "inputs": {
-      "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "model_variant": "FL2VA",
       "weight_dtype": "default",
       "gpu_0": 0,
       "gpu_1": 1
     },
-    "_meta": {"title": "Kaggle H3 | Diffusion Shard Loader (GPU0 + GPU1)"}
+    "_meta": {"title": "Kaggle H3 | Diffusion Auto Loader (FL2VA; replaces inactive checkpoint)"}
   },
   "clip": {
     "class_type": "KaggleH3TextEncoderLoader",

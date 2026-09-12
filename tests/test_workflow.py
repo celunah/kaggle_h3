@@ -74,9 +74,11 @@ class WorkflowTests(unittest.TestCase):
     def test_native_h3_workflow_uses_dtype_safe_video_decode_node(self):
         workflow = build_workflow(H3Request("decode smoke"))
         self.assertTrue(all(node.get("_meta", {}).get("title") for node in workflow.values()))
-        self.assertEqual(workflow["unet"]["_meta"]["title"], "Kaggle H3 | Diffusion Shard Loader (GPU0 + GPU1)")
+        self.assertIn("Diffusion Auto Loader", workflow["unet"]["_meta"]["title"])
         self.assertEqual(workflow["phase"]["_meta"]["title"], "Kaggle H3 | Transformer Dispatch Barrier")
         self.assertEqual(workflow["unet"]["class_type"], "KaggleH3ShardedDiffusionLoader")
+        self.assertEqual(workflow["unet"]["inputs"]["model_variant"], "FL2VA")
+        self.assertNotIn("unet_name", workflow["unet"]["inputs"])
         self.assertEqual(workflow["unet"]["inputs"]["gpu_0"], 0)
         self.assertEqual(workflow["unet"]["inputs"]["gpu_1"], 1)
         self.assertEqual(workflow["clip"]["class_type"], "KaggleH3TextEncoderLoader")
@@ -95,7 +97,15 @@ class WorkflowTests(unittest.TestCase):
         workflow = json.loads((root / "workflows" / "kaggle_h3_turbo_smoke.json").read_text(encoding="utf-8"))
         self.assertTrue(all(node.get("_meta", {}).get("title") for node in workflow.values()))
         self.assertEqual(workflow["sample"]["_meta"]["title"], "Kaggle H3 | Turbo Sampler (4 steps)")
-        self.assertIn("ref2va", workflow["unet"]["inputs"]["unet_name"])
+        self.assertEqual(workflow["unet"]["inputs"]["model_variant"], "Ref2VA")
+        self.assertEqual(
+            workflow["character_reference"]["class_type"],
+            "KaggleH3SmokeReference",
+        )
+        self.assertEqual(
+            workflow["scene_reference"]["class_type"],
+            "KaggleH3SmokeReference",
+        )
         self.assertEqual(workflow["h3"]["class_type"], "KaggleH3Ref2VAConditioning")
         self.assertEqual(workflow["h3_adapter"]["inputs"]["model_variant"], "ref2va")
         self.assertEqual(workflow["h3_adapter"]["inputs"]["adapter_1"], "h3_ref2va_turbo_4step_v0_1")

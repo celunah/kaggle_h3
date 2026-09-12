@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .bootstrap import COMMON_MODEL_FILES, MODE_MODEL_FILES
 from .ref2va import quality_mode_to_ref2va_preset
@@ -44,7 +43,7 @@ WORKFLOW_REGISTRY: dict[str, dict[str, str]] = {
 }
 
 WORKFLOW_NODE_LABELS: dict[str, str] = {
-    "unet": "Kaggle H3 | Diffusion Shard Loader (GPU0 + GPU1)",
+    "unet": "Kaggle H3 | Diffusion Auto Loader (select FL2VA or Ref2VA)",
     "clip": "Kaggle H3 | Text Encoder (GPU0)",
     "vae_video": "Kaggle H3 | Video VAE (GPU1)",
     "vae_audio": "Kaggle H3 | Audio VAE (GPU0)",
@@ -337,18 +336,22 @@ def build_workflow(
     width, height = dimensions(request)
     length = frame_length(request)
     nodes: dict[str, Any] = {}
+    use_explicit_h3_loaders = loader == "native"
     unet_inputs: dict[str, Any] = {
-        "unet_name": _model_name(canonical_mode),
         "weight_dtype": "default",
     }
-    use_explicit_h3_loaders = loader == "native"
     if loader == "comfyui_sp":
+        unet_inputs["unet_name"] = _model_name(canonical_mode)
         unet_inputs.update({"world_size": 2, "devices": "auto"})
         unet_class = "MiniMaxH3SPUNETLoader"
     elif use_explicit_h3_loaders:
+        # The custom loader owns the mutually exclusive diffusion checkpoint:
+        # it downloads the selected variant only when this graph executes.
+        unet_inputs["model_variant"] = "Ref2VA" if canonical_mode == "Ref2VA" else "FL2VA"
         unet_inputs.update({"gpu_0": int(device_ids[0]), "gpu_1": int(device_ids[1])})
         unet_class = "KaggleH3ShardedDiffusionLoader"
     else:
+        unet_inputs["unet_name"] = _model_name(canonical_mode)
         unet_class = "UNETLoader"
     nodes["unet"] = {"class_type": unet_class, "inputs": unet_inputs}
     nodes["clip"] = {
@@ -576,6 +579,12 @@ def build_workflow(
                 "Kaggle H3 | Ref2VA Conditioning (Seconds + Presets)"
                 if canonical_mode == "Ref2VA"
                 else f"Kaggle H3 | {canonical_mode} Conditioning"
+            )
+        elif node_id == "unet" and use_explicit_h3_loaders:
+            selected_variant = "Ref2VA" if canonical_mode == "Ref2VA" else "FL2VA"
+            label = (
+                "Kaggle H3 | Diffusion Auto Loader "
+                f"({selected_variant}; replaces inactive checkpoint)"
             )
         node["_meta"] = {"title": label}
     return nodes

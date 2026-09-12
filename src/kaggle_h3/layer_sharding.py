@@ -705,7 +705,6 @@ def plan_layer_device_map(
     device_map: dict[str, int | str] = {"": "cpu"}
     loads = {device_id: 0 for device_id in ids}
     cpu_used = 0
-    group_prefix = f"{group.container_path}." if group.container_path else ""
 
     # Place all non-block top-level components. A hierarchical root entry
     # covers nested parameters that do not have a more specific assignment.
@@ -876,6 +875,112 @@ def is_comfy_quantized_model(model: Any) -> bool:
     return False
 
 
+def _synchronize_h3_device(device: Any) -> None:
+    """Wait for every CUDA stream on one device before a phase boundary."""
+
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return
+
+    try:
+        resolved = torch.device(device)
+    except (TypeError, RuntimeError, ValueError):
+        return
+    if resolved.type == "cuda":
+        torch.cuda.synchronize(resolved)
+
+
+def _cuda_devices_in_tree(value: Any) -> list[Any]:
+    """Return CUDA tensor devices in traversal order without copying values."""
+
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return []
+    devices: list[Any] = []
+    seen: set[int] = set()
+
+    def visit(current: Any) -> None:
+        if isinstance(current, torch.Tensor):
+            device = getattr(current, "device", None)
+            if device is not None and getattr(device, "type", "") == "cuda":
+                label = str(device)
+                if label not in {str(item) for item in devices}:
+                    devices.append(device)
+            return
+        if current is None or isinstance(current, (str, bytes, int, float, bool)):
+            return
+        identity = id(current)
+        if identity in seen:
+            return
+        seen.add(identity)
+        if isinstance(current, dict):
+            for item in current.values():
+                visit(item)
+        elif isinstance(current, (tuple, list)):
+            for item in current:
+                visit(item)
+
+    visit(value)
+    return devices
+
+
+def _synchronize_h3_transfer(value: Any, target: Any) -> None:
+    """Synchronize producers and the destination before a routed copy."""
+
+    try:
+        import torch  # type: ignore
+
+        target_device = torch.device(target)
+    except Exception:
+        return
+    source_devices = _cuda_devices_in_tree(value)
+    synchronized = {str(device) for device in source_devices}
+    for source in source_devices:
+        _synchronize_h3_device(source)
+    if target_device.type == "cuda" and str(target_device) not in synchronized:
+        _synchronize_h3_device(target_device)
+
+
+def _move_h3_tree_synchronously(value: Any, device: Any) -> Any:
+    """Move one routed value with explicit producer/copy/consumer barriers."""
+
+    _synchronize_h3_transfer(value, device)
+    moved = _move_tensor_tree(value, device, non_blocking=False)
+    _synchronize_h3_device(device)
+    return moved
+
+
+def _move_h3_arguments_synchronously(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    device: Any,
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Route a module call as one synchronized activation boundary."""
+
+    _synchronize_h3_transfer((args, kwargs), device)
+    moved_args = tuple(_move_tensor_tree(value, device, non_blocking=False) for value in args)
+    moved_kwargs = _move_tensor_tree(kwargs, device, non_blocking=False)
+    _synchronize_h3_device(device)
+    return moved_args, moved_kwargs
+
+
+def _synchronize_h3_values(*values: Any) -> None:
+    """Synchronize every CUDA device represented by arbitrary values."""
+
+    devices: list[Any] = []
+    seen: set[str] = set()
+    for value in values:
+        for device in _cuda_devices_in_tree(value):
+            label = str(device)
+            if label not in seen:
+                seen.add(label)
+                devices.append(device)
+    for device in devices:
+        _synchronize_h3_device(device)
+
+
 def _move_tensor_tree(value: Any, device: Any, *, non_blocking: bool = False) -> Any:
     """Move H3 arguments without touching model parameters.
 
@@ -947,6 +1052,39 @@ def _remove_handles(handles: Iterable[Any]) -> None:
                 remove()
             except Exception:
                 pass
+
+
+def _positional_or_keyword(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    index: int,
+    name: str,
+    default: Any = None,
+) -> Any:
+    """Read a value from a Comfy helper without assuming call syntax."""
+
+    if len(args) > index:
+        return args[index]
+    return kwargs.get(name, default)
+
+
+def _force_keyword_or_positional(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    index: int,
+    name: str,
+    value: Any,
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Replace a positional or keyword argument while preserving its style."""
+
+    updated_args = list(args)
+    updated_kwargs = dict(kwargs)
+    if len(updated_args) > index:
+        updated_args[index] = value
+        updated_kwargs.pop(name, None)
+    else:
+        updated_kwargs[name] = value
+    return tuple(updated_args), updated_kwargs
 
 
 class _AttributeRestoreHandle:
@@ -1041,7 +1179,9 @@ def dispatch_h3_text_encoder(
             planned_residency = str(item["device"])
             if planned_residency.startswith("cuda:"):
                 try:
+                    _synchronize_h3_device(target)
                     module.to(target)
+                    _synchronize_h3_device(target)
                 except Exception as exc:
                     raise H3LayerShardingError(
                         f"Could not place text-encoder layer {path!r} on {target}: {exc}"
@@ -1058,14 +1198,15 @@ def dispatch_h3_text_encoder(
             ) -> tuple[tuple[Any, ...], dict[str, Any]]:
                 if _planned == "cpu" or _planned == "disk":
                     try:
+                        _synchronize_h3_device(_target)
                         current.to(_target)
+                        _synchronize_h3_device(_target)
                     except Exception as exc:
                         raise H3LayerShardingError(
                             f"Could not stage text-encoder layer {_path!r} on {_target}: {exc}"
                         ) from exc
                 return (
-                    tuple(_move_tensor_tree(value, _target) for value in args),
-                    _move_tensor_tree(kwargs, _target),
+                    _move_h3_arguments_synchronously(args, kwargs, _target)
                 )
 
             register_pre_hook(module, route_layer_inputs)
@@ -1080,6 +1221,7 @@ def dispatch_h3_text_encoder(
                     _path=path,
                 ) -> Any:
                     try:
+                        _synchronize_h3_device(_observed_module_device(current))
                         current.to(torch.device("cpu"))
                     except Exception as exc:
                         raise H3LayerShardingError(
@@ -1114,10 +1256,7 @@ def dispatch_h3_text_encoder(
                     *,
                     _target=primary,
                 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-                    return (
-                        tuple(_move_tensor_tree(value, _target) for value in args),
-                        _move_tensor_tree(kwargs, _target),
-                    )
+                    return _move_h3_arguments_synchronously(args, kwargs, _target)
 
                 register_pre_hook(sibling, route_boundary)
 
@@ -1135,6 +1274,73 @@ def dispatch_h3_text_encoder(
         "hook_count": len(handles),
     }
     return model, plan, handles
+
+
+def _install_synchronous_comfy_quantized_copies(
+    comfy_model_management: Any,
+) -> list[Any]:
+    """Install scoped barriers around ComfyUI's quantized weight copies.
+
+    ComfyUI uses an offload stream for both ordinary ``cast_to`` copies and
+    gathered/VBAR copies.  The stream is still useful for choosing the native
+    allocation path, but H3 must not let a subsequent block observe a copy
+    that is still queued on that stream.  Keep the stream argument intact and
+    add a full device barrier only around these copy calls.
+    """
+
+    handles: list[Any] = []
+
+    cast_to = getattr(comfy_model_management, "cast_to", None)
+    if callable(cast_to):
+
+        def synchronous_cast_to(*args: Any, **kwargs: Any) -> Any:
+            weight = _positional_or_keyword(args, kwargs, 0, "weight")
+            device = _positional_or_keyword(args, kwargs, 2, "device")
+            destination = _positional_or_keyword(args, kwargs, 6, "r")
+            stream = _positional_or_keyword(args, kwargs, 5, "stream")
+            _synchronize_h3_values(weight, destination)
+            _synchronize_h3_device(device)
+            _synchronize_h3_device(getattr(stream, "device", None))
+            copy_args, copy_kwargs = _force_keyword_or_positional(
+                args, kwargs, 3, "non_blocking", False
+            )
+            result = cast_to(*copy_args, **copy_kwargs)
+            _synchronize_h3_values(result)
+            _synchronize_h3_device(device)
+            _synchronize_h3_device(getattr(stream, "device", None))
+            return result
+
+        comfy_model_management.cast_to = synchronous_cast_to
+        handles.append(
+            _AttributeRestoreHandle(comfy_model_management, "cast_to", cast_to)
+        )
+
+    cast_to_gathered = getattr(comfy_model_management, "cast_to_gathered", None)
+    if callable(cast_to_gathered):
+
+        def synchronous_cast_to_gathered(*args: Any, **kwargs: Any) -> Any:
+            tensors = _positional_or_keyword(args, kwargs, 0, "tensors")
+            destination = _positional_or_keyword(args, kwargs, 1, "r")
+            stream = _positional_or_keyword(args, kwargs, 3, "stream")
+            destination_2 = _positional_or_keyword(args, kwargs, 4, "r2")
+            _synchronize_h3_values(tensors, destination, destination_2)
+            _synchronize_h3_device(getattr(stream, "device", None))
+            copy_args, copy_kwargs = _force_keyword_or_positional(
+                args, kwargs, 2, "non_blocking", False
+            )
+            result = cast_to_gathered(*copy_args, **copy_kwargs)
+            _synchronize_h3_values(destination, destination_2, result)
+            _synchronize_h3_device(getattr(stream, "device", None))
+            return result
+
+        comfy_model_management.cast_to_gathered = synchronous_cast_to_gathered
+        handles.append(
+            _AttributeRestoreHandle(
+                comfy_model_management, "cast_to_gathered", cast_to_gathered
+            )
+        )
+
+    return handles
 
 
 def _install_comfy_quantized_router(
@@ -1184,9 +1390,9 @@ def _install_comfy_quantized_router(
 
     # ComfyUI calculates this helper inside cast_bias_weight() immediately
     # before it copies a quantized weight. Disable non-blocking transfers for
-    # the lifetime of this phase so a Comfy offload stream cannot race a
-    # cross-device QuantizedTensor copy. The original helper is restored by
-    # the same cleanup path as the forward hooks.
+    # the lifetime of this phase and wrap both copy entry points so an offload
+    # stream cannot race a cross-device QuantizedTensor copy. The originals
+    # are restored by the same cleanup path as the forward hooks.
     try:
         import comfy.model_management as comfy_model_management  # type: ignore
 
@@ -1207,6 +1413,9 @@ def _install_comfy_quantized_router(
                     non_blocking_helper,
                 )
             )
+        handles.extend(
+            _install_synchronous_comfy_quantized_copies(comfy_model_management)
+        )
     except Exception:
         # The dependency-light planner and unit tests do not provide ComfyUI.
         pass
@@ -1227,7 +1436,10 @@ def _install_comfy_quantized_router(
             move_error = None
             if isinstance(target, int):
                 try:
+                    _synchronize_h3_device(residency_before)
+                    _synchronize_h3_device(execution_device)
                     module.to(torch.device(execution_device))
+                    _synchronize_h3_device(execution_device)
                     residency_after = _observed_module_device(module)
                 except Exception as exc:
                     move_error = str(exc)
@@ -1260,10 +1472,7 @@ def _install_comfy_quantized_router(
                 _target=execution_device,
             ) -> tuple[tuple[Any, ...], dict[str, Any]]:
                 target_device = torch.device(_target)
-                return (
-                    tuple(_move_tensor_tree(item, target_device) for item in args),
-                    _move_tensor_tree(kwargs, target_device),
-                )
+                return _move_h3_arguments_synchronously(args, kwargs, target_device)
 
             try:
                 handle = register(route_inputs, with_kwargs=True)
@@ -1271,11 +1480,44 @@ def _install_comfy_quantized_router(
                 # PyTorch versions before the kwargs-aware hook API still
                 # cover H3's positional activation/timestep arguments.
                 handle = register(
-                    lambda _module, args, _target=execution_device: tuple(
-                        _move_tensor_tree(item, torch.device(_target)) for item in args
-                    )
+                    lambda _module, args, _target=execution_device: _move_h3_arguments_synchronously(
+                        args, {}, torch.device(_target)
+                    )[0]
                 )
             handles.append(handle)
+
+            register_output = getattr(module, "register_forward_hook", None)
+            if not callable(register_output):
+                raise H3LayerShardingError(
+                    f"Mapped H3 module {path!r} does not support forward hooks"
+                )
+
+            def synchronize_module_output(
+                _module: Any,
+                _args: tuple[Any, ...],
+                _kwargs: dict[str, Any],
+                output: Any,
+                *,
+                _target=execution_device,
+            ) -> Any:
+                # This is the deliberate block/component barrier. It replaces
+                # the accidental synchronization caused by scanning every
+                # nested operation with the finite-value diagnostics enabled.
+                _synchronize_h3_device(_target)
+                return output
+
+            try:
+                handles.append(
+                    register_output(synchronize_module_output, with_kwargs=True)
+                )
+            except TypeError:
+                handles.append(
+                    register_output(
+                        lambda _module, _args, output, _target=execution_device: (
+                            _synchronize_h3_device(_target) or output
+                        )
+                    )
+                )
 
             # MiniMaxH3Model applies masks and the audio sigma conversion after
             # _forward returns.  Those tensors are owned by the sampler's
@@ -1303,9 +1545,8 @@ def _install_comfy_quantized_router(
                             *,
                             _target=torch.device(execution_device),
                         ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-                            return (
-                                tuple(_move_tensor_tree(value, _target) for value in nested_args),
-                                _move_tensor_tree(nested_kwargs, _target),
+                            return _move_h3_arguments_synchronously(
+                                nested_args, nested_kwargs, _target
                             )
 
                         try:
@@ -1315,9 +1556,9 @@ def _install_comfy_quantized_router(
                             )
                         except TypeError:
                             nested_handle = nested_module.register_forward_pre_hook(
-                                lambda _nested, nested_args, _target=torch.device(execution_device): tuple(
-                                    _move_tensor_tree(value, _target) for value in nested_args
-                                )
+                                lambda _nested, nested_args, _target=torch.device(execution_device): _move_h3_arguments_synchronously(
+                                    nested_args, {}, _target
+                                )[0]
                             )
                         handles.append(nested_handle)
 
@@ -1332,7 +1573,7 @@ def _install_comfy_quantized_router(
                         *,
                         _target=torch.device(_device_label(device_ids[0])),
                     ) -> Any:
-                        return _move_tensor_tree(output, _target)
+                        return _move_h3_tree_synchronously(output, _target)
 
                     try:
                         handles.append(register_forward(route_outputs, with_kwargs=True))
@@ -1341,7 +1582,7 @@ def _install_comfy_quantized_router(
                             register_forward(
                                 lambda _module, _args, output, _target=torch.device(
                                     _device_label(device_ids[0])
-                                ): _move_tensor_tree(output, _target)
+                                ): _move_h3_tree_synchronously(output, _target)
                             )
                         )
 
@@ -1360,7 +1601,9 @@ def _install_comfy_quantized_router(
                 forward = getattr(module, "forward", None)
                 if not callable(forward):
                     continue
+                _synchronize_h3_device(primary_device)
                 module.to(primary_device)
+                _synchronize_h3_device(primary_device)
 
                 def final_layer_forward(
                     *args: Any,
@@ -1368,11 +1611,12 @@ def _install_comfy_quantized_router(
                     _target=primary_device,
                     **kwargs: Any,
                 ) -> Any:
-                    moved_args = tuple(
-                        _move_tensor_tree(value, _target) for value in args
+                    moved_args, moved_kwargs = _move_h3_arguments_synchronously(
+                        args, kwargs, _target
                     )
-                    moved_kwargs = _move_tensor_tree(kwargs, _target)
-                    return _forward(*moved_args, **moved_kwargs)
+                    output = _forward(*moved_args, **moved_kwargs)
+                    _synchronize_h3_device(_target)
+                    return output
 
                 module.forward = final_layer_forward
                 handles.append(
@@ -1411,7 +1655,16 @@ def _install_comfy_quantized_router(
         "disk_storage": "Comfy-managed source/offload when available; no Accelerate disk hooks",
         "outer_model_return_device": _device_label(device_ids[0]),
         "quantized_copies": "synchronous",
+        "quantized_copy_boundaries": {
+            "entry_points": ["comfy.model_management.cast_to", "comfy.model_management.cast_to_gathered"],
+            "policy": "source/device barrier -> native Comfy copy with non_blocking=False -> destination/device barrier",
+        },
         "activation_transfers": "synchronous",
+        "activation_boundaries": {
+            "policy": "source-device barrier -> direct tensor copy -> destination-device barrier",
+            "block_output_barrier": "cuda.synchronize(execution_device)",
+            "final_output_barrier": "cuda.synchronize(cuda:0)",
+        },
         "final_layer_device_island": _device_label(device_ids[0]),
     }
     return execution_map, plan["comfy_quantized_router"], handles

@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -35,6 +36,7 @@ class ComfyNodeTests(unittest.TestCase):
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "layer_sharding.py", node_dir / "kaggle_h3_layer_sharding.py")
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "ref2va.py", node_dir / "kaggle_h3_ref2va.py")
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "fp_diagnostics.py", node_dir / "kaggle_h3_fp_diagnostics.py")
+            shutil.copy2(ROOT / "src" / "kaggle_h3" / "model_manager.py", node_dir / "kaggle_h3_model_manager.py")
             shutil.copy2(ROOT / "custom_nodes" / "kaggle_h3_adapter_catalog.json", node_dir / "kaggle_h3_adapter_catalog.json")
             script = """
 import importlib.util
@@ -47,6 +49,7 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 assert set(module.NODE_CLASS_MAPPINGS) == {
+    "KaggleH3SmokeReference",
     "KaggleH3Ref2VAConditioning",
     "KaggleH3ShardedDiffusionLoader",
     "KaggleH3TextEncoderLoader",
@@ -72,6 +75,7 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
     def test_registration_and_interface_are_present(self):
         module = load_node_module()
         self.assertIn("KaggleH3Ref2VAConditioning", module.NODE_CLASS_MAPPINGS)
+        self.assertIn("KaggleH3SmokeReference", module.NODE_CLASS_MAPPINGS)
         self.assertIn("KaggleH3AdapterStack", module.NODE_CLASS_MAPPINGS)
         self.assertIn("KaggleH3ShardedDiffusionLoader", module.NODE_CLASS_MAPPINGS)
         self.assertIn("KaggleH3TextEncoderLoader", module.NODE_CLASS_MAPPINGS)
@@ -149,8 +153,11 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
 
     def test_explicit_loader_interfaces_have_phase_targets(self):
         module = load_node_module()
+        loader_inputs = module.KaggleH3ShardedDiffusionLoader.INPUT_TYPES()["required"]
+        self.assertEqual(loader_inputs["model_variant"][0], ["FL2VA", "Ref2VA"])
+        self.assertEqual(loader_inputs["model_variant"][1]["default"], "Ref2VA")
         self.assertEqual(
-            module.KaggleH3ShardedDiffusionLoader.INPUT_TYPES()["required"]["gpu_1"][1]["default"],
+            loader_inputs["gpu_1"][1]["default"],
             1,
         )
         self.assertEqual(
@@ -165,6 +172,22 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
             module.KaggleH3PhaseDispatch.RETURN_TYPES,
             ("MODEL", "CONDITIONING", "LATENT", "H3_RUNTIME_CONFIG"),
         )
+
+    def test_smoke_reference_loader_resolves_checked_in_assets(self):
+        module = load_node_module()
+        inputs = module.KaggleH3SmokeReference.INPUT_TYPES()["required"]
+        self.assertEqual(inputs["reference"][0], ["character", "scene"])
+        self.assertEqual(
+            module._resolve_h3_smoke_reference("character").name,
+            "CHARACTER_REFERENCE.png",
+        )
+        self.assertEqual(
+            module._resolve_h3_smoke_reference("scene").name,
+            "SCENE_REFERENCE.png",
+        )
+
+        with self.assertRaisesRegex(module.H3PhaseError, "choose character or scene"):
+            module._resolve_h3_smoke_reference("unknown")
 
     def test_h3_video_decode_reconciles_latent_dtype_without_mutating_input(self):
         module = load_node_module()
@@ -389,6 +412,125 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertEqual(steps, 8)
         with self.assertRaisesRegex(RuntimeError, "requires sampler"):
             module.H3TurboSampler._resolve_sampling_parameters(config, "res_multistep")
+
+    def test_repeated_seed_sampler_and_vae_outputs_remain_finite_and_stable(self):
+        module = load_node_module()
+        import torch
+        from unittest.mock import patch
+
+        class SamplingModel:
+            def get_model_object(self, _name):
+                return object()
+
+        sampling_model = SamplingModel()
+
+        class Guider:
+            def __init__(self, _model):
+                self.model_patcher = types.SimpleNamespace(
+                    model=types.SimpleNamespace(process_latent_out=lambda value: value)
+                )
+
+            def set_conds(self, _conditioning):
+                return None
+
+            def sample(self, _noise, _latent, _sampler, _sigmas, **kwargs):
+                generator = torch.Generator().manual_seed(int(kwargs["seed"]))
+                video = torch.randn((1, 2, 3), generator=generator)
+                audio = torch.randn((1, 2, 3), generator=generator)
+                return torch.nested.nested_tensor([video, audio])
+
+        class Noise:
+            def __init__(self, _seed):
+                pass
+
+            def generate_noise(self, latent):
+                return latent["samples"]
+
+        comfy = types.ModuleType("comfy")
+        comfy.__path__ = []
+        comfy_sample = types.ModuleType("comfy.sample")
+        comfy_sample.fix_empty_latent_channels = lambda _model, value, *_args: value
+        comfy_samplers = types.ModuleType("comfy.samplers")
+        comfy_samplers.calculate_sigmas = lambda *_args: torch.ones((3,))
+        comfy_samplers.sampler_object = lambda _name: object()
+        comfy_helpers = types.ModuleType("comfy.sampler_helpers")
+        comfy_helpers.prepare_sampling = lambda *_args, **_kwargs: None
+        comfy_management = types.ModuleType("comfy.model_management")
+        comfy_utils = types.ModuleType("comfy.utils")
+        comfy_utils.PROGRESS_BAR_ENABLED = False
+        comfy_extra = types.ModuleType("comfy_extras")
+        comfy_extra.__path__ = []
+        comfy_sampler_nodes = types.ModuleType("comfy_extras.nodes_custom_sampler")
+        comfy_sampler_nodes.Guider_Basic = Guider
+        comfy_sampler_nodes.Noise_RandomNoise = Noise
+        comfy_audio_nodes = types.ModuleType("comfy_extras.nodes_audio")
+        comfy_audio_nodes.vae_decode_audio = lambda _vae, _samples: {
+            "waveform": torch.tensor([[[0.25, -0.5]]]),
+            "sample_rate": 32000,
+        }
+        latent_preview = types.ModuleType("latent_preview")
+        latent_preview.prepare_callback = lambda *_args: None
+        modules = {
+            "comfy": comfy,
+            "comfy.sample": comfy_sample,
+            "comfy.samplers": comfy_samplers,
+            "comfy.sampler_helpers": comfy_helpers,
+            "comfy.model_management": comfy_management,
+            "comfy.utils": comfy_utils,
+            "comfy_extras": comfy_extra,
+            "comfy_extras.nodes_custom_sampler": comfy_sampler_nodes,
+            "comfy_extras.nodes_audio": comfy_audio_nodes,
+            "latent_preview": latent_preview,
+        }
+        for name, child in modules.items():
+            if name.startswith("comfy."):
+                setattr(comfy, name.split(".", 1)[1], child)
+            if name.startswith("comfy_extras."):
+                setattr(comfy_extra, name.split(".", 1)[1], child)
+
+        conditioning = [[torch.ones((1,)), {"minimax_refs": True}]]
+        latent = {"samples": torch.zeros((1, 2, 3))}
+        with patch.dict(sys.modules, modules), patch.object(
+            module.H3TurboSampler,
+            "_shift_model",
+            return_value=sampling_model,
+        ), patch.object(
+            module,
+            "_install_phase_dispatch_hook",
+            side_effect=lambda helpers, _config, _holder: helpers.prepare_sampling,
+        ), patch.object(module, "phase_device_ids", return_value=()), patch.object(
+            module, "_h3_move_for_consumer", side_effect=lambda value, **_kwargs: value
+        ), patch.object(module, "release_transformer_phase"), patch.object(
+            module, "release_h3_runtime_resources"
+        ), patch.object(module, "configure_vae_phase"), patch.object(
+            module, "release_vae_phase"
+        ):
+            first = module.H3TurboSampler().sample(
+                object(), None, conditioning, latent, 1234, "euler", 2
+            )
+            second = module.H3TurboSampler().sample(
+                object(), None, conditioning, latent, 1234, "euler", 2
+            )
+            video_vae = types.SimpleNamespace(
+                decode=lambda _samples: torch.ones((1, 2, 2, 3))
+            )
+            first_video = module.H3VAEDecode().decode(video_vae, first[0], device_id=1)
+            second_video = module.H3VAEDecode().decode(video_vae, second[0], device_id=1)
+            first_audio = module.H3AudioVAEDecode().decode(
+                object(), first[1], device_id=0
+            )
+            second_audio = module.H3AudioVAEDecode().decode(
+                object(), second[1], device_id=0
+            )
+
+        self.assertTrue(torch.equal(first[0]["samples"], second[0]["samples"]))
+        self.assertTrue(torch.equal(first[1]["samples"], second[1]["samples"]))
+        self.assertTrue(torch.isfinite(first_video[0]).all())
+        self.assertTrue(torch.isfinite(second_video[0]).all())
+        self.assertTrue(torch.isfinite(first_audio[0]["waveform"]).all())
+        self.assertTrue(torch.isfinite(second_audio[0]["waveform"]).all())
+        self.assertTrue(torch.equal(first_video[0], second_video[0]))
+        self.assertTrue(torch.equal(first_audio[0]["waveform"], second_audio[0]["waveform"]))
 
     def test_phase_dispatch_hook_runs_after_comfy_managed_load(self):
         module = load_node_module()

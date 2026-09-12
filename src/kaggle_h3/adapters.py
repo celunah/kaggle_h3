@@ -567,6 +567,25 @@ def builtin_catalog() -> dict[str, H3AdapterMetadata]:
                 "4": {"steps": 4, "nfe": 4, "sampler_name": "euler", "shift_video": 12.0, "shift_audio": 3.0, "resolution": "544p"}
             },
         },
+        {
+            "adapter_id": "h3_ref2va_turbo_8step_v1_0_768p",
+            "name": "Ref2VA Turbo 8-step v1.0 768p",
+            "repository": "lightx2v/Minimax-h3-Turbo",
+            "filename": "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+            "revision": "3ec17a324ced54151364f24f8b5fb6bf7e26414f",
+            "model_variants": ["ref2va"],
+            "conditioning_modes": ["Ref2VA"],
+            "recommended_strength": 1.0,
+            "supported_steps": [8],
+            "fused": False,
+            "license": "Apache-2.0; see lightx2v/Minimax-h3-Turbo repository and model card.",
+            "attribution": "LightX2V / ModelTC MiniMax-H3-Turbo",
+            "kind": "turbo",
+            "sha256": "6a56f41ab4229c9dd845b9501bbd475ee57e112d846cf2e819d534a1ae928c5a",
+            "schedules": {
+                "8": {"steps": 8, "nfe": 8, "sampler_name": "euler", "shift_video": 6.0, "shift_audio": 3.0, "resolution": "768p"}
+            },
+        },
     ]
     return {item.adapter_id: item for item in map(H3AdapterMetadata.from_mapping, raw)}
 

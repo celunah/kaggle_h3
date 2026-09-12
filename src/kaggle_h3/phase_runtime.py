@@ -98,6 +98,41 @@ class H3TextEncoderPhase:
 _ACTIVE_TEXT_ENCODER_PHASES: list[H3TextEncoderPhase] = []
 
 
+def synchronize_h3_devices(device_ids: Any, *, reason: str = "") -> list[str]:
+    """Synchronize all requested CUDA devices at an H3 phase boundary."""
+
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return []
+    if isinstance(device_ids, (str, bytes, int)):
+        device_ids = (device_ids,)
+    synchronized: list[str] = []
+    for device_id in device_ids or ():
+        try:
+            device = torch.device(device_id)
+        except (TypeError, RuntimeError, ValueError):
+            continue
+        if device.type != "cuda":
+            continue
+        torch.cuda.synchronize(device)
+        synchronized.append(str(device))
+    return synchronized
+
+
+def _synchronize_h3_devices_for_cleanup(
+    device_ids: Any, report: dict[str, Any], *, reason: str
+) -> None:
+    """Attempt cleanup synchronization without blocking resource release."""
+
+    try:
+        synchronize_h3_devices(device_ids, reason=reason)
+    except Exception as exc:
+        report.setdefault("warnings", []).append(
+            f"CUDA synchronization failed during cleanup: {exc}"
+        )
+
+
 class _GpuMemoryMonitor:
     """Low-overhead memory sampler for the lifetime of one H3 phase."""
 
@@ -397,6 +432,11 @@ def release_text_encoder_phase(state: H3TextEncoderPhase | None) -> dict[str, An
     if state is None or state.released:
         return {"status": "already_released" if state else "not_started"}
     state.released = True
+    _synchronize_h3_devices_for_cleanup(
+        state.device_ids,
+        state.report,
+        reason="text encoder phase release",
+    )
     for handle in state.dispatch_handles:
         remove = getattr(handle, "remove", None)
         if callable(remove):
@@ -703,6 +743,10 @@ def release_vae_phase(vae: Any, *, role: str) -> dict[str, Any]:
     try:
         import torch  # type: ignore
 
+        phase_device = getattr(vae, "device", None)
+        if phase_device is None and patcher is not None:
+            phase_device = getattr(patcher, "load_device", None)
+        synchronize_h3_devices((phase_device,), reason=f"{role} VAE phase release")
         unpatch = getattr(patcher, "unpatch_model", None)
         if callable(unpatch):
             unpatch(torch.device("cpu"), unpatch_weights=True)
@@ -923,7 +967,7 @@ def _measure_gpu_transfer(device_ids: tuple[int, ...]) -> dict[str, Any]:
 
 
 def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
-    """Record calls and validate every dispatched H3 block and internal op."""
+    """Record calls and validate every dispatched H3 block boundary."""
 
     state.activity = {
         "planned_gpu_calls": {str(device_id): 0 for device_id in state.device_ids},
@@ -931,7 +975,6 @@ def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
         "block_calls": {},
         "diagnostic_checks": {},
         "validated_blocks": {"input": [], "output": []},
-        "validated_internal_ops": {"input": [], "output": []},
     }
     planned_layers = (state.report.get("planned") or {}).get("layers") or []
     group_path = str((state.report.get("planned") or {}).get("group", {}).get("container_path", ""))
@@ -979,19 +1022,6 @@ def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
         checked = state.activity["validated_blocks"][kind]
         if path not in checked:
             checked.append(path)
-
-    def mark_internal_check(kind: str, path: str) -> None:
-        checked = state.activity["validated_internal_ops"][kind]
-        if path not in checked:
-            checked.append(path)
-
-    def validate_internal_input(stage: str, value: Any, path: str) -> None:
-        validate_finite(
-            {"args": value[0], "kwargs": value[1]},
-            stage,
-            tensor_name=f"{path}.input",
-        )
-        mark_internal_check("input", path)
 
     def validate_phase_input(stage: str, value: Any, path: str) -> None:
         validate_finite(
@@ -1082,95 +1112,6 @@ def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
         except Exception:
             continue
 
-        # Check every nested module after the root block hooks are installed.
-        # This includes container modules and leaf operations so the first
-        # failing internal boundary is reported with its complete H3 path.
-        named_modules = getattr(module, "named_modules", None)
-        if not callable(named_modules):
-            continue
-        try:
-            nested_modules = tuple(named_modules())
-        except Exception:
-            continue
-        for nested_path, nested_module in nested_modules:
-            if not nested_path:
-                continue
-            internal_path = f"{path}.{nested_path}"
-            internal_stage = (
-                "sampler_gpu0"
-                if target == primary_gpu
-                else "sampler_gpu1"
-            )
-
-            def observe_internal_call(
-                _module: Any,
-                args: tuple[Any, ...],
-                _kwargs: dict[str, Any] | None = None,
-                *,
-                _path=internal_path,
-                _stage=internal_stage,
-            ) -> None:
-                validate_internal_input(_stage, (args, _kwargs or {}), _path)
-
-            def observe_internal_output(
-                _module: Any,
-                _args: tuple[Any, ...],
-                _kwargs: dict[str, Any] | None,
-                output: Any,
-                *,
-                _path=internal_path,
-                _stage=(
-                    "sampler_gpu0_out"
-                    if target == primary_gpu
-                    else "sampler_gpu1_out"
-                ),
-            ) -> Any:
-                validate_finite(output, _stage, tensor_name=f"{_path}.output")
-                mark_internal_check("output", _path)
-                return output
-
-            register_internal = getattr(nested_module, "register_forward_pre_hook", None)
-            if callable(register_internal):
-                try:
-                    state.activity_handles.append(
-                        register_internal(observe_internal_call, with_kwargs=True)
-                    )
-                except TypeError:
-                    try:
-                        state.activity_handles.append(
-                            register_internal(
-                                lambda current, call_args, _observe=observe_internal_call: _observe(
-                                    current, call_args, {}
-                                )
-                            )
-                        )
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-            register_internal_output = getattr(nested_module, "register_forward_hook", None)
-            if callable(register_internal_output):
-                try:
-                    state.activity_handles.append(
-                        register_internal_output(
-                            observe_internal_output,
-                            with_kwargs=True,
-                        )
-                    )
-                except TypeError:
-                    try:
-                        state.activity_handles.append(
-                            register_internal_output(
-                                lambda current, call_args, output, _observe=observe_internal_output: _observe(
-                                    current, call_args, {}, output
-                                )
-                            )
-                        )
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
         register_output = getattr(module, "register_forward_hook", None)
         if not callable(register_output):
             continue
@@ -1409,6 +1350,11 @@ def release_transformer_phase(state: H3TransformerPhase | None) -> dict[str, Any
         state.report["release"] = {"status": "fallback_no_dispatch"}
         return state.report["release"]
 
+    _synchronize_h3_devices_for_cleanup(
+        state.device_ids,
+        state.report,
+        reason="transformer phase release",
+    )
     memory_report = state.monitor.stop() if state.monitor is not None else None
     _remove_transformer_activity_hooks(state)
     _remove_transformer_dispatch_hooks(state)
@@ -1481,10 +1427,6 @@ def release_transformer_phase(state: H3TransformerPhase | None) -> dict[str, Any
             kind: list(paths)
             for kind, paths in (activity.get("validated_blocks") or {}).items()
         },
-        "validated_internal_ops": {
-            kind: list(paths)
-            for kind, paths in (activity.get("validated_internal_ops") or {}).items()
-        },
         "observed_gpu_ids": sorted(used_gpu_ids),
         "same_generation_all_requested_gpus": set(state.device_ids).issubset(used_gpu_ids),
     }
@@ -1493,22 +1435,11 @@ def release_transformer_phase(state: H3TransformerPhase | None) -> dict[str, Any
         f"{kind}={len(paths)}"
         for kind, paths in state.report["generation_activity"]["validated_blocks"].items()
     )
-    validated_internal_op_counts = ", ".join(
-        f"{kind}={len(paths)}"
-        for kind, paths in state.report["generation_activity"]["validated_internal_ops"].items()
-    )
     print(
         "[Kaggle H3] Transformer generation activity: "
         f"planned_gpu_calls={planned_gpu_calls}, observed_input_devices="
         f"{state.report['generation_activity']['input_gpu_ids']}, "
-        f"validated_blocks={validated_block_counts}, "
-        f"validated_internal_ops={validated_internal_op_counts}.",
-        flush=True,
-    )
-    print(
-        "[Kaggle H3] Validated internal operation paths: "
-        f"input={state.report['generation_activity']['validated_internal_ops']['input']}, "
-        f"output={state.report['generation_activity']['validated_internal_ops']['output']}",
+        f"validated_blocks={validated_block_counts}.",
         flush=True,
     )
     print(

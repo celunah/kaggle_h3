@@ -1,4 +1,3 @@
-import json
 import sys
 import tempfile
 import types
@@ -45,6 +44,10 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(four.schedule_for(4)["shift_video"], 6.0)
         self.assertEqual(eight.schedule_for(8)["steps"], 8)
         self.assertEqual(eight.schedule_for(8)["sampler_name"], "euler")
+        ref_eight = catalog["h3_ref2va_turbo_8step_v1_0_768p"]
+        self.assertEqual(ref_eight.conditioning_modes, ("Ref2VA",))
+        self.assertEqual(ref_eight.schedule_for(8)["shift_video"], 6.0)
+        self.assertEqual(ref_eight.schedule_for(8)["resolution"], "768p")
 
     def test_invalid_metadata_rejects_unsafe_or_unsupported_files(self):
         base = {

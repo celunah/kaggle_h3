@@ -5,9 +5,11 @@ from pathlib import Path
 from kaggle_h3.bootstrap import (
     comfy_launch_command,
     configure_comfyui_model_paths,
+    download_selected_models,
     ensure_github_checkout,
     model_file_status,
     required_model_files,
+    stage_smoke_assets,
     start_comfyui,
 )
 
@@ -43,6 +45,31 @@ class BootstrapTests(unittest.TestCase):
             self.assertIn("diffusion_models: models/diffusion_models/", config)
             self.assertIn("text_encoders: models/text_encoders/", config)
             self.assertIn("vae: models/vae/", config)
+
+    def test_smoke_assets_are_staged_into_comfy_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            comfy_root = Path(temporary) / "ComfyUI"
+            result = stage_smoke_assets(comfy_root, Path(__file__).parents[1])
+            self.assertEqual(result["status"], "staged")
+            self.assertTrue((comfy_root / "input" / "CHARACTER_REFERENCE.png").is_file())
+            self.assertTrue((comfy_root / "input" / "SCENE_REFERENCE.png").is_file())
+
+    def test_default_model_download_defers_diffusion_to_comfy_loader(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            models_root = root / "models"
+            for directory, filename in required_model_files(
+                "Ref2VA", include_diffusion=False
+            ).values():
+                path = models_root / directory / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"shared")
+
+            result = download_selected_models(root / "ComfyUI", "Ref2VA", models_root=models_root)
+
+            self.assertEqual(result["download_status"], "already_present")
+            self.assertEqual(result["diffusion_model"]["status"], "deferred_to_comfy_loader")
+            self.assertNotIn("diffusion_model", result["files"])
 
     def test_github_checkout_dry_run_does_not_need_network(self):
         with tempfile.TemporaryDirectory() as temporary:

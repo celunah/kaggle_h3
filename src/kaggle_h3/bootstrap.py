@@ -16,13 +16,18 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+
+from .model_manager import H3_DIFFUSION_MODEL_SPECS
 
 
 COMFYUI_REPOSITORY = "https://github.com/Comfy-Org/ComfyUI.git"
 COMFYUI_REF = os.environ.get("KAGGLE_H3_COMFYUI_REF", "v0.34.0")
 H3_MODEL_REPOSITORY = "Comfy-Org/MiniMax-H3"
-H3_MODEL_REVISION = os.environ.get("KAGGLE_H3_MODEL_REVISION", "main")
+H3_MODEL_REVISION = os.environ.get(
+    "KAGGLE_H3_MODEL_REVISION",
+    "a98869194787969724c7425d95d0ed73ce9202af",
+)
 
 COMMON_MODEL_FILES: dict[str, tuple[str, str]] = {
     "clip": (
@@ -33,19 +38,10 @@ COMMON_MODEL_FILES: dict[str, tuple[str, str]] = {
     "audio_vae": ("vae", "minimax_h3_audio_vae_fp32.safetensors"),
 }
 MODE_MODEL_FILES: dict[str, tuple[str, str]] = {
-    "Ref2VA": (
-        "diffusion_models",
-        "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
-    ),
-    "FL2VA": (
-        "diffusion_models",
-        "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-    ),
-    "T2VA": (
-        "diffusion_models",
-        "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-    ),
+    variant: ("diffusion_models", spec.filename)
+    for variant, spec in H3_DIFFUSION_MODEL_SPECS.items()
 }
+MODE_MODEL_FILES["T2VA"] = MODE_MODEL_FILES["FL2VA"]
 
 
 @dataclass(frozen=True)
@@ -229,8 +225,10 @@ def plan_execution_devices(
     }
 
 
-def required_model_files(mode: str) -> dict[str, tuple[str, str]]:
-    """Return only the common files and the diffusion file for ``mode``."""
+def required_model_files(
+    mode: str, *, include_diffusion: bool = True
+) -> dict[str, tuple[str, str]]:
+    """Return common files and optionally the diffusion file for ``mode``."""
 
     normalized = mode.strip().upper()
     canonical = {
@@ -240,11 +238,18 @@ def required_model_files(mode: str) -> dict[str, tuple[str, str]]:
     }.get(normalized)
     if canonical is None:
         raise ValueError(f"Unsupported H3 mode: {mode}")
-    return {**COMMON_MODEL_FILES, "diffusion_model": MODE_MODEL_FILES[canonical]}
+    files = dict(COMMON_MODEL_FILES)
+    if include_diffusion:
+        files["diffusion_model"] = MODE_MODEL_FILES[canonical]
+    return files
 
 
 def model_file_status(
-    comfy_root: Path, mode: str, *, models_root: Path | None = None
+    comfy_root: Path,
+    mode: str,
+    *,
+    models_root: Path | None = None,
+    include_diffusion: bool = True,
 ) -> dict[str, Any]:
     models_root = models_root or (comfy_root / "models")
     status: dict[str, Any] = {
@@ -254,7 +259,9 @@ def model_file_status(
         "files": {},
         "all_present": True,
     }
-    for role, (directory, filename) in required_model_files(mode).items():
+    for role, (directory, filename) in required_model_files(
+        mode, include_diffusion=include_diffusion
+    ).items():
         path = models_root / directory / filename
         present = path.is_file()
         status["files"][role] = {
@@ -324,6 +331,7 @@ def install_h3_adapter_node(
     source_layer_sharding = project_root / "src" / "kaggle_h3" / "layer_sharding.py"
     source_ref2va = project_root / "src" / "kaggle_h3" / "ref2va.py"
     source_fp_diagnostics = project_root / "src" / "kaggle_h3" / "fp_diagnostics.py"
+    source_model_manager = project_root / "src" / "kaggle_h3" / "model_manager.py"
     sources = (
         source_node,
         source_core,
@@ -332,6 +340,7 @@ def install_h3_adapter_node(
         source_layer_sharding,
         source_ref2va,
         source_fp_diagnostics,
+        source_model_manager,
     )
     missing = [str(path) for path in sources if not path.is_file()]
     if missing:
@@ -345,6 +354,7 @@ def install_h3_adapter_node(
         target_dir / "kaggle_h3_layer_sharding.py",
         target_dir / "kaggle_h3_ref2va.py",
         target_dir / "kaggle_h3_fp_diagnostics.py",
+        target_dir / "kaggle_h3_model_manager.py",
     )
     legacy_target_files = (
         target_dir / "celune_h3_adapters.py",
@@ -360,6 +370,7 @@ def install_h3_adapter_node(
         "targets": [str(path) for path in target_files],
         "removed_legacy_targets": [str(path) for path in legacy_target_files if path.is_file()],
         "node_ids": [
+            "KaggleH3SmokeReference",
             "KaggleH3Ref2VAConditioning",
             "KaggleH3ShardedDiffusionLoader",
             "KaggleH3TextEncoderLoader",
@@ -379,6 +390,33 @@ def install_h3_adapter_node(
             legacy_target.unlink()
     for source, target in zip(sources, target_files):
         shutil.copy2(source, target)
+    return result
+
+
+def stage_smoke_assets(
+    comfy_root: Path, project_root: Path, *, dry_run: bool = False
+) -> dict[str, Any]:
+    """Copy the checked-in smoke references into ComfyUI's input directory."""
+
+    asset_dir = project_root / "smoke_assets"
+    asset_names = ("CHARACTER_REFERENCE.png", "SCENE_REFERENCE.png")
+    sources = [asset_dir / name for name in asset_names]
+    missing = [str(path) for path in sources if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("Missing smoke workflow assets: " + ", ".join(missing))
+    input_dir = comfy_root / "input"
+    targets = [input_dir / name for name in asset_names]
+    result: dict[str, Any] = {
+        "status": "would_stage" if dry_run else "staged",
+        "sources": [str(path) for path in sources],
+        "targets": [str(path) for path in targets],
+    }
+    if dry_run:
+        return result
+    input_dir.mkdir(parents=True, exist_ok=True)
+    for source, target in zip(sources, targets):
+        if source.resolve() != target.resolve():
+            shutil.copy2(source, target)
     return result
 
 
@@ -507,7 +545,8 @@ def ensure_github_checkout(
         return result
 
     remote = git("config", "--get", "remote.origin.url").stdout.strip()
-    normalize = lambda value: str(value).strip().removesuffix(".git").rstrip("/")
+    def normalize(value: str) -> str:
+        return str(value).strip().removesuffix(".git").rstrip("/")
     if remote and normalize(remote) != normalize(repository):
         raise RuntimeError(
             f"Existing checkout {destination} points to {remote!r}, not {repository!r}"
@@ -534,12 +573,28 @@ def download_selected_models(
     mode: str,
     *,
     models_root: Path | None = None,
+    include_diffusion: bool = False,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Download the selected mode's files into ComfyUI or an external model root."""
+    """Download shared files; defer diffusion weights to the ComfyUI loader.
+
+    ``include_diffusion`` is retained for non-Comfy callers that explicitly
+    need the old eager behavior.  Kaggle startup and the normal ComfyUI path
+    leave it false so only the selected workflow downloads a diffusion model.
+    """
 
     models_root = models_root or (comfy_root / "models")
-    status = model_file_status(comfy_root, mode, models_root=models_root)
+    status = model_file_status(
+        comfy_root,
+        mode,
+        models_root=models_root,
+        include_diffusion=include_diffusion,
+    )
+    if not include_diffusion:
+        status["diffusion_model"] = {
+            "status": "deferred_to_comfy_loader",
+            "note": "KaggleH3ShardedDiffusionLoader downloads the selected variant at execution time.",
+        }
     if status["all_present"]:
         status["download_status"] = "already_present"
         return status
@@ -554,7 +609,9 @@ def download_selected_models(
         ) from exc
 
     downloaded: list[str] = []
-    for role, (directory, filename) in required_model_files(mode).items():
+    for role, (directory, filename) in required_model_files(
+        mode, include_diffusion=include_diffusion
+    ).items():
         destination = models_root / directory
         destination.mkdir(parents=True, exist_ok=True)
         if (destination / filename).is_file():
@@ -567,7 +624,17 @@ def download_selected_models(
             token=os.environ.get("HF_TOKEN"),
         )
         downloaded.append(f"{directory}/{filename}")
-    status = model_file_status(comfy_root, mode, models_root=models_root)
+    status = model_file_status(
+        comfy_root,
+        mode,
+        models_root=models_root,
+        include_diffusion=include_diffusion,
+    )
+    if not include_diffusion:
+        status["diffusion_model"] = {
+            "status": "deferred_to_comfy_loader",
+            "note": "KaggleH3ShardedDiffusionLoader downloads the selected variant at execution time.",
+        }
     status["download_status"] = "downloaded"
     status["downloaded"] = downloaded
     return status

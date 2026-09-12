@@ -8,6 +8,7 @@ dependency-light core makes the resolver and ordering rules unit-testable.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import importlib.util
 import sys
@@ -106,6 +107,38 @@ except ImportError:
         resolve_ref2va_length = ref2va_module.resolve_ref2va_length
 
 
+try:
+    from kaggle_h3.model_manager import (
+        H3DiffusionModelError,
+        H3DiffusionModelManager,
+        h3_diffusion_directory_from_comfy,
+    )
+except ImportError:
+    try:
+        from kaggle_h3_model_manager import (  # type: ignore
+            H3DiffusionModelError,
+            H3DiffusionModelManager,
+            h3_diffusion_directory_from_comfy,
+        )
+    except ImportError:
+        model_manager_path = Path(__file__).with_name("kaggle_h3_model_manager.py")
+        model_manager_spec = importlib.util.spec_from_file_location(
+            "kaggle_h3_model_manager", model_manager_path
+        )
+        if (
+            model_manager_spec is None
+            or model_manager_spec.loader is None
+            or not model_manager_path.is_file()
+        ):
+            raise ImportError(f"Cannot load standalone H3 model manager: {model_manager_path}")
+        model_manager_module = importlib.util.module_from_spec(model_manager_spec)
+        sys.modules[model_manager_spec.name] = model_manager_module
+        model_manager_spec.loader.exec_module(model_manager_module)
+        H3DiffusionModelError = model_manager_module.H3DiffusionModelError
+        H3DiffusionModelManager = model_manager_module.H3DiffusionModelManager
+        h3_diffusion_directory_from_comfy = model_manager_module.h3_diffusion_directory_from_comfy
+
+
 CATALOG_PATH = Path(__file__).with_name("kaggle_h3_adapter_catalog.json")
 
 try:
@@ -124,6 +157,7 @@ try:
         release_h3_runtime_resources,
         release_vae_phase,
         release_transformer_phase,
+        synchronize_h3_devices,
         validate_finite,
     )
 except ImportError:
@@ -143,6 +177,7 @@ except ImportError:
             release_h3_runtime_resources,
             release_vae_phase,
             release_transformer_phase,
+            synchronize_h3_devices,
             validate_finite,
         )
     except ImportError:
@@ -173,6 +208,7 @@ except ImportError:
         release_h3_runtime_resources = phase_module.release_h3_runtime_resources
         release_vae_phase = phase_module.release_vae_phase
         release_transformer_phase = phase_module.release_transformer_phase
+        synchronize_h3_devices = phase_module.synchronize_h3_devices
         validate_finite = phase_module.validate_finite
 
 
@@ -192,12 +228,132 @@ def _folder_options(category: str) -> list[str]:
         return [""]
 
 
+H3_SMOKE_REFERENCE_FILES = {
+    "character": "CHARACTER_REFERENCE.png",
+    "scene": "SCENE_REFERENCE.png",
+}
+
+
+def _resolve_h3_smoke_reference(reference: str) -> Path:
+    """Resolve a checked-in smoke reference without relying on a UI filename list."""
+
+    key = str(reference or "").strip().lower()
+    filename = H3_SMOKE_REFERENCE_FILES.get(key)
+    if filename is None:
+        raise H3PhaseError(
+            f"Unknown H3 smoke reference {reference!r}; choose character or scene."
+        )
+
+    candidates: list[Path] = []
+    configured_asset_dir = os.environ.get("KAGGLE_H3_SMOKE_ASSET_DIR", "").strip()
+    if configured_asset_dir:
+        candidates.append(Path(configured_asset_dir).expanduser() / filename)
+    configured_project_root = os.environ.get("KAGGLE_H3_PROJECT_ROOT", "").strip()
+    if configured_project_root:
+        candidates.append(Path(configured_project_root).expanduser() / "smoke_assets" / filename)
+
+    node_path = Path(__file__).resolve()
+    # This covers the normal checkout layout: <project>/ComfyUI/custom_nodes.
+    for parent in node_path.parents:
+        candidates.append(parent / "smoke_assets" / filename)
+
+    try:
+        import folder_paths  # type: ignore
+
+        input_directory = getattr(folder_paths, "get_input_directory", None)
+        if callable(input_directory):
+            candidates.append(Path(input_directory()) / filename)
+        configured_input_directory = getattr(folder_paths, "input_directory", None)
+        if configured_input_directory:
+            candidates.append(Path(configured_input_directory) / filename)
+    except Exception:
+        # The project and environment candidates above are enough for the
+        # standalone node; ComfyUI's folder_paths API is optional here.
+        pass
+
+    seen: set[Path] = set()
+    searched: list[str] = []
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        searched.append(str(resolved))
+        if resolved.is_file():
+            return resolved
+    raise H3PhaseError(
+        f"Could not resolve H3 smoke {key} reference {filename!r}. Searched: "
+        + ", ".join(searched)
+        + ". Run the updated Kaggle startup cell or set KAGGLE_H3_PROJECT_ROOT."
+    )
+
+
+class KaggleH3SmokeReference:
+    """Load the repository's fixed smoke image references by semantic role."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "reference": (
+                    list(H3_SMOKE_REFERENCE_FILES),
+                    {"default": "character"},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "load_reference"
+    CATEGORY = "loaders/MiniMax H3"
+
+    def load_reference(self, reference: str):
+        path = _resolve_h3_smoke_reference(reference)
+        try:
+            import numpy as np  # type: ignore
+            import torch  # type: ignore
+            from PIL import Image  # type: ignore
+        except Exception as exc:
+            raise H3PhaseError(
+                "Kaggle H3 smoke references require ComfyUI's Pillow, NumPy, and PyTorch."
+            ) from exc
+        with Image.open(path) as image:
+            rgb = image.convert("RGB")
+            array = np.array(rgb, dtype=np.float32, copy=True) / 255.0
+        tensor = torch.from_numpy(array)[None, ...]
+        print(f"[Kaggle H3] Resolved smoke {reference} reference: {path}", flush=True)
+        return (tensor,)
+
+
 def _set_explicit_patcher_devices(owner: Any, *, load_device: Any, offload_device: Any) -> None:
     patcher = owner if hasattr(owner, "load_device") else getattr(owner, "patcher", None)
     if patcher is None:
         raise H3PhaseError(f"{type(owner).__name__} does not expose a Comfy model patcher")
     _retarget_patcher_load_device(patcher, load_device)
     patcher.offload_device = offload_device
+
+
+def _release_comfy_model_cache_before_h3_switch() -> None:
+    """Release a previous H3 model before replacing its on-disk checkpoint."""
+
+    try:
+        import comfy.model_management as model_management  # type: ignore
+
+        unload = getattr(model_management, "unload_all_models", None)
+        if callable(unload):
+            unload()
+        empty = getattr(model_management, "soft_empty_cache", None)
+        if callable(empty):
+            empty()
+        print(
+            "[Kaggle H3] Released ComfyUI's cached model residency before diffusion switch.",
+            flush=True,
+        )
+    except Exception as exc:
+        # The native loader remains the source of truth on older Comfy builds;
+        # failing to expose a cache-release helper must not hide a download
+        # error or change the selected checkpoint.
+        print(f"[Kaggle H3] Cache release before diffusion switch unavailable: {exc}", flush=True)
 
 
 def _h3_stream_tensor(samples: dict[str, Any], stream: str) -> Any:
@@ -245,13 +401,18 @@ def _h3_move_for_consumer(tensor: Any, *, device_id: int, role: str) -> Any:
     target = torch.device(f"cuda:{int(device_id)}")
     source = getattr(tensor, "device", None)
     source_label = str(source) if source is not None else "unknown"
+    # The sampler or preceding VAE may have produced the tensor on a worker
+    # stream. Synchronize the producer and consumer devices before the copy so
+    # a direct peer transfer cannot observe a partially written activation.
+    synchronize_h3_devices((source, target), reason=f"{role} transfer before copy")
     if source_label == str(target):
         print(
             f"[Kaggle H3] Consumer routing retained {role} latent on {target}.",
             flush=True,
         )
         return tensor
-    moved = tensor.to(target)
+    moved = tensor.to(target, non_blocking=False)
+    synchronize_h3_devices((target,), reason=f"{role} transfer after copy")
     print(
         f"[Kaggle H3] Consumer routing moved {role} latent {source_label} -> {target} "
         "directly for its next consumer.",
@@ -461,13 +622,13 @@ class KaggleH3Ref2VAConditioning:
 
 
 class KaggleH3ShardedDiffusionLoader:
-    """Load H3 without allowing ComfyUI to materialize it on GPU0 first."""
+    """Select, download, and phase-load exactly one H3 diffusion variant."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "unet_name": (_folder_options("diffusion_models"),),
+                "model_variant": (["FL2VA", "Ref2VA"], {"default": "Ref2VA"}),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e5m2"], {"default": "default"}),
                 "gpu_0": ("INT", {"default": 0, "min": 0, "max": 7}),
                 "gpu_1": ("INT", {"default": 1, "min": 0, "max": 7}),
@@ -480,25 +641,53 @@ class KaggleH3ShardedDiffusionLoader:
     CATEGORY = "loaders/MiniMax H3"
 
     def load_model(
-        self, unet_name: str, weight_dtype: str = "default", gpu_0: int = 0, gpu_1: int = 1
+        self,
+        model_variant: str,
+        weight_dtype: str = "default",
+        gpu_0: int = 0,
+        gpu_1: int = 1,
     ):
-        if "minimax_h3" not in str(unet_name).lower():
-            raise H3PhaseError(
-                "Kaggle H3 Sharded Diffusion Loader received a non-H3 checkpoint: "
-                f"{unet_name!r}"
-            )
         try:
             import torch  # type: ignore
             import nodes  # type: ignore
         except Exception as exc:
             raise H3PhaseError("The H3 sharded loader must run inside ComfyUI with PyTorch") from exc
         ids = (int(gpu_0), int(gpu_1))
-        loaded = nodes.UNETLoader().load_unet(str(unet_name), str(weight_dtype))
+        try:
+            _release_comfy_model_cache_before_h3_switch()
+            diffusion_dir = h3_diffusion_directory_from_comfy()
+            switch = H3DiffusionModelManager(diffusion_dir).switch(str(model_variant))
+        except H3DiffusionModelError as exc:
+            raise H3PhaseError(f"Kaggle H3 diffusion auto-loader failed: {exc}") from exc
+        try:
+            # Resolve the file through ComfyUI's native loader after the
+            # just-in-time switch. The native loader still owns model parsing,
+            # dtype selection, patcher construction, and offloading behavior.
+            loaded = nodes.UNETLoader().load_unet(switch.spec.filename, str(weight_dtype))
+        except Exception as exc:
+            raise H3PhaseError(
+                "Kaggle H3 downloaded the selected diffusion checkpoint but "
+                f"ComfyUI could not load {switch.spec.filename!r}: {exc}"
+            ) from exc
         model = loaded[0]
+        for owner in (model, getattr(model, "model", None)):
+            if owner is None:
+                continue
+            try:
+                setattr(owner, "h3_model_variant", switch.spec.variant.lower())
+                setattr(owner, "kaggle_h3_diffusion_path", str(switch.path))
+                setattr(owner, "kaggle_h3_diffusion_revision", switch.spec.revision)
+            except Exception:
+                pass
+            options = getattr(owner, "model_options", None)
+            if isinstance(options, dict):
+                options["h3_model_variant"] = switch.spec.variant.lower()
+                options["kaggle_h3_diffusion_path"] = str(switch.path)
         if phase_policy() == "off":
             print(
-                "[Kaggle H3] H3 sharded loader honoring explicit one-GPU fallback; "
-                "the standard ComfyUI load device remains in control.",
+                "[Kaggle H3] H3 diffusion auto-loader selected "
+                f"{switch.spec.variant}; native ComfyUI loader remains in control "
+                "for the explicit one-GPU fallback.",
                 flush=True,
             )
             return (model,)
@@ -509,8 +698,10 @@ class KaggleH3ShardedDiffusionLoader:
             )
         prepare_model_for_h3_phase(model, device_ids=ids)
         print(
-            "[Kaggle H3] H3 sharded loader selected: "
-            f"checkpoint={unet_name}, loader_device=cpu, phase_gpus={list(ids)}.",
+            "[Kaggle H3] H3 diffusion auto-loader selected: "
+            f"variant={switch.spec.variant}, checkpoint={switch.path}, "
+            f"downloaded={switch.downloaded}, removed={len(switch.removed)}, "
+            f"loader_device=cpu, phase_gpus={list(ids)}.",
             flush=True,
         )
         return (model,)
@@ -855,6 +1046,10 @@ class H3VAEDecode:
             validate_finite(latent, "vae_video_in", tensor_name="video_latent")
             validate_finite(latent, "vae_video", tensor_name="video_latent")
             images = vae.decode(latent)
+            synchronize_h3_devices(
+                (getattr(images, "device", None),),
+                reason="video VAE decode completion",
+            )
             validate_finite(images, "vae_video_out", tensor_name="video_frames")
             validate_finite(images, "vae_video", tensor_name="video_frames")
             if len(images.shape) == 5:
@@ -918,6 +1113,11 @@ class H3AudioVAEDecode:
             validate_finite(audio_tensor, "vae_audio_in", tensor_name="audio_latent")
             validate_finite(audio_tensor, "vae_audio", tensor_name="audio_latent")
             audio = vae_decode_audio(vae, {"samples": audio_tensor})
+            audio_waveform = audio.get("waveform") if isinstance(audio, dict) else audio
+            synchronize_h3_devices(
+                (getattr(audio_waveform, "device", None),),
+                reason="audio VAE decode completion",
+            )
             validate_finite(audio, "vae_audio_out", tensor_name="audio_output")
             validate_finite(audio, "vae_audio", tensor_name="audio_output")
             return (_h3_finite_audio(audio),)
@@ -1240,6 +1440,10 @@ class H3TurboSampler:
                 disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
                 seed=int(noise_seed),
             )
+            synchronize_h3_devices(
+                phase_device_ids(),
+                reason="transformer sampler completion",
+            )
             validate_finite(
                 samples,
                 "sampler_final_out",
@@ -1360,6 +1564,7 @@ class H3TurboSampler:
 
 
 NODE_CLASS_MAPPINGS = {
+    "KaggleH3SmokeReference": KaggleH3SmokeReference,
     "KaggleH3Ref2VAConditioning": KaggleH3Ref2VAConditioning,
     "KaggleH3ShardedDiffusionLoader": KaggleH3ShardedDiffusionLoader,
     "KaggleH3TextEncoderLoader": KaggleH3TextEncoderLoader,
@@ -1372,8 +1577,9 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "KaggleH3SmokeReference": "Kaggle H3 | Smoke Reference (auto-resolved)",
     "KaggleH3Ref2VAConditioning": "Kaggle H3 | Ref2VA Conditioning (Seconds + Presets)",
-    "KaggleH3ShardedDiffusionLoader": "Kaggle H3 | Diffusion Shard Loader (GPU0 + GPU1)",
+    "KaggleH3ShardedDiffusionLoader": "Kaggle H3 | Diffusion Auto Loader (select FL2VA or Ref2VA)",
     "KaggleH3TextEncoderLoader": "Kaggle H3 | Text Encoder (GPU0 + GPU1)",
     "KaggleH3VAELoader": "Kaggle H3 | VAE Loader",
     "KaggleH3PhaseDispatch": "Kaggle H3 | Transformer Dispatch Barrier",
