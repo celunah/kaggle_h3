@@ -512,7 +512,10 @@ def build_workflow(
         )
     nodes["decode_audio"] = {
         "class_type": "KaggleH3AudioVAEDecode" if loader != "comfyui_sp" else "VAEDecodeAudio",
-        "inputs": {"samples": ["sample", 0], "vae": ["vae_audio", 0]},
+        # The dedicated sampler output is the audio stream on GPU0. Keeping
+        # this separate from the video latent enables a direct GPU0 -> GPU1
+        # video handoff without retaining a packed AV NestedTensor.
+        "inputs": {"samples": ["sample", 1], "vae": ["vae_audio", 0]},
     }
     if loader != "comfyui_sp":
         nodes["decode_audio"]["inputs"]["device_id"] = int(device_ids[0]) if device_ids else 0

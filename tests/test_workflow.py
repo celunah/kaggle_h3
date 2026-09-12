@@ -74,6 +74,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["decode"]["inputs"]["device_id"], 1)
         self.assertEqual(workflow["decode_audio"]["class_type"], "KaggleH3AudioVAEDecode")
         self.assertEqual(workflow["decode_audio"]["inputs"]["device_id"], 0)
+        self.assertEqual(workflow["decode"]["inputs"]["samples"], ["sample", 0])
+        self.assertEqual(workflow["decode_audio"]["inputs"]["samples"], ["sample", 1])
         self.assertEqual(workflow["video"]["inputs"]["color_space"], "sRGB")
 
     def test_default_turbo_smoke_template_matches_ref2va_active_mode(self):

@@ -204,7 +204,14 @@ decode. The text-encoder and VAE phases have matching cleanup paths, including
 failure cleanup, so a sampler or decode exception does not intentionally retain
 their GPU pages.
 The explicit VAE loader/decoder nodes then target video at GPU1 and audio at
-GPU0, while retaining CPU as the offload device.
+GPU0, while retaining CPU as the offload device. The dedicated sampler now
+returns separate `video_latent` and `audio_latent` outputs. The H3 final AV
+output is kept on GPU0; video is transferred directly GPU0 -> GPU1 only when
+the video VAE consumes it, audio stays on GPU0, and decoded frames/waveform
+are moved to CPU before `CreateVideo`/`SaveVideo`. This avoids CPU staging of a
+packed AV NestedTensor and avoids retaining the unused stream in each decoder.
+The audio decoder also reports and replaces non-finite VAE samples before the
+AAC mux boundary, preventing PyAV's opaque `avcodec_send_frame()` failure.
 
 This remains experimental because ComfyUI's ordinary `ModelPatcher` also
 manages model loading. If Accelerate cannot coexist with the installed

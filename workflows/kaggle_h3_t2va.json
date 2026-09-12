@@ -57,7 +57,7 @@
   },
   "decode_audio": {
     "class_type": "KaggleH3AudioVAEDecode",
-    "inputs": {"samples": ["sample", 0], "vae": ["vae_audio", 0], "device_id": 0},
+    "inputs": {"samples": ["sample", 1], "vae": ["vae_audio", 0], "device_id": 0},
     "_meta": {"title": "Kaggle H3 | Audio Decode (GPU0)"}
   },
   "video": {

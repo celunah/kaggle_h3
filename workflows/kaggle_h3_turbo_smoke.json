@@ -118,7 +118,7 @@
   "decode_audio": {
     "class_type": "KaggleH3AudioVAEDecode",
     "inputs": {
-      "samples": ["sample", 0],
+      "samples": ["sample", 1],
       "vae": ["vae_audio", 0],
       "device_id": 0,
       "runtime_config": ["h3_adapter", 1]

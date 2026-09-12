@@ -163,6 +163,106 @@ def _set_explicit_patcher_devices(owner: Any, *, load_device: Any, offload_devic
     patcher.offload_device = offload_device
 
 
+def _h3_stream_tensor(samples: dict[str, Any], stream: str) -> Any:
+    """Return one H3 AV stream without copying the other stream.
+
+    Native H3 sampling produces a NestedTensor pair: video at index 0 and
+    audio at index 1. The sampler converts that pair into two ordinary
+    ComfyUI LATENT values so each downstream VAE owns only the tensor it will
+    consume. Accept the old packed form here as a migration path for hand
+    edited workflows, but reject an ambiguous audio input rather than decoding
+    the video stream through the audio VAE.
+    """
+
+    packed = samples.get("samples") if isinstance(samples, dict) else None
+    if packed is None:
+        raise RuntimeError(f"H3 {stream} latent is missing its samples tensor")
+    if bool(getattr(packed, "is_nested", False)):
+        unbind = getattr(packed, "unbind", None)
+        if not callable(unbind):
+            raise RuntimeError("H3 NestedTensor does not expose unbind()")
+        streams = tuple(unbind())
+        if len(streams) != 2:
+            raise RuntimeError(
+                f"H3 AV latent must contain exactly video+audio streams; got {len(streams)}"
+            )
+        return streams[0 if stream == "video" else 1]
+    declared = samples.get("_kaggle_h3_stream")
+    if declared == stream:
+        return packed
+    if stream == "video" and declared is None:
+        # This is the legacy video output shape. Audio remains intentionally
+        # strict because treating a plain video tensor as audio is destructive.
+        return packed
+    raise RuntimeError(
+        f"H3 {stream} decoder received an ambiguous latent. Reconnect it to the "
+        "dedicated output of Kaggle H3 | Turbo Sampler."
+    )
+
+
+def _h3_move_for_consumer(tensor: Any, *, device_id: int, role: str) -> Any:
+    """Move one stream directly to its next consumer, retaining CPU as tier 3."""
+
+    import torch
+
+    target = torch.device(f"cuda:{int(device_id)}")
+    source = getattr(tensor, "device", None)
+    source_label = str(source) if source is not None else "unknown"
+    if source_label == str(target):
+        print(
+            f"[Kaggle H3] Consumer routing retained {role} latent on {target}.",
+            flush=True,
+        )
+        return tensor
+    moved = tensor.to(target)
+    print(
+        f"[Kaggle H3] Consumer routing moved {role} latent {source_label} -> {target} "
+        "directly for its next consumer.",
+        flush=True,
+    )
+    return moved
+
+
+def _h3_finite_audio(audio: dict[str, Any]) -> dict[str, Any]:
+    """Make the final audio codec boundary finite and CPU-owned.
+
+    The H3 audio VAE can produce a non-finite sample when an unstable audio
+    latent reaches its normalization step. PyAV reports this much later as
+    ``avcodec_send_frame`` error 22, which otherwise hides the real boundary.
+    Replace only non-finite samples with silence, log the event, clamp the
+    codec input to the legal PCM range, and release the GPU waveform.
+    """
+
+    import torch
+
+    waveform = audio.get("waveform")
+    if waveform is None:
+        raise RuntimeError("H3 audio VAE returned no waveform")
+    finite = torch.isfinite(waveform)
+    nonfinite_count = int((~finite).sum().item())
+    if nonfinite_count:
+        print(
+            "[Kaggle H3] WARNING: audio VAE produced "
+            f"{nonfinite_count} non-finite samples; replacing them with silence "
+            "so SaveVideo/AAC can complete.",
+            flush=True,
+        )
+        waveform = torch.nan_to_num(
+            waveform,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+    peak = float(waveform.detach().abs().amax().item()) if waveform.numel() else 0.0
+    if peak > 1.0:
+        print(
+            f"[Kaggle H3] Clamping audio codec input peak {peak:.4g} to [-1, 1].",
+            flush=True,
+        )
+    waveform = waveform.clamp(-1.0, 1.0).to("cpu")
+    return {"waveform": waveform, "sample_rate": audio["sample_rate"]}
+
+
 class KaggleH3ShardedDiffusionLoader:
     """Load H3 without allowing ComfyUI to materialize it on GPU0 first."""
 
@@ -541,13 +641,16 @@ class H3VAEDecode:
                 runtime_config=runtime_config,
             )
             _enable_h3_decode_weight_casting(vae)
-            latent = _coerce_h3_video_samples(vae, samples)["samples"]
-            if getattr(latent, "is_nested", False):
-                latent = latent.unbind()[0]
+            video_samples = {"samples": _h3_stream_tensor(samples, "video")}
+            video_samples = _coerce_h3_video_samples(vae, video_samples)
+            latent = _h3_move_for_consumer(
+                video_samples["samples"], device_id=int(device_id), role="video VAE"
+            )
             images = vae.decode(latent)
             if len(images.shape) == 5:
                 images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
-            return (images,)
+            # The encoder and CreateVideo do not need GPU-resident frames.
+            return (images.to("cpu"),)
         finally:
             release_vae_phase(vae, role="video")
 
@@ -591,7 +694,14 @@ class H3AudioVAEDecode:
                 from comfy_extras.nodes_audio import vae_decode_audio  # type: ignore
             except ImportError:
                 from nodes_audio import vae_decode_audio  # type: ignore
-            return (vae_decode_audio(vae, samples),)
+            audio_samples = {
+                "samples": _h3_stream_tensor(samples, "audio"),
+            }
+            audio_tensor = _h3_move_for_consumer(
+                audio_samples["samples"], device_id=int(device_id), role="audio VAE"
+            )
+            audio = vae_decode_audio(vae, {"samples": audio_tensor})
+            return (_h3_finite_audio(audio),)
         finally:
             release_vae_phase(vae, role="audio")
 
@@ -756,8 +866,8 @@ class H3TurboSampler:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "LATENT")
-    RETURN_NAMES = ("output", "denoised_output")
+    RETURN_TYPES = ("LATENT", "LATENT", "LATENT")
+    RETURN_NAMES = ("video_latent", "audio_latent", "denoised_output")
     FUNCTION = "sample"
     CATEGORY = "sampling/MiniMax H3"
 
@@ -907,18 +1017,67 @@ class H3TurboSampler:
                 disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
                 seed=int(noise_seed),
             )
-            samples = samples.to(comfy.model_management.intermediate_device())
-            output = latent.copy()
-            output.pop("downscale_ratio_spacial", None)
-            output.pop("downscale_ratio_temporal", None)
-            output["samples"] = samples
+
+            # H3 returns a NestedTensor pair. Keep the final output on the
+            # phase primary GPU, then expose separate consumer-owned streams:
+            # video can cross GPU0 -> GPU1 once, while audio stays on GPU0.
+            # Moving the packed result to Comfy's intermediate device here
+            # would force both streams through CPU and retain an unnecessary
+            # video+audio container until both decoders finish.
+            video_tensor = _h3_stream_tensor({"samples": samples}, "video")
+            audio_tensor = _h3_stream_tensor({"samples": samples}, "audio")
+            phase_ids = tuple(phase_device_ids())
+            primary_id = int(phase_ids[0]) if phase_ids else 0
+            video_id = int(phase_ids[1]) if len(phase_ids) > 1 else primary_id
+            video_tensor = _h3_move_for_consumer(
+                video_tensor, device_id=primary_id, role="final video output"
+            )
+            audio_tensor = _h3_move_for_consumer(
+                audio_tensor, device_id=primary_id, role="final audio output"
+            )
+            video_output = {
+                "samples": video_tensor,
+                "type": "h3_video",
+                "_kaggle_h3_stream": "video",
+                "_kaggle_h3_final_device": str(video_tensor.device),
+                "_kaggle_h3_next_device": f"cuda:{video_id}",
+            }
+            audio_output = {
+                "samples": audio_tensor,
+                "type": "h3_audio",
+                "_kaggle_h3_stream": "audio",
+                "_kaggle_h3_final_device": str(audio_tensor.device),
+                "_kaggle_h3_next_device": f"cuda:{primary_id}",
+            }
+            if isinstance(runtime_config, dict):
+                execution = dict(runtime_config.get("execution") or {})
+                execution["consumer_aware_latent_routing"] = {
+                    "h3_final_output": f"cuda:{primary_id}",
+                    "video": {
+                        "source": str(video_tensor.device),
+                        "next_consumer": f"cuda:{video_id}",
+                        "transfer": "direct_gpu_to_gpu" if video_id != primary_id else "same_device",
+                        "cpu_staging": False,
+                    },
+                    "audio": {
+                        "source": str(audio_tensor.device),
+                        "next_consumer": f"cuda:{primary_id}",
+                        "transfer": "same_device",
+                        "cpu_staging": False,
+                    },
+                    "decoded_outputs": "GPU_to_CPU_before_encode",
+                }
+                runtime_config["execution"] = execution
             if "x0" in x0_output:
                 denoised = latent.copy()
                 # Convert this before the transformer is unloaded; this is
                 # the only post-sample operation that still needs the model.
                 denoised["samples"] = guider.model_patcher.model.process_latent_out(x0_output["x0"].cpu())
             else:
-                denoised = output
+                # Do not retain a second packed AV NestedTensor just for an
+                # unconsumed fallback output. The primary video result is the
+                # same denoised sample in this branch and shares its storage.
+                denoised = video_output
         finally:
             comfy.sampler_helpers.prepare_sampling = original_prepare_sampling
             phase_state = phase_holder.get("state")
@@ -964,7 +1123,7 @@ class H3TurboSampler:
             f"shift={schedule.get('shift_video')}/{schedule.get('shift_audio')}",
             flush=True,
         )
-        return (output, denoised)
+        return (video_output, audio_output, denoised)
 
 
 NODE_CLASS_MAPPINGS = {

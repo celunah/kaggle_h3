@@ -81,6 +81,11 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
             self.assertIn(name, inputs["required"])
         self.assertEqual(inputs["required"]["turbo_steps"][0], ["4", "8"])
         self.assertEqual(module.H3AdapterStack.RETURN_TYPES, ("MODEL", "H3_RUNTIME_CONFIG"))
+        self.assertEqual(module.H3TurboSampler.RETURN_TYPES, ("LATENT", "LATENT", "LATENT"))
+        self.assertEqual(
+            module.H3TurboSampler.RETURN_NAMES,
+            ("video_latent", "audio_latent", "denoised_output"),
+        )
         self.assertEqual(module.H3VAEDecode.INPUT_TYPES()["required"]["device_id"][1]["default"], 1)
         self.assertEqual(module.H3AudioVAEDecode.INPUT_TYPES()["required"]["device_id"][1]["default"], 0)
 
@@ -161,6 +166,37 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         changed = module._enable_h3_decode_weight_casting(vae)
         self.assertEqual(changed, 1)
         self.assertTrue(model.decoder.x_embedder.comfy_cast_weights)
+
+    def test_h3_consumer_routing_splits_nested_video_and_audio_streams(self):
+        module = load_node_module()
+        import torch
+
+        video = torch.zeros((1, 24, 2, 22, 38))
+        audio = torch.zeros((1, 32, 2, 248))
+
+        class Packed:
+            is_nested = True
+
+            def unbind(self):
+                return video, audio
+
+        samples = {"samples": Packed()}
+        self.assertIs(module._h3_stream_tensor(samples, "video"), video)
+        self.assertIs(module._h3_stream_tensor(samples, "audio"), audio)
+
+    def test_h3_audio_codec_boundary_replaces_nonfinite_samples_and_moves_to_cpu(self):
+        module = load_node_module()
+        import torch
+
+        audio = module._h3_finite_audio(
+            {
+                "waveform": torch.tensor([[[0.25, float("nan"), 2.0, float("-inf")]]]),
+                "sample_rate": 32000,
+            }
+        )
+        self.assertEqual(audio["waveform"].device.type, "cpu")
+        self.assertTrue(torch.isfinite(audio["waveform"]).all())
+        self.assertLessEqual(float(audio["waveform"].abs().max()), 1.0)
 
     def test_turbo_workflow_routes_both_outputs_into_dedicated_sampler(self):
         request = H3Request(
