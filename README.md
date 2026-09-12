@@ -170,7 +170,7 @@ The worker builder exposes the official two-GPU memory-mode shape (`--num-gpus 2
 
 ### Diffusers
 
-The evaluator reports the generic Accelerate `balanced` probe, the automatic layer-sharded worker, and the explicit component split separately. Install `requirements-h3-layer-sharded.txt` when testing the new worker; the base requirements intentionally avoid pulling that optional stack into every ComfyUI-only session. The layer worker discovers the largest indexed H3 transformer block sequence, constructs a meta model to size it without a full CPU duplicate, creates a memory-budgeted hierarchical map, and loads complete residual blocks directly across every visible GPU. For the current 50-block H3 model it tries the proposed `blocks[0:23]` on GPU 0 and `blocks[23:50]` on GPU 1, with input projections/token refinement on GPU 0 and output/final layers on GPU 1. Other indexed block counts receive a balanced contiguous split. CPU RAM plus `/kaggle/tmp` disk are overflow tiers. It inspects the resulting parameter devices after loading and refuses to continue if the map collapses to one GPU. The conditioner is run first and released before denoiser materialization, avoiding a resident duplicate Qwen copy during denoising. The current worker does not claim an internal Qwen 21/29 layer split or a split VAE forward; it uses ComponentsManager for the temporary conditioner/VAE stages until those paths can be verified against the installed H3 implementation. Its live safety gate uses at least 12 GiB free on each GPU and 24 GiB available host RAM; these are attempt thresholds, not claims that H3 is guaranteed to fit. The explicit component split remains available for comparison, while a generic `device_map="balanced"` is not treated as sufficient evidence by itself.
+The evaluator reports the generic Accelerate `balanced` probe, the automatic layer-sharded worker, and the explicit component split separately. Install `requirements-h3-layer-sharded.txt` when testing the new worker; the base requirements intentionally avoid pulling that optional stack into every ComfyUI-only session. The layer worker discovers the largest indexed H3 transformer block sequence, constructs a meta model to size it without a full CPU duplicate, creates a memory-budgeted hierarchical map, and loads complete residual blocks directly across every visible GPU. For the current 50-block H3 model it tries the proposed `blocks[0:23]` on GPU 0 and `blocks[23:50]` on GPU 1, with input projections/token refinement and the quantized output/final path on GPU 0. Other indexed block counts receive a balanced contiguous split. CPU RAM plus `/kaggle/tmp` disk are overflow tiers. It inspects the resulting parameter devices after loading and refuses to continue if the map collapses to one GPU. The conditioner is run first and released before denoiser materialization, avoiding a resident duplicate Qwen copy during denoising. The current worker does not claim an internal Qwen 21/29 layer split or a split VAE forward; it uses ComponentsManager for the temporary conditioner/VAE stages until those paths can be verified against the installed H3 implementation. Its live safety gate uses a 13 GiB/card residency budget, a 14 GiB process ceiling, and 26 GiB available host RAM; these are attempt thresholds, not claims that H3 is guaranteed to fit. The explicit component split remains available for comparison, while a generic `device_map="balanced"` is not treated as sufficient evidence by itself.
 
 ### ComfyUI sequence-parallel custom node
 
@@ -184,12 +184,14 @@ layers contiguously across GPU0 and GPU1 during conditioning. The existing
 workflow `device_id=0` means the primary boundary device; it does not disable
 text-layer sharding. `KaggleH3PhaseDispatch` is a graph barrier: it runs after the H3
 conditioning node, discovers the largest indexed block sequence, and applies
-the 14 GiB/card and 24 GiB CPU-headroom map across both GPUs. For ComfyUI's
+the 13 GiB/card residency and 26 GiB CPU-headroom map across both GPUs. For ComfyUI's
 INT8 ConvRot H3 weights it does not call Accelerate's generic tensor hook:
 that hook reconstructs `comfy_kitchen.QuantizedTensor` with an unsupported
 `requires_grad` argument. Instead, GPU-budgeted blocks are moved through
 ComfyUI's native quantized `_apply` path, CPU/disk-tier blocks remain
 CPU-owned, and activation arguments are routed to the assigned GPU. The
+quantized final/output path stays on the primary GPU so its internal dtype
+conversion never crosses a live device boundary. The
 report records both the physical parameter map and the actual execution map.
 The sampler preserves that map by filtering the already-dispatched H3 model
 out of ComfyUI's subsequent global `load_models_gpu()` call. A lightweight

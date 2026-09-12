@@ -318,8 +318,8 @@ def prepare_text_encoder_for_h3_phase(
         _dispatched, report, handles = dispatch_h3_text_encoder(
             encoder,
             device_ids=ids,
-            gpu_limit_gib=14.0,
-            cpu_headroom_gib=24.0,
+            gpu_limit_gib=13.0,
+            cpu_headroom_gib=26.0,
             offload_dir=offload_dir,
         )
     except ImportError:
@@ -328,8 +328,8 @@ def prepare_text_encoder_for_h3_phase(
         _dispatched, report, handles = dispatch_h3_text_encoder(
             encoder,
             device_ids=ids,
-            gpu_limit_gib=14.0,
-            cpu_headroom_gib=24.0,
+            gpu_limit_gib=13.0,
+            cpu_headroom_gib=26.0,
             offload_dir=offload_dir,
         )
     primary = torch.device(f"cuda:{ids[0]}")
@@ -564,8 +564,8 @@ def build_phase_runtime_config(
         "transformer": {
             "dispatch": "automatic_contiguous_intact_blocks",
             "device_ids": list(ids),
-            "gpu_budget_gib": 14.0,
-            "cpu_headroom_gib": 24.0,
+            "gpu_budget_gib": 13.0,
+            "cpu_headroom_gib": 26.0,
             "offload_dir": offload,
         },
         "audio_vae": f"cuda:{ids[0]}" if ids else "cuda:0",
@@ -1030,8 +1030,8 @@ def begin_transformer_phase(
             transformer,
             device_ids=ids,
             offload_dir=offload_dir or phase_offload_dir(),
-            gpu_limit_gib=14.0,
-            cpu_headroom_gib=24.0,
+            gpu_limit_gib=13.0,
+            cpu_headroom_gib=26.0,
             preferred_layout="h3_two_t4_preferred",
         )
     except Exception as exc:

@@ -791,8 +791,8 @@ def build_runtime_config(
             "text_encoder": "automatic_contiguous_language_layers_cuda_0_cuda_1_then_cpu",
             "transformer": {
                 "dispatch": "automatic_contiguous_intact_blocks",
-                "gpu_budget_gib": 14.0,
-                "cpu_headroom_gib": 24.0,
+                "gpu_budget_gib": 13.0,
+                "cpu_headroom_gib": 26.0,
             },
             "audio_vae": "cuda:0",
             "video_vae": "cuda:1",

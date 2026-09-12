@@ -25,9 +25,12 @@ from typing import Any, Iterable
 
 
 GIB = 2**30
-DEFAULT_GPU_LIMIT_GIB = 14.0
+# This is the H3 phase residency budget, not a claim that the whole process
+# may safely consume this much. ComfyUI's quantized casts and denoising
+# activations need room above the resident block weights.
+DEFAULT_GPU_LIMIT_GIB = 13.0
 DEFAULT_GPU_RESERVE_GIB = 0.5
-DEFAULT_CPU_HEADROOM_GIB = 24.0
+DEFAULT_CPU_HEADROOM_GIB = 26.0
 PREFERRED_H3_FIRST_GPU_BLOCKS = 23
 
 
@@ -477,8 +480,13 @@ def _preferred_h3_component_device(name: str, device_ids: list[int]) -> int | No
         "video_patch_proj",
         "audio_patch_proj",
     }
+    # ComfyUI's INT8/ConvRot output path ends with a dtype/device conversion
+    # inside MiniMax's FinalLayer. Keep that complete path on the primary side
+    # so comfy_kitchen never materializes a quantized tensor on one GPU and
+    # converts it on the other. The repeated transformer blocks still span
+    # both GPUs; only this boundary is intentionally pinned.
     if lower in output_names or lower.endswith(".final_layer"):
-        return device_ids[-1]
+        return device_ids[0]
     if lower in input_names:
         return device_ids[0]
     return None
@@ -496,11 +504,13 @@ def _plan_preferred_h3_t4_layout(
     """Plan the proposed H3 two-T4 layout while retaining CPU/disk tiers.
 
     For the current 50-block H3 transformer this places blocks 0-22 on the
-    first GPU and blocks 23-49 on the second GPU.  The input projections and
-    token refiner follow the first side; output/final layers follow the second
-    side.  Other indexed block counts use the same contiguous split at the
-    nearest balanced boundary, so this remains structural rather than tied to
-    one checkpoint filename.
+    first GPU and blocks 23-49 on the second GPU. The input projections,
+    token refiner, and quantized output/final path follow the first side. The
+    output path is deliberately kept intact on one device because ComfyUI's
+    quantized tensor conversion is not safe across a live device boundary.
+    Other indexed block counts use the same contiguous split at the nearest
+    balanced boundary, so this remains structural rather than tied to one
+    checkpoint filename.
     """
 
     if len(device_ids) != 2:
@@ -524,8 +534,20 @@ def _plan_preferred_h3_t4_layout(
 
     def place_component(name: str, size: int, preferred: int | None) -> None:
         nonlocal cpu_used
+        normalized = name.lower().replace("-", "_")
+        output_path = normalized in {
+            "final_layer",
+            "norm_out",
+            "proj_out",
+            "audio_proj_out",
+        }
         candidates = sorted(device_ids, key=lambda device_id: loads[device_id])
-        if preferred is not None:
+        if preferred is not None and output_path:
+            # A quantized output module may use .to(dtype) internally before
+            # the parent hook runs. It must stay on the primary device or move
+            # to CPU/disk; falling back to GPU1 recreates the native abort.
+            candidates = [preferred]
+        elif preferred is not None:
             candidates = [preferred] + [device_id for device_id in candidates if device_id != preferred]
         for device_id in candidates:
             if loads[device_id] + size <= gpu_budgets[device_id]:
@@ -627,8 +649,8 @@ def _plan_preferred_h3_t4_layout(
         "uses_all_requested_gpus": True,
         "strategy": "h3_two_t4_preferred_contiguous_blocks",
         "preferred_layout": {
-            "gpu_0": f"{group.container_path}[0:{split}] plus input projections/token_refiner",
-            "gpu_1": f"{group.container_path}[{split}:] plus final/output layers",
+            "gpu_0": f"{group.container_path}[0:{split}] plus input projections/token_refiner and final/output layers",
+            "gpu_1": f"{group.container_path}[{split}:]",
             "activation_boundary": f"after {group.container_path}.{split - 1} before {group.container_path}.{split}",
             "conditioning": "temporary conditioner placement is managed by the worker before denoiser materialization",
             "preferred_component_fallbacks": preferred_fallbacks,
@@ -696,7 +718,19 @@ def plan_layer_device_map(
         if size == 0:
             device_map[name] = ids[0]
             continue
-        candidates = sorted(ids, key=lambda device_id: loads[device_id])
+        preferred = _preferred_h3_component_device(name, ids)
+        if preferred is not None and name.lower().replace("-", "_") in {
+            "final_layer",
+            "norm_out",
+            "proj_out",
+            "audio_proj_out",
+        }:
+            # The quantized output path must not fall back to the other GPU:
+            # its internal dtype conversion happens before an outer hook can
+            # repair the activation device.
+            candidates = [preferred]
+        else:
+            candidates = sorted(ids, key=lambda device_id: loads[device_id])
         placed = False
         for device_id in candidates:
             if loads[device_id] + size <= gpu_budgets[device_id]:

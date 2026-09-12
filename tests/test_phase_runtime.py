@@ -46,8 +46,8 @@ class PhaseRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(plan["audio_vae"], "cuda:0")
         self.assertEqual(plan["video_vae"], "cuda:1")
-        self.assertEqual(plan["transformer"]["gpu_budget_gib"], 14.0)
-        self.assertEqual(plan["transformer"]["cpu_headroom_gib"], 24.0)
+        self.assertEqual(plan["transformer"]["gpu_budget_gib"], 13.0)
+        self.assertEqual(plan["transformer"]["cpu_headroom_gib"], 26.0)
         self.assertTrue(plan["release_transformer_before_decode"])
 
     def test_invalid_phase_policy_is_rejected(self):

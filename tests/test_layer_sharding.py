@@ -139,7 +139,7 @@ class LayerShardingTests(unittest.TestCase):
         self.assertEqual(layer_devices[23:], ["cuda:1"] * 27)
         self.assertEqual(plan["device_map"]["proj_in"], 0)
         self.assertEqual(plan["device_map"]["token_refiner"], 0)
-        self.assertEqual(plan["device_map"]["norm_out"], 1)
+        self.assertEqual(plan["device_map"]["norm_out"], 0)
         self.assertEqual(plan["strategy"], "h3_two_t4_preferred_contiguous_blocks")
         self.assertIn("after transformer_blocks.22", plan["preferred_layout"]["activation_boundary"])
 
