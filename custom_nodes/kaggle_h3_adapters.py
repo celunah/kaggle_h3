@@ -72,6 +72,40 @@ except ImportError:
         selector_options = core_module.selector_options
 
 
+try:
+    from kaggle_h3.ref2va import (
+        H3_MAX_SECONDS,
+        H3_MIN_FRAMES,
+        REF2VA_SIZE_PRESETS,
+        resolve_ref2va_dimensions,
+        resolve_ref2va_length,
+    )
+except ImportError:
+    try:
+        from kaggle_h3_ref2va import (  # type: ignore
+            H3_MAX_SECONDS,
+            H3_MIN_FRAMES,
+            REF2VA_SIZE_PRESETS,
+            resolve_ref2va_dimensions,
+            resolve_ref2va_length,
+        )
+    except ImportError:
+        ref2va_path = Path(__file__).with_name("kaggle_h3_ref2va.py")
+        ref2va_spec = importlib.util.spec_from_file_location(
+            "kaggle_h3_ref2va", ref2va_path
+        )
+        if ref2va_spec is None or ref2va_spec.loader is None or not ref2va_path.is_file():
+            raise ImportError(f"Cannot load standalone H3 Ref2VA helper: {ref2va_path}")
+        ref2va_module = importlib.util.module_from_spec(ref2va_spec)
+        sys.modules[ref2va_spec.name] = ref2va_module
+        ref2va_spec.loader.exec_module(ref2va_module)
+        H3_MAX_SECONDS = ref2va_module.H3_MAX_SECONDS
+        H3_MIN_FRAMES = ref2va_module.H3_MIN_FRAMES
+        REF2VA_SIZE_PRESETS = ref2va_module.REF2VA_SIZE_PRESETS
+        resolve_ref2va_dimensions = ref2va_module.resolve_ref2va_dimensions
+        resolve_ref2va_length = ref2va_module.resolve_ref2va_length
+
+
 CATALOG_PATH = Path(__file__).with_name("kaggle_h3_adapter_catalog.json")
 
 try:
@@ -261,6 +295,166 @@ def _h3_finite_audio(audio: dict[str, Any]) -> dict[str, Any]:
         )
     waveform = waveform.clamp(-1.0, 1.0).to("cpu")
     return {"waveform": waveform, "sample_rate": audio["sample_rate"]}
+
+
+def _native_ref2va_conditioning():
+    """Load ComfyUI's reference conditioner only when the node executes."""
+
+    try:
+        from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Kaggle H3 Ref2VA Conditioning requires ComfyUI's native "
+            "comfy_extras.nodes_minimax_h3 module. Update ComfyUI to a build "
+            "that includes MiniMax H3 support."
+        ) from exc
+    return MiniMaxH3ReferenceToVideo
+
+
+def _node_output_values(result: Any) -> tuple[Any, ...]:
+    """Convert a native V3 NodeOutput to a V1 custom-node return tuple."""
+
+    values = getattr(result, "result", None)
+    if values is not None:
+        return tuple(values)
+    if isinstance(result, tuple):
+        return result
+    raise RuntimeError(
+        "ComfyUI's MiniMax H3 Ref2VA conditioner returned an unsupported result "
+        f"type: {type(result).__name__}"
+    )
+
+
+class KaggleH3Ref2VAConditioning:
+    """Ref2VA conditioner with seconds, aligned size presets, and ordered refs.
+
+    V1 custom nodes cannot expose native ``io.Autogrow`` sockets, so this node
+    provides bounded optional slots.  Users can connect any number of slots up
+    to H3's native limits; empty slots are omitted before calling the native
+    conditioner.  The native implementation remains responsible for actual
+    reference resizing, tokenization, and VAE reference encoding.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        optional: dict[str, Any] = {}
+        for index in range(9):
+            optional[f"ref_image_{index}"] = ("IMAGE",)
+        for index in range(3):
+            optional[f"ref_video_{index}"] = ("IMAGE",)
+            optional[f"ref_video_audio_{index}"] = ("AUDIO",)
+            optional[f"ref_audio_{index}"] = ("AUDIO",)
+        return {
+            "required": {
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "audio_vae": ("VAE",),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+                "seconds": (
+                    "FLOAT",
+                    {
+                        "default": 5.0,
+                        "min": H3_MIN_FRAMES / 24.0,
+                        "max": H3_MAX_SECONDS,
+                        "step": 0.001,
+                    },
+                ),
+                "size_preset": (
+                    list(REF2VA_SIZE_PRESETS),
+                    {"default": "480p"},
+                ),
+                "aspect_ratio": (["16:9", "4:3"], {"default": "16:9"}),
+                "ref_image_size": (["match", "max"], {"default": "match"}),
+            },
+            "optional": optional,
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "latent")
+    FUNCTION = "condition"
+    CATEGORY = "conditioning/MiniMax H3"
+
+    def condition(
+        self,
+        clip: Any,
+        vae: Any,
+        audio_vae: Any,
+        prompt: str,
+        seconds: float,
+        size_preset: str,
+        aspect_ratio: str,
+        ref_image_size: str = "match",
+        **references: Any,
+    ):
+        width, height = resolve_ref2va_dimensions(size_preset, aspect_ratio)
+        length = resolve_ref2va_length(seconds)
+        ref_images = {
+            f"ref_image_{index}": references.get(f"ref_image_{index}")
+            for index in range(9)
+            if references.get(f"ref_image_{index}") is not None
+        }
+        ref_videos = {
+            f"ref_video_{index}": references.get(f"ref_video_{index}")
+            for index in range(3)
+            if references.get(f"ref_video_{index}") is not None
+        }
+        ref_video_audios = {
+            f"ref_video_audio_{index}": references.get(f"ref_video_audio_{index}")
+            for index in range(3)
+            if references.get(f"ref_video_audio_{index}") is not None
+        }
+        ref_audios = {
+            f"ref_audio_{index}": references.get(f"ref_audio_{index}")
+            for index in range(3)
+            if references.get(f"ref_audio_{index}") is not None
+        }
+        if not ref_images and not ref_videos:
+            raise ValueError(
+                "Kaggle H3 Ref2VA Conditioning needs at least one image or video "
+                "reference; audio alone cannot define Ref2VA subject conditioning."
+            )
+        orphan_video_audio = sorted(
+            index
+            for index in range(3)
+            if f"ref_video_audio_{index}" in ref_video_audios
+            and f"ref_video_{index}" not in ref_videos
+        )
+        if orphan_video_audio:
+            indexes = ", ".join(str(index) for index in orphan_video_audio)
+            raise ValueError(
+                "Each ref_video_audio_N must be connected with the matching "
+                f"ref_video_N; orphan audio slot(s): {indexes}."
+            )
+        if not prompt or not str(prompt).strip():
+            raise ValueError("Kaggle H3 Ref2VA Conditioning prompt must not be empty")
+
+        print(
+            "[Kaggle H3] Ref2VA conditioning: "
+            f"canvas={width}x{height}, requested_seconds={float(seconds):g}, "
+            f"frames={length['actual_frames']}, actual_seconds={length['actual_seconds']}, "
+            f"images={len(ref_images)}, videos={len(ref_videos)}, "
+            f"video_audio={len(ref_video_audios)}, audio={len(ref_audios)}.",
+            flush=True,
+        )
+        native = _native_ref2va_conditioning()
+        try:
+            result = native.execute(
+                clip=clip,
+                vae=vae,
+                audio_vae=audio_vae,
+                prompt=prompt,
+                width=width,
+                height=height,
+                length=int(length["actual_frames"]),
+                ref_image_size=ref_image_size,
+                ref_images=ref_images,
+                ref_videos=ref_videos,
+                ref_video_audios=ref_video_audios,
+                ref_audios=ref_audios,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Kaggle H3 Ref2VA conditioning failed: {exc}") from exc
+        return _node_output_values(result)
 
 
 class KaggleH3ShardedDiffusionLoader:
@@ -1127,6 +1321,7 @@ class H3TurboSampler:
 
 
 NODE_CLASS_MAPPINGS = {
+    "KaggleH3Ref2VAConditioning": KaggleH3Ref2VAConditioning,
     "KaggleH3ShardedDiffusionLoader": KaggleH3ShardedDiffusionLoader,
     "KaggleH3TextEncoderLoader": KaggleH3TextEncoderLoader,
     "KaggleH3VAELoader": KaggleH3VAELoader,
@@ -1138,6 +1333,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "KaggleH3Ref2VAConditioning": "Kaggle H3 | Ref2VA Conditioning (Seconds + Presets)",
     "KaggleH3ShardedDiffusionLoader": "Kaggle H3 | Diffusion Shard Loader (GPU0 + GPU1)",
     "KaggleH3TextEncoderLoader": "Kaggle H3 | Text Encoder (GPU0 + GPU1)",
     "KaggleH3VAELoader": "Kaggle H3 | VAE Loader",

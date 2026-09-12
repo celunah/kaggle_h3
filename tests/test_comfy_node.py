@@ -33,6 +33,7 @@ class ComfyNodeTests(unittest.TestCase):
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "adapters.py", node_dir / "kaggle_h3_adapter_core.py")
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "phase_runtime.py", node_dir / "kaggle_h3_phase_runtime.py")
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "layer_sharding.py", node_dir / "kaggle_h3_layer_sharding.py")
+            shutil.copy2(ROOT / "src" / "kaggle_h3" / "ref2va.py", node_dir / "kaggle_h3_ref2va.py")
             shutil.copy2(ROOT / "custom_nodes" / "kaggle_h3_adapter_catalog.json", node_dir / "kaggle_h3_adapter_catalog.json")
             script = """
 import importlib.util
@@ -45,6 +46,7 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 assert set(module.NODE_CLASS_MAPPINGS) == {
+    "KaggleH3Ref2VAConditioning",
     "KaggleH3ShardedDiffusionLoader",
     "KaggleH3TextEncoderLoader",
     "KaggleH3VAELoader",
@@ -68,6 +70,7 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
 
     def test_registration_and_interface_are_present(self):
         module = load_node_module()
+        self.assertIn("KaggleH3Ref2VAConditioning", module.NODE_CLASS_MAPPINGS)
         self.assertIn("KaggleH3AdapterStack", module.NODE_CLASS_MAPPINGS)
         self.assertIn("KaggleH3ShardedDiffusionLoader", module.NODE_CLASS_MAPPINGS)
         self.assertIn("KaggleH3TextEncoderLoader", module.NODE_CLASS_MAPPINGS)
@@ -88,6 +91,60 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         )
         self.assertEqual(module.H3VAEDecode.INPUT_TYPES()["required"]["device_id"][1]["default"], 1)
         self.assertEqual(module.H3AudioVAEDecode.INPUT_TYPES()["required"]["device_id"][1]["default"], 0)
+        ref2va_inputs = module.KaggleH3Ref2VAConditioning.INPUT_TYPES()
+        self.assertEqual(ref2va_inputs["required"]["size_preset"][0], ["240p", "360p", "480p", "720p"])
+        self.assertEqual(ref2va_inputs["required"]["aspect_ratio"][0], ["16:9", "4:3"])
+        self.assertAlmostEqual(ref2va_inputs["required"]["seconds"][1]["min"], 39 / 24)
+        self.assertIn("ref_image_8", ref2va_inputs["optional"])
+        self.assertIn("ref_video_audio_2", ref2va_inputs["optional"])
+
+    def test_ref2va_conditioning_translates_controls_and_preserves_slot_names(self):
+        module = load_node_module()
+        captured = {}
+
+        class Result:
+            result = ("positive", "latent")
+
+        class NativeRef2VA:
+            @classmethod
+            def execute(cls, **kwargs):
+                captured.update(kwargs)
+                return Result()
+
+        original_loader = module._native_ref2va_conditioning
+        module._native_ref2va_conditioning = lambda: NativeRef2VA
+        try:
+            result = module.KaggleH3Ref2VAConditioning().condition(
+                clip="clip",
+                vae="video_vae",
+                audio_vae="audio_vae",
+                prompt="animate the reference",
+                seconds=5.0,
+                size_preset="720p",
+                aspect_ratio="16:9",
+                ref_image_1="image-one",
+                ref_audio_0="audio-one",
+            )
+        finally:
+            module._native_ref2va_conditioning = original_loader
+
+        self.assertEqual(result, ("positive", "latent"))
+        self.assertEqual((captured["width"], captured["height"]), (1280, 704))
+        self.assertEqual(captured["length"], 124)
+        self.assertEqual(captured["ref_images"], {"ref_image_1": "image-one"})
+        self.assertEqual(captured["ref_audios"], {"ref_audio_0": "audio-one"})
+        with self.assertRaisesRegex(ValueError, "matching ref_video_N"):
+            module.KaggleH3Ref2VAConditioning().condition(
+                clip="clip",
+                vae="video_vae",
+                audio_vae="audio_vae",
+                prompt="animate the reference",
+                seconds=5.0,
+                size_preset="360p",
+                aspect_ratio="16:9",
+                ref_image_0="image-one",
+                ref_video_audio_1="orphan-audio",
+            )
 
     def test_explicit_loader_interfaces_have_phase_targets(self):
         module = load_node_module()

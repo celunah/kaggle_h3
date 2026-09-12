@@ -10,6 +10,7 @@ from kaggle_h3.workflow import (
     select_mode,
     validate_workflow_shape,
 )
+from kaggle_h3.ref2va import resolve_ref2va_dimensions, resolve_ref2va_length
 
 
 class WorkflowTests(unittest.TestCase):
@@ -25,6 +26,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result["fps"], 24)
         self.assertEqual((result["actual_frames"] - 5) % 17, 0)
 
+    def test_ref2va_seconds_and_canvas_presets_are_h3_aligned(self):
+        length = resolve_ref2va_length(5.0)
+        self.assertEqual(length["actual_frames"], 124)
+        self.assertEqual(resolve_ref2va_dimensions("720p", "16:9"), (1280, 704))
+        self.assertEqual(resolve_ref2va_dimensions("480p", "4:3"), (640, 480))
+        with self.assertRaises(ValueError):
+            resolve_ref2va_length(1.0)
+
     def test_reference_workflow_has_role_inputs(self):
         request = H3Request(
             "A subject and their scene",
@@ -33,10 +42,13 @@ class WorkflowTests(unittest.TestCase):
             quality_mode="quick",
         )
         workflow = build_workflow(request)
-        self.assertEqual(workflow["h3"]["class_type"], "MiniMaxH3ReferenceToVideo")
+        self.assertEqual(workflow["h3"]["class_type"], "KaggleH3Ref2VAConditioning")
         self.assertIn("audio_vae", workflow["h3"]["inputs"])
-        self.assertIn("ref_images.ref_image_0", workflow["h3"]["inputs"])
-        self.assertIn("ref_images.ref_image_1", workflow["h3"]["inputs"])
+        self.assertEqual(workflow["h3"]["inputs"]["seconds"], 5.0)
+        self.assertEqual(workflow["h3"]["inputs"]["size_preset"], "360p")
+        self.assertEqual(workflow["h3"]["inputs"]["aspect_ratio"], "16:9")
+        self.assertIn("ref_image_0", workflow["h3"]["inputs"])
+        self.assertIn("ref_image_1", workflow["h3"]["inputs"])
         self.assertIn("<Picture 1>", workflow["h3"]["inputs"]["prompt"])
         self.assertEqual(workflow["ref_00"]["_meta"]["title"], "Kaggle H3 | Character Reference")
         self.assertEqual(workflow["ref_01"]["_meta"]["title"], "Kaggle H3 | Scene Reference")
@@ -84,10 +96,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(all(node.get("_meta", {}).get("title") for node in workflow.values()))
         self.assertEqual(workflow["sample"]["_meta"]["title"], "Kaggle H3 | Turbo Sampler (4 steps)")
         self.assertIn("ref2va", workflow["unet"]["inputs"]["unet_name"])
-        self.assertEqual(workflow["h3"]["class_type"], "MiniMaxH3ReferenceToVideo")
+        self.assertEqual(workflow["h3"]["class_type"], "KaggleH3Ref2VAConditioning")
         self.assertEqual(workflow["h3_adapter"]["inputs"]["model_variant"], "ref2va")
         self.assertEqual(workflow["h3_adapter"]["inputs"]["adapter_1"], "h3_ref2va_turbo_4step_v0_1")
-        self.assertIn("ref_images.ref_image_0", workflow["h3"]["inputs"])
+        self.assertIn("ref_image_0", workflow["h3"]["inputs"])
+        self.assertEqual(workflow["h3"]["inputs"]["seconds"], 5.0)
 
 
 if __name__ == "__main__":

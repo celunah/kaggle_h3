@@ -41,8 +41,9 @@ The final Kaggle report must be read from the run manifest. It must not claim bo
 - `workflows/kaggle_h3_ref2va.json`: reference-conditioned API-format graph.
 - `workflows/kaggle_h3_fl2va.json`: first/last-frame API-format graph.
 - `workflows/kaggle_h3_t2va.json`: text-to-video/audio API-format graph.
-- `workflows/kaggle_h3_turbo_smoke.json`: Ref2VA 608x352, 5-second, 4-step adapter smoke graph using generic reference placeholders.
-- `custom_nodes/kaggle_h3_adapters.py`: explicit H3 diffusion/text-encoder/VAE loaders, a conditioning-complete phase barrier, `H3 Adapter Stack`, phase-aware H3 sampler, and GPU0/GPU1 audio/video VAE decode nodes.
+- `workflows/kaggle_h3_turbo_smoke.json`: Ref2VA 360p/16:9, 5-second, 4-step adapter smoke graph using generic reference placeholders.
+- `custom_nodes/kaggle_h3_adapters.py`: the seconds/preset Ref2VA conditioner, explicit H3 diffusion/text-encoder/VAE loaders, a conditioning-complete phase barrier, `H3 Adapter Stack`, phase-aware H3 sampler, and GPU0/GPU1 audio/video VAE decode nodes.
+- `src/kaggle_h3/ref2va.py`: shared Ref2VA seconds, 17*k+5 frame alignment, and 32-pixel canvas-preset rules.
 - `src/kaggle_h3/phase_runtime.py`: phase orchestration, automatic Qwen language-layer dispatch/release, Accelerate dispatch verification, GPU/RAM monitoring, transformer release, and per-VAE device placement.
 - `custom_nodes/kaggle_h3_adapter_catalog.json`: pinned built-in adapter metadata and registration surface.
 - `custom_nodes.lock`: resolved ComfyUI and optional multi-GPU custom-node revisions.
@@ -65,6 +66,17 @@ without relying on their internal node IDs.
 5. The startup cell starts ComfyUI, clones the pinned checkout when needed, installs its `requirements.txt`, downloads the active H3 diffusion partition into `/kaggle/tmp/minimax-h3-models`, configures ComfyUI to read that external model tree, and installs the H3 adapter node. It does not construct or queue a generation request. The entrypoint's `ACTIVE_H3_MODE` defaults to `Ref2VA`; change it to `FL2VA` (which also serves T2VA) and rerun the cell when switching modes. The inactive exact diffusion checkpoint is pruned so the session stays below the scratch soft limit. `/kaggle/tmp` is scratch storage and must be repopulated after a new session.
 6. ComfyUI is started on internal port `8188` with `0.0.0.0` binding for the notebook environment. When two GPUs are in the preflight plan, the launcher explicitly sets `CUDA_VISIBLE_DEVICES=0,1` and passes `--cuda-device 0,1`; it then checks `/system_stats` and stops before loading a workflow if ComfyUI exposes fewer than two devices. The startup output must therefore show both devices and roughly 29 GiB total VRAM, rather than only `cuda:0`. If it reports one device, stop the old ComfyUI process and rerun the updated startup cell; changing environment variables cannot change an already-running process. The notebook reloads the bootstrap module when that cell is rerun, so a full kernel reset is not required unless an older ComfyUI child remains alive. The notebook then prints the local runtime address and leaves public exposure optional. To test remote access, run the optional public-tunnel cell in the entrypoint; it restarts ComfyUI with `--enable-cors-header *` for the dynamic tunnel hostname, downloads `cloudflared` into `/kaggle/tmp`, starts a temporary tunnel to `http://127.0.0.1:8188`, and prints the generated URL if Kaggle permits it. This public mode disables ComfyUI's origin protection, so anyone with the URL can access the unauthenticated instance. The phase sampler prints an observed map and per-device peak memory during each generation.
 7. Build or import an H3 graph in the web interface. For Turbo, use `H3 Adapter Stack` followed by `H3 Turbo Sampler`; select the matching 4-step or 8-step adapter and sampler configuration. The node downloads its selected LoRA into `ComfyUI/models/loras/` on first use.
+
+For Ref2VA, use `Kaggle H3 | Ref2VA Conditioning (Seconds + Presets)` between the
+loaders and `Kaggle H3 | Transformer Dispatch Barrier`. Set `seconds`, choose
+`240p`, `360p`, `480p`, or `720p`, and choose `16:9` or `4:3`. Connect any
+number of the optional image, video, paired-video-audio, and standalone-audio
+slots in index order. The node converts seconds to H3's aligned frame count,
+prints the requested and actual duration, and delegates tokenization/reference
+encoding to ComfyUI's native `MiniMaxH3ReferenceToVideo` implementation. The
+minimum is 39 frames (1.625 seconds), and the current project safety cap is 15
+seconds. A nominal 720p/16:9 request becomes 1280x704 because H3 requires a
+32-pixel canvas grid; this is expected and matches native H3 behavior.
 
 The web interface remains the ComfyUI workflow frontend. The direct graphs
 use `KaggleH3TurboSampler` even for base H3 so transformer dispatch/release is

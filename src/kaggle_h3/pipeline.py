@@ -428,7 +428,7 @@ def run_generation(
                     "UNETLoader",
                     "CLIPLoader",
                     "VAELoader",
-                    "MiniMaxH3ImageToVideo" if mode != "Ref2VA" else "MiniMaxH3ReferenceToVideo",
+                    "MiniMaxH3ImageToVideo" if mode != "Ref2VA" else "KaggleH3Ref2VAConditioning",
                     "MiniMaxH3SigmaShift",
                     "RandomNoise",
                     "KSamplerSelect",

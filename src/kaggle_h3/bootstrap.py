@@ -322,7 +322,15 @@ def install_h3_adapter_node(
     source_catalog = project_root / "custom_nodes" / "kaggle_h3_adapter_catalog.json"
     source_phase_runtime = project_root / "src" / "kaggle_h3" / "phase_runtime.py"
     source_layer_sharding = project_root / "src" / "kaggle_h3" / "layer_sharding.py"
-    sources = (source_node, source_core, source_catalog, source_phase_runtime, source_layer_sharding)
+    source_ref2va = project_root / "src" / "kaggle_h3" / "ref2va.py"
+    sources = (
+        source_node,
+        source_core,
+        source_catalog,
+        source_phase_runtime,
+        source_layer_sharding,
+        source_ref2va,
+    )
     missing = [str(path) for path in sources if not path.is_file()]
     if missing:
         raise FileNotFoundError("Missing H3 adapter node source files: " + ", ".join(missing))
@@ -333,6 +341,7 @@ def install_h3_adapter_node(
         target_dir / "kaggle_h3_adapter_catalog.json",
         target_dir / "kaggle_h3_phase_runtime.py",
         target_dir / "kaggle_h3_layer_sharding.py",
+        target_dir / "kaggle_h3_ref2va.py",
     )
     legacy_target_files = (
         target_dir / "celune_h3_adapters.py",
@@ -340,6 +349,7 @@ def install_h3_adapter_node(
         target_dir / "celune_h3_adapter_catalog.json",
         target_dir / "celune_h3_phase_runtime.py",
         target_dir / "celune_h3_layer_sharding.py",
+        target_dir / "celune_h3_ref2va.py",
     )
     result: dict[str, Any] = {
         "status": "would_install" if dry_run else "installed",
@@ -347,6 +357,7 @@ def install_h3_adapter_node(
         "targets": [str(path) for path in target_files],
         "removed_legacy_targets": [str(path) for path in legacy_target_files if path.is_file()],
         "node_ids": [
+            "KaggleH3Ref2VAConditioning",
             "KaggleH3ShardedDiffusionLoader",
             "KaggleH3TextEncoderLoader",
             "KaggleH3VAELoader",
