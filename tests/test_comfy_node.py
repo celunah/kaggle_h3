@@ -34,6 +34,7 @@ class ComfyNodeTests(unittest.TestCase):
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "phase_runtime.py", node_dir / "kaggle_h3_phase_runtime.py")
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "layer_sharding.py", node_dir / "kaggle_h3_layer_sharding.py")
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "ref2va.py", node_dir / "kaggle_h3_ref2va.py")
+            shutil.copy2(ROOT / "src" / "kaggle_h3" / "fp_diagnostics.py", node_dir / "kaggle_h3_fp_diagnostics.py")
             shutil.copy2(ROOT / "custom_nodes" / "kaggle_h3_adapter_catalog.json", node_dir / "kaggle_h3_adapter_catalog.json")
             script = """
 import importlib.util
@@ -254,6 +255,109 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertEqual(audio["waveform"].device.type, "cpu")
         self.assertTrue(torch.isfinite(audio["waveform"]).all())
         self.assertLessEqual(float(audio["waveform"].abs().max()), 1.0)
+
+    def test_video_vae_validates_before_and_after_decode(self):
+        module = load_node_module()
+        import torch
+        from unittest.mock import patch
+
+        class VAE:
+            bad_output = False
+
+            def decode(self, samples):
+                self.received = samples
+                value = float("nan") if self.bad_output else 0.0
+                return torch.full((1, 2, 2, 3), value, dtype=torch.float32)
+
+        vae = VAE()
+        with patch.object(module, "configure_vae_phase"), patch.object(
+            module, "release_vae_phase"
+        ), patch.object(module, "_enable_h3_decode_weight_casting"), patch.object(
+            module, "_h3_move_for_consumer", side_effect=lambda tensor, **_: tensor
+        ):
+            result = module.H3VAEDecode().decode(
+                vae,
+                {"samples": torch.zeros((1, 4, 2, 2), dtype=torch.float32)},
+                device_id=0,
+            )
+        self.assertEqual(result[0].shape, (1, 2, 2, 3))
+
+        vae.bad_output = True
+        with patch.object(module, "configure_vae_phase"), patch.object(
+            module, "release_vae_phase"
+        ), patch.object(module, "_enable_h3_decode_weight_casting"), patch.object(
+            module, "_h3_move_for_consumer", side_effect=lambda tensor, **_: tensor
+        ):
+            with self.assertRaisesRegex(FloatingPointError, "stage 'vae_video_out'"):
+                module.H3VAEDecode().decode(
+                    vae,
+                    {"samples": torch.zeros((1, 4, 2, 2), dtype=torch.float32)},
+                    device_id=0,
+                )
+
+        with patch.object(module, "configure_vae_phase"), patch.object(
+            module, "release_vae_phase"
+        ), patch.object(module, "_enable_h3_decode_weight_casting"), patch.object(
+            module, "_h3_move_for_consumer", side_effect=lambda tensor, **_: tensor
+        ):
+            with self.assertRaisesRegex(FloatingPointError, "stage 'vae_video_in'"):
+                module.H3VAEDecode().decode(
+                    vae,
+                    {"samples": torch.tensor([[[[float("nan")]]]])},
+                    device_id=0,
+                )
+
+    def test_audio_vae_validates_before_and_after_decode_before_sanitization(self):
+        module = load_node_module()
+        import sys
+        import types
+        import torch
+        from unittest.mock import patch
+
+        audio_module = types.ModuleType("comfy_extras.nodes_audio")
+        audio_module.vae_decode_audio = lambda _vae, _samples: {
+            "waveform": torch.tensor([[[float("inf")]]]),
+            "sample_rate": 32000,
+        }
+        comfy_extras = types.ModuleType("comfy_extras")
+        comfy_extras.__path__ = []
+        with patch.dict(
+            sys.modules,
+            {"comfy_extras": comfy_extras, "comfy_extras.nodes_audio": audio_module},
+        ), patch.object(module, "configure_vae_phase"), patch.object(
+            module, "release_vae_phase"
+        ), patch.object(module, "_h3_move_for_consumer", side_effect=lambda tensor, **_: tensor), patch.object(
+            module, "_h3_finite_audio"
+        ) as sanitize:
+            with self.assertRaisesRegex(FloatingPointError, "stage 'vae_audio_out'"):
+                module.H3AudioVAEDecode().decode(
+                    object(),
+                    {
+                        "samples": torch.zeros((1, 4, 2, 2), dtype=torch.float32),
+                        "_kaggle_h3_stream": "audio",
+                    },
+                    device_id=0,
+                )
+        sanitize.assert_not_called()
+
+        with patch.dict(
+            sys.modules,
+            {"comfy_extras": comfy_extras, "comfy_extras.nodes_audio": audio_module},
+        ), patch.object(module, "configure_vae_phase"), patch.object(
+            module, "release_vae_phase"
+        ), patch.object(module, "_h3_move_for_consumer", side_effect=lambda tensor, **_: tensor), patch.object(
+            module, "_h3_finite_audio"
+        ) as sanitize:
+            with self.assertRaisesRegex(FloatingPointError, "stage 'vae_audio_in'"):
+                module.H3AudioVAEDecode().decode(
+                    object(),
+                    {
+                        "samples": torch.tensor([[[[float("nan")]]]]),
+                        "_kaggle_h3_stream": "audio",
+                    },
+                    device_id=0,
+                )
+        sanitize.assert_not_called()
 
     def test_turbo_workflow_routes_both_outputs_into_dedicated_sampler(self):
         request = H3Request(

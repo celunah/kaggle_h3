@@ -7,7 +7,9 @@ from unittest.mock import patch
 
 from kaggle_h3.phase_runtime import (
     _attach_dispatched_transformer,
+    _install_transformer_activity_hooks,
     H3PhaseError,
+    H3TransformerPhase,
     build_phase_runtime_config,
     phase_policy,
     prepare_model_for_h3_phase,
@@ -86,6 +88,83 @@ class PhaseRuntimeTests(unittest.TestCase):
         self.assertEqual(patcher.offload_device, torch.device("cpu"))
         self.assertEqual(patcher.model.device, torch.device("cpu"))
         self.assertEqual(placement["model_residency"], "cpu")
+
+    def test_transformer_activity_hooks_validate_sampler_segments(self):
+        import torch
+
+        class Transformer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = torch.nn.ModuleList([torch.nn.Identity(), torch.nn.Identity()])
+
+        transformer = Transformer()
+        state = H3TransformerPhase(
+            transformer=transformer,
+            device_ids=(0, 1),
+            report={
+                "planned": {
+                    "group": {"container_path": "blocks"},
+                    "layers": [
+                        {"path": "blocks.0", "execution_device": "cuda:0"},
+                        {"path": "blocks.1", "execution_device": "cuda:1"},
+                    ],
+                }
+            },
+        )
+        _install_transformer_activity_hooks(state)
+        try:
+            value = torch.ones((1, 2), dtype=torch.float32)
+            transformer.blocks[0](value)
+            transformer.blocks[1](value)
+        finally:
+            for handle in state.activity_handles:
+                handle.remove()
+
+        self.assertEqual(
+            set(state.activity["diagnostic_checks"]),
+            {
+                "sampler_gpu0",
+                "sampler_gpu0_out",
+                "gpu0_to_gpu1",
+                "sampler_gpu1_in",
+                "sampler_gpu1",
+                "sampler_gpu1_out",
+            },
+        )
+
+    def test_transformer_activity_hooks_fail_at_gpu0_segment_output(self):
+        import torch
+
+        class BadBlock(torch.nn.Module):
+            def forward(self, value):
+                return torch.full_like(value, float("nan"))
+
+        class Transformer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = torch.nn.ModuleList([BadBlock(), torch.nn.Identity()])
+
+        transformer = Transformer()
+        state = H3TransformerPhase(
+            transformer=transformer,
+            device_ids=(0, 1),
+            report={
+                "planned": {
+                    "group": {"container_path": "blocks"},
+                    "layers": [
+                        {"path": "blocks.0", "execution_device": "cuda:0"},
+                        {"path": "blocks.1", "execution_device": "cuda:1"},
+                    ],
+                }
+            },
+        )
+        _install_transformer_activity_hooks(state)
+        try:
+            with self.assertRaisesRegex(FloatingPointError, "stage 'sampler_gpu0_out'"):
+                transformer.blocks[0](torch.ones((1, 2), dtype=torch.float32))
+        finally:
+            for handle in state.activity_handles:
+                handle.remove()
 
 
 if __name__ == "__main__":

@@ -323,6 +323,7 @@ def install_h3_adapter_node(
     source_phase_runtime = project_root / "src" / "kaggle_h3" / "phase_runtime.py"
     source_layer_sharding = project_root / "src" / "kaggle_h3" / "layer_sharding.py"
     source_ref2va = project_root / "src" / "kaggle_h3" / "ref2va.py"
+    source_fp_diagnostics = project_root / "src" / "kaggle_h3" / "fp_diagnostics.py"
     sources = (
         source_node,
         source_core,
@@ -330,6 +331,7 @@ def install_h3_adapter_node(
         source_phase_runtime,
         source_layer_sharding,
         source_ref2va,
+        source_fp_diagnostics,
     )
     missing = [str(path) for path in sources if not path.is_file()]
     if missing:
@@ -342,6 +344,7 @@ def install_h3_adapter_node(
         target_dir / "kaggle_h3_phase_runtime.py",
         target_dir / "kaggle_h3_layer_sharding.py",
         target_dir / "kaggle_h3_ref2va.py",
+        target_dir / "kaggle_h3_fp_diagnostics.py",
     )
     legacy_target_files = (
         target_dir / "celune_h3_adapters.py",

@@ -24,15 +24,39 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import gc
+import importlib.util
 import inspect
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from statistics import median
 from typing import Any
+
+
+try:
+    from .fp_diagnostics import validate_finite
+except ImportError:
+    try:
+        from kaggle_h3_fp_diagnostics import validate_finite  # type: ignore
+    except ImportError:
+        _diagnostics_path = Path(__file__).with_name("kaggle_h3_fp_diagnostics.py")
+        _diagnostics_spec = importlib.util.spec_from_file_location(
+            "kaggle_h3_fp_diagnostics", _diagnostics_path
+        )
+        if (
+            _diagnostics_spec is None
+            or _diagnostics_spec.loader is None
+            or not _diagnostics_path.is_file()
+        ):
+            raise ImportError(f"Cannot load H3 floating-point diagnostics: {_diagnostics_path}")
+        _diagnostics_module = importlib.util.module_from_spec(_diagnostics_spec)
+        sys.modules[_diagnostics_spec.name] = _diagnostics_module
+        _diagnostics_spec.loader.exec_module(_diagnostics_module)
+        validate_finite = _diagnostics_module.validate_finite
 
 
 class H3PhaseError(RuntimeError):
@@ -899,18 +923,70 @@ def _measure_gpu_transfer(device_ids: tuple[int, ...]) -> dict[str, Any]:
 
 
 def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
-    """Record which planned GPU blocks actually receive denoising calls."""
+    """Record calls and validate the H3 sampler's GPU boundaries."""
 
     state.activity = {
         "planned_gpu_calls": {str(device_id): 0 for device_id in state.device_ids},
         "input_gpu_ids": [],
         "block_calls": {},
+        "diagnostic_checks": {},
     }
     planned_layers = (state.report.get("planned") or {}).get("layers") or []
+    group_path = str((state.report.get("planned") or {}).get("group", {}).get("container_path", ""))
+    observed_execution_map = (
+        (state.report.get("observed") or {}).get("reported_execution_map") or {}
+    )
+
+    def execution_target(layer: dict[str, Any]) -> str:
+        path = str(layer.get("path", ""))
+        return str(
+            observed_execution_map.get(
+                path,
+                layer.get("execution_device", layer.get("device", "")),
+            )
+        )
+
+    block_layers: list[tuple[int, dict[str, Any]]] = []
+    for layer in planned_layers:
+        path = str(layer.get("path", ""))
+        if not group_path or not path.startswith(f"{group_path}."):
+            continue
+        try:
+            index = int(path.rsplit(".", 1)[-1])
+        except ValueError:
+            continue
+        block_layers.append((index, layer))
+    block_layers.sort(key=lambda item: item[0])
+    primary_gpu = f"cuda:{state.device_ids[0]}" if state.device_ids else "cuda:0"
+    secondary_gpu = f"cuda:{state.device_ids[1]}" if len(state.device_ids) > 1 else None
+    primary_blocks = [
+        (index, layer)
+        for index, layer in block_layers
+        if execution_target(layer) == primary_gpu
+    ]
+    secondary_blocks = [
+        (index, layer)
+        for index, layer in block_layers
+        if secondary_gpu is not None
+        and execution_target(layer) == secondary_gpu
+    ]
+    first_primary_path = primary_blocks[0][1].get("path") if primary_blocks else None
+    last_primary_path = primary_blocks[-1][1].get("path") if primary_blocks else None
+    first_secondary_path = secondary_blocks[0][1].get("path") if secondary_blocks else None
+    last_secondary_path = secondary_blocks[-1][1].get("path") if secondary_blocks else None
+
+    def validate_phase_input(stage: str, value: Any, path: str) -> None:
+        validate_finite(
+            {"args": value[0], "kwargs": value[1]},
+            stage,
+            tensor_name=f"{path}.input",
+        )
+        state.activity["diagnostic_checks"][stage] = True
+
     for layer in planned_layers:
         # The quantized Comfy router records the GPU where a CPU/disk-tier
         # block actually executes separately from its parameter residency.
-        target = str(layer.get("execution_device", layer.get("device", "")))
+        target = execution_target(layer)
         if not target.startswith("cuda:"):
             continue
         path = str(layer.get("path", ""))
@@ -932,12 +1008,61 @@ def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
                 label = str(device)
                 if label.startswith("cuda:") and label not in state.activity["input_gpu_ids"]:
                     state.activity["input_gpu_ids"].append(label)
+            kwargs = _kwargs or {}
+            if _path == first_primary_path and "sampler_gpu0" not in state.activity["diagnostic_checks"]:
+                validate_phase_input("sampler_gpu0", (args, kwargs), _path)
+            if _path == first_secondary_path:
+                # The first GPU1 block is the exact destination boundary of
+                # the preceding GPU0 segment. Keep the low-level names first
+                # so a failing transition reports its precise location.
+                validate_phase_input("gpu0_to_gpu1", (args, kwargs), _path)
+                validate_phase_input("sampler_gpu1_in", (args, kwargs), _path)
+                if "sampler_gpu1" not in state.activity["diagnostic_checks"]:
+                    validate_phase_input("sampler_gpu1", (args, kwargs), _path)
+
+        def observe_output(
+            _module: Any,
+            _args: tuple[Any, ...],
+            _kwargs: dict[str, Any] | None,
+            output: Any,
+            *,
+            _path=path,
+        ) -> Any:
+            if _path == last_primary_path:
+                validate_finite(output, "sampler_gpu0_out", tensor_name=f"{_path}.output")
+                state.activity["diagnostic_checks"]["sampler_gpu0_out"] = True
+            if _path == last_secondary_path:
+                validate_finite(output, "sampler_gpu1_out", tensor_name=f"{_path}.output")
+                state.activity["diagnostic_checks"]["sampler_gpu1_out"] = True
+            return output
 
         try:
             state.activity_handles.append(register(observe_call, with_kwargs=True))
         except TypeError:
             try:
                 state.activity_handles.append(register(lambda module, args, _observe=observe_call: _observe(module, args),))
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if path not in {last_primary_path, last_secondary_path}:
+            continue
+        register_output = getattr(module, "register_forward_hook", None)
+        if not callable(register_output):
+            continue
+        try:
+            state.activity_handles.append(
+                register_output(observe_output, with_kwargs=True)
+            )
+        except TypeError:
+            try:
+                state.activity_handles.append(
+                    register_output(
+                        lambda current, call_args, output, _observe=observe_output: _observe(
+                            current, call_args, {}, output
+                        )
+                    )
+                )
             except Exception:
                 continue
         except Exception:

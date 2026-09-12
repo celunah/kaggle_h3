@@ -124,6 +124,7 @@ try:
         release_h3_runtime_resources,
         release_vae_phase,
         release_transformer_phase,
+        validate_finite,
     )
 except ImportError:
     try:
@@ -142,6 +143,7 @@ except ImportError:
             release_h3_runtime_resources,
             release_vae_phase,
             release_transformer_phase,
+            validate_finite,
         )
     except ImportError:
         # The bootstrap copies this helper next to the node. The direct
@@ -171,6 +173,7 @@ except ImportError:
         release_h3_runtime_resources = phase_module.release_h3_runtime_resources
         release_vae_phase = phase_module.release_vae_phase
         release_transformer_phase = phase_module.release_transformer_phase
+        validate_finite = phase_module.validate_finite
 
 
 def _catalog():
@@ -628,6 +631,7 @@ class KaggleH3PhaseDispatch:
         latent_image: dict[str, Any],
         runtime_config: dict[str, Any] | None = None,
     ):
+        validate_finite(conditioning, "conditioning_in", tensor_name="conditioning")
         state = phase_state_for_model(model)
         text_release: list[dict[str, Any]] = []
         try:
@@ -836,11 +840,23 @@ class H3VAEDecode:
             )
             _enable_h3_decode_weight_casting(vae)
             video_samples = {"samples": _h3_stream_tensor(samples, "video")}
+            # Inspect the stream before Comfy's VAE compatibility cast. The
+            # destination check below separately covers the post-transfer
+            # tensor immediately before decode.
+            validate_finite(
+                video_samples["samples"],
+                "vae_video_in",
+                tensor_name="video_latent.source",
+            )
             video_samples = _coerce_h3_video_samples(vae, video_samples)
             latent = _h3_move_for_consumer(
                 video_samples["samples"], device_id=int(device_id), role="video VAE"
             )
+            validate_finite(latent, "vae_video_in", tensor_name="video_latent")
+            validate_finite(latent, "vae_video", tensor_name="video_latent")
             images = vae.decode(latent)
+            validate_finite(images, "vae_video_out", tensor_name="video_frames")
+            validate_finite(images, "vae_video", tensor_name="video_frames")
             if len(images.shape) == 5:
                 images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
             # The encoder and CreateVideo do not need GPU-resident frames.
@@ -891,10 +907,19 @@ class H3AudioVAEDecode:
             audio_samples = {
                 "samples": _h3_stream_tensor(samples, "audio"),
             }
+            validate_finite(
+                audio_samples["samples"],
+                "vae_audio_in",
+                tensor_name="audio_latent.source",
+            )
             audio_tensor = _h3_move_for_consumer(
                 audio_samples["samples"], device_id=int(device_id), role="audio VAE"
             )
+            validate_finite(audio_tensor, "vae_audio_in", tensor_name="audio_latent")
+            validate_finite(audio_tensor, "vae_audio", tensor_name="audio_latent")
             audio = vae_decode_audio(vae, {"samples": audio_tensor})
+            validate_finite(audio, "vae_audio_out", tensor_name="audio_output")
+            validate_finite(audio, "vae_audio", tensor_name="audio_output")
             return (_h3_finite_audio(audio),)
         finally:
             release_vae_phase(vae, role="audio")
@@ -1157,6 +1182,10 @@ class H3TurboSampler:
         )
         turbo = (runtime_config or {}).get("turbo") or {}
 
+        # Keep the sampler safe for hand-edited graphs that bypass the phase
+        # dispatch node. The normal Ref2VA graph validates this same boundary
+        # at KaggleH3PhaseDispatch first.
+        validate_finite(conditioning, "conditioning_in", tensor_name="conditioning")
         resolved_mode = (runtime_config or {}).get("model", {}).get("conditioning_mode", "auto")
         if resolved_mode == "auto":
             resolved_mode = detect_conditioning_mode(conditioning)
@@ -1210,6 +1239,16 @@ class H3TurboSampler:
                 callback=callback,
                 disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
                 seed=int(noise_seed),
+            )
+            validate_finite(
+                samples,
+                "sampler_final_out",
+                tensor_name="sampler_output",
+            )
+            validate_finite(
+                samples,
+                "sampler_final",
+                tensor_name="sampler_output",
             )
 
             # H3 returns a NestedTensor pair. Keep the final output on the
