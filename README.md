@@ -191,7 +191,9 @@ that hook reconstructs `comfy_kitchen.QuantizedTensor` with an unsupported
 ComfyUI's native quantized `_apply` path, CPU/disk-tier blocks remain
 CPU-owned, and activation arguments are routed to the assigned GPU. The
 quantized final/output path stays on the primary GPU so its internal dtype
-conversion never crosses a live device boundary. The
+conversion never crosses a live device boundary. H3 activation and
+quantized-weight transfers are synchronous, and the launcher disables
+`cudaMallocAsync` for this phase to avoid allocator/stream races. The
 report records both the physical parameter map and the actual execution map.
 The sampler preserves that map by filtering the already-dispatched H3 model
 out of ComfyUI's subsequent global `load_models_gpu()` call. A lightweight

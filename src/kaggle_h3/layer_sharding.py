@@ -876,8 +876,13 @@ def is_comfy_quantized_model(model: Any) -> bool:
     return False
 
 
-def _move_tensor_tree(value: Any, device: Any) -> Any:
-    """Move tensors nested in H3 block arguments without touching metadata."""
+def _move_tensor_tree(value: Any, device: Any, *, non_blocking: bool = False) -> Any:
+    """Move H3 arguments without touching model parameters.
+
+    Synchronous routing is intentional for Comfy's quantized path. An async
+    peer copy can race the next quantized weight transfer and surface later as
+    ``cudaErrorIllegalAddress`` inside comfy_kitchen.
+    """
 
     try:
         import torch  # type: ignore
@@ -886,13 +891,22 @@ def _move_tensor_tree(value: Any, device: Any) -> Any:
     if isinstance(value, torch.Tensor):
         if getattr(value, "device", None) == device:
             return value
-        return value.to(device=device, non_blocking=True)
+        return value.to(device=device, non_blocking=non_blocking)
     if isinstance(value, tuple):
-        return tuple(_move_tensor_tree(item, device) for item in value)
+        return tuple(
+            _move_tensor_tree(item, device, non_blocking=non_blocking)
+            for item in value
+        )
     if isinstance(value, list):
-        return [_move_tensor_tree(item, device) for item in value]
+        return [
+            _move_tensor_tree(item, device, non_blocking=non_blocking)
+            for item in value
+        ]
     if isinstance(value, dict):
-        return {key: _move_tensor_tree(item, device) for key, item in value.items()}
+        return {
+            key: _move_tensor_tree(item, device, non_blocking=non_blocking)
+            for key, item in value.items()
+        }
     return value
 
 
@@ -933,6 +947,22 @@ def _remove_handles(handles: Iterable[Any]) -> None:
                 remove()
             except Exception:
                 pass
+
+
+class _AttributeRestoreHandle:
+    """Make a temporary Comfy runtime override participate in cleanup."""
+
+    def __init__(self, owner: Any, name: str, original: Any) -> None:
+        self.owner = owner
+        self.name = name
+        self.original = original
+        self.active = True
+
+    def remove(self) -> None:
+        if not self.active:
+            return
+        setattr(self.owner, self.name, self.original)
+        self.active = False
 
 
 def dispatch_h3_text_encoder(
@@ -1152,6 +1182,35 @@ def _install_comfy_quantized_router(
     handles: list[Any] = []
     movement: list[dict[str, Any]] = []
 
+    # ComfyUI calculates this helper inside cast_bias_weight() immediately
+    # before it copies a quantized weight. Disable non-blocking transfers for
+    # the lifetime of this phase so a Comfy offload stream cannot race a
+    # cross-device QuantizedTensor copy. The original helper is restored by
+    # the same cleanup path as the forward hooks.
+    try:
+        import comfy.model_management as comfy_model_management  # type: ignore
+
+        non_blocking_helper = getattr(
+            comfy_model_management, "device_supports_non_blocking", None
+        )
+        if callable(non_blocking_helper):
+            def h3_quantized_copies_are_synchronous(_device: Any) -> bool:
+                return False
+
+            comfy_model_management.device_supports_non_blocking = (
+                h3_quantized_copies_are_synchronous
+            )
+            handles.append(
+                _AttributeRestoreHandle(
+                    comfy_model_management,
+                    "device_supports_non_blocking",
+                    non_blocking_helper,
+                )
+            )
+    except Exception:
+        # The dependency-light planner and unit tests do not provide ComfyUI.
+        pass
+
     # Route all explicitly mapped components, including each intact block.
     # The root entry is a residency default, not a callable module.
     mapped_paths = [path for path in device_map if path]
@@ -1309,6 +1368,8 @@ def _install_comfy_quantized_router(
         "cpu_third_tier": True,
         "disk_storage": "Comfy-managed source/offload when available; no Accelerate disk hooks",
         "outer_model_return_device": _device_label(device_ids[0]),
+        "quantized_copies": "synchronous",
+        "activation_transfers": "synchronous",
     }
     return execution_map, plan["comfy_quantized_router"], handles
 

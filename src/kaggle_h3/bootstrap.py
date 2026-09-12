@@ -602,12 +602,16 @@ def comfy_launch_command(
     visible_device_ids: list[int] | None = None,
     enable_cors_header: str | None = None,
     cpu_vae: bool = False,
+    disable_cuda_malloc: bool = True,
 ) -> list[str]:
     """Build a ComfyUI command with an explicit VAE phase policy.
 
     ``--lowvram`` remains enabled. ``--cpu-vae`` is opt-in for the explicit
     one-GPU fallback; phase-aware H3 needs GPU VAE targets after denoising.
     ``--gpu-only`` is never included because it defeats CPU/RAM offload.
+    ``--disable-cuda-malloc`` is enabled for H3 by default because the
+    quantized phase router uses explicit synchronous device boundaries and
+    must not combine them with ComfyUI's cudaMallocAsync allocator.
     """
 
     command = [
@@ -620,6 +624,8 @@ def comfy_launch_command(
         "--lowvram",
         "--disable-auto-launch",
     ]
+    if disable_cuda_malloc:
+        command.insert(command.index("--disable-auto-launch"), "--disable-cuda-malloc")
     if cpu_vae:
         command.insert(command.index("--disable-auto-launch"), "--cpu-vae")
     if enable_cors_header is not None:
@@ -658,6 +664,7 @@ def start_comfyui(
     log_dir: Path | None = None,
     enable_cors_header: str | None = None,
     cpu_vae: bool = False,
+    disable_cuda_malloc: bool = True,
     dry_run: bool = False,
 ) -> ComfyProcess | dict[str, Any]:
     """Start ComfyUI, optionally exposing it beyond loopback."""
@@ -676,6 +683,7 @@ def start_comfyui(
         visible_device_ids=visible,
         enable_cors_header=enable_cors_header,
         cpu_vae=cpu_vae,
+        disable_cuda_malloc=disable_cuda_malloc,
     )
     log_dir = (log_dir or (comfy_root / ".." / "kaggle_h3_runs")).resolve()
     log_dir.mkdir(parents=True, exist_ok=True)

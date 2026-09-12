@@ -82,6 +82,7 @@ class BootstrapTests(unittest.TestCase):
         )
         self.assertNotIn("--cpu-vae", phase_command)
         self.assertIn("--cpu-vae", fallback_command)
+        self.assertIn("--disable-cuda-malloc", phase_command)
         self.assertIn("--cuda-device", phase_command)
         self.assertIn("0,1", phase_command)
 
