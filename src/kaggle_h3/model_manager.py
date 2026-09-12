@@ -28,6 +28,7 @@ from typing import Callable
 
 
 H3_DIFFUSION_REPOSITORY = "Comfy-Org/MiniMax-H3"
+H3_DIFFUSION_REPOSITORY_DIRECTORY = "diffusion_models"
 H3_DIFFUSION_REVISION = os.environ.get(
     "KAGGLE_H3_MODEL_REVISION",
     "a98869194787969724c7425d95d0ed73ce9202af",
@@ -142,7 +143,10 @@ def _sha256(path: Path) -> str:
 def _hf_resolve_url(spec: H3DiffusionModelSpec) -> str:
     endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
     repository = urllib.parse.quote(spec.repository, safe="/")
-    filename = urllib.parse.quote(spec.filename, safe="/")
+    # The local destination is already the diffusion_models directory, but
+    # Hugging Face resolves paths relative to the repository root.
+    repository_path = f"{H3_DIFFUSION_REPOSITORY_DIRECTORY}/{spec.filename}"
+    filename = urllib.parse.quote(repository_path, safe="/")
     revision = urllib.parse.quote(spec.revision, safe="")
     return f"{endpoint}/{repository}/resolve/{revision}/{filename}?download=true"
 
@@ -193,7 +197,8 @@ class H3DiffusionModelManager:
             headers["Authorization"] = f"Bearer {token}"
         print(
             f"[Kaggle H3] Downloading diffusion model {spec.variant}: "
-            f"{spec.repository}/{spec.filename} @ {spec.revision}",
+            f"{spec.repository}/{H3_DIFFUSION_REPOSITORY_DIRECTORY}/{spec.filename} "
+            f"@ {spec.revision}",
             flush=True,
         )
         request = urllib.request.Request(url, headers=headers)
@@ -226,7 +231,8 @@ class H3DiffusionModelManager:
                         last_report = now
         except urllib.error.HTTPError as exc:
             raise H3DiffusionModelError(
-                f"Hugging Face returned HTTP {exc.code} for {spec.repository}/{spec.filename} "
+                f"Hugging Face returned HTTP {exc.code} for "
+                f"{spec.repository}/{H3_DIFFUSION_REPOSITORY_DIRECTORY}/{spec.filename} "
                 f"at pinned revision {spec.revision}. Check Internet access and HF_TOKEN."
             ) from exc
         except Exception as exc:

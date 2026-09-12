@@ -5,11 +5,20 @@ from pathlib import Path
 from kaggle_h3.model_manager import (
     H3DiffusionModelError,
     H3DiffusionModelManager,
+    _hf_resolve_url,
     h3_diffusion_spec,
 )
 
 
 class DiffusionModelManagerTests(unittest.TestCase):
+    def test_hugging_face_url_includes_comfy_diffusion_directory(self):
+        spec = h3_diffusion_spec("Ref2VA")
+        url = _hf_resolve_url(spec)
+        self.assertIn(
+            f"/resolve/{spec.revision}/diffusion_models/{spec.filename}?download=true",
+            url,
+        )
+
     def test_switch_removes_only_known_inactive_checkpoint_and_caches_selected(self):
         with tempfile.TemporaryDirectory() as temporary:
             diffusion_dir = Path(temporary) / "diffusion_models"
