@@ -15,7 +15,7 @@ Two T4 devices are not treated as one pooled VRAM device. Before generation, the
 | Diffusers balanced | Intended, but requires map inspection | `device_map="balanced"` probe plus CPU group offload | Blocked by H3-specific capacity/contract checks |
 | Diffusers explicit split | Yes if the modular pipeline loads and runs | text encoder on GPU 1; transformer and VAEs on GPU 0; CPU as third tier | Blocked by the documented 48 GiB-card int8 example envelope |
 | ComfyUI H3 sequence parallel | Yes, if the optional custom node is installed | `MiniMaxH3SPUNETLoader`, `world_size=2`, sequence/head sharding | Blocked by its replicated DiT footprint on 15 GiB T4s |
-| ComfyUI phase-aware H3 dispatch | Yes if the native model exposes dispatchable blocks and live verification passes | Explicit GPU0 text encoder during conditioning; intact transformer blocks across GPU0/GPU1; transformer released; audio VAE GPU0 and video VAE GPU1; CPU/disk overflow tiers | Experimental custom-loader path; fails instead of silently downgrading when two GPUs are visible |
+| ComfyUI phase-aware H3 dispatch | Yes if the native model exposes dispatchable blocks and live verification passes | Qwen language layers across GPU0/GPU1 during conditioning; intact transformer blocks across GPU0/GPU1; transformer released; audio VAE GPU0 and video VAE GPU1; CPU/disk overflow tiers | Experimental custom-loader path; fails instead of silently downgrading when two GPUs are visible |
 
 The native ComfyUI one-GPU path remains `comfyui_native_fallback` and is
 explicitly labeled as a fallback. The direct notebook frontend now exposes
@@ -43,7 +43,7 @@ The final Kaggle report must be read from the run manifest. It must not claim bo
 - `workflows/kaggle_h3_t2va.json`: text-to-video/audio API-format graph.
 - `workflows/kaggle_h3_turbo_smoke.json`: Ref2VA 608x352, 5-second, 4-step adapter smoke graph using generic reference placeholders.
 - `custom_nodes/kaggle_h3_adapters.py`: explicit H3 diffusion/text-encoder/VAE loaders, a conditioning-complete phase barrier, `H3 Adapter Stack`, phase-aware H3 sampler, and GPU0/GPU1 audio/video VAE decode nodes.
-- `src/kaggle_h3/phase_runtime.py`: phase orchestration, Accelerate dispatch verification, GPU/RAM monitoring, transformer release, and per-VAE device placement.
+- `src/kaggle_h3/phase_runtime.py`: phase orchestration, automatic Qwen language-layer dispatch/release, Accelerate dispatch verification, GPU/RAM monitoring, transformer release, and per-VAE device placement.
 - `custom_nodes/kaggle_h3_adapter_catalog.json`: pinned built-in adapter metadata and registration surface.
 - `custom_nodes.lock`: resolved ComfyUI and optional multi-GPU custom-node revisions.
 - `src/kaggle_h3/`: bootstrap, ComfyUI API, backend checks/workers, workflow builder, telemetry, pipeline, and media validation.
@@ -179,8 +179,10 @@ The workflow builder can emit `MiniMaxH3SPUNETLoader` and `MiniMaxH3SPVAEDecode`
 ### Native ComfyUI phase path and fallback
 
 The explicit native path uses `KaggleH3ShardedDiffusionLoader` to keep the H3
-model CPU-owned while `KaggleH3TextEncoderLoader` performs conditioning on
-GPU0. `KaggleH3PhaseDispatch` is a graph barrier: it runs after the H3
+model CPU-owned while `KaggleH3TextEncoderLoader` dispatches the Qwen language
+layers contiguously across GPU0 and GPU1 during conditioning. The existing
+workflow `device_id=0` means the primary boundary device; it does not disable
+text-layer sharding. `KaggleH3PhaseDispatch` is a graph barrier: it runs after the H3
 conditioning node, discovers the largest indexed block sequence, and applies
 the 14 GiB/card and 24 GiB CPU-headroom map across both GPUs. For ComfyUI's
 INT8 ConvRot H3 weights it does not call Accelerate's generic tensor hook:
@@ -194,7 +196,9 @@ out of ComfyUI's subsequent global `load_models_gpu()` call. A lightweight
 monitor logs peak used/allocated/reserved memory for both GPUs and minimum CPU
 RAM during the phase. After the sample it removes dispatch hooks, asks the
 ComfyUI patcher to return the model to CPU, and clears the cache before VAE
-decode.
+decode. The text-encoder and VAE phases have matching cleanup paths, including
+failure cleanup, so a sampler or decode exception does not intentionally retain
+their GPU pages.
 The explicit VAE loader/decoder nodes then target video at GPU1 and audio at
 GPU0, while retaining CPU as the offload device.
 

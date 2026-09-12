@@ -41,7 +41,8 @@ class PhaseRuntimeTests(unittest.TestCase):
             )
         self.assertEqual(plan["strategy"], "phase_aware_h3")
         self.assertEqual(
-            plan["text_encoder"], "default_gpu_during_conditioning_then_cpu"
+            plan["text_encoder"],
+            "automatic_contiguous_language_layers_cuda_0_cuda_1_then_cpu",
         )
         self.assertEqual(plan["audio_vae"], "cuda:0")
         self.assertEqual(plan["video_vae"], "cuda:1")

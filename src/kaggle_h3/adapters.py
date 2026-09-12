@@ -788,7 +788,7 @@ def build_runtime_config(
         },
         "execution": {
             "strategy": "phase_aware_h3",
-            "text_encoder": "default_gpu_during_conditioning_then_cpu",
+            "text_encoder": "automatic_contiguous_language_layers_cuda_0_cuda_1_then_cpu",
             "transformer": {
                 "dispatch": "automatic_contiguous_intact_blocks",
                 "gpu_budget_gib": 14.0,

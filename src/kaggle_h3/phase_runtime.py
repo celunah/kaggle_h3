@@ -8,8 +8,8 @@ about to start.
 
 The phase contract is:
 
-* the text encoder may use the default GPU during conditioning, then returns
-  to CPU before the transformer phase;
+* the Qwen language layers are dispatched contiguously across every requested
+  GPU during conditioning, then return to CPU before the transformer phase;
 * the H3 transformer is dispatched as intact blocks across every requested
   GPU, with CPU and optionally /kaggle/tmp as overflow tiers;
 * the transformer is released after denoising;
@@ -55,6 +55,23 @@ class H3TransformerPhase:
     activity_handles: list[Any] = field(default_factory=list)
     dispatch_handles: list[Any] = field(default_factory=list)
     activity: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class H3TextEncoderPhase:
+    """State owned by the temporary two-GPU Qwen conditioning phase."""
+
+    clip: Any = None
+    patcher: Any = None
+    encoder: Any = None
+    device_ids: tuple[int, ...] = ()
+    report: dict[str, Any] = field(default_factory=dict)
+    dispatch_handles: list[Any] = field(default_factory=list)
+    active: bool = False
+    released: bool = False
+
+
+_ACTIVE_TEXT_ENCODER_PHASES: list[H3TextEncoderPhase] = []
 
 
 class _GpuMemoryMonitor:
@@ -239,6 +256,199 @@ def phase_state_for_model(model: Any) -> H3TransformerPhase | None:
     return None
 
 
+def _text_encoder_root(clip: Any) -> Any:
+    """Find the model root that contains Qwen's language-layer sequence."""
+
+    candidates = [
+        getattr(clip, "cond_stage_model", None),
+        getattr(clip, "model", None),
+        clip,
+    ]
+    for candidate in candidates:
+        if candidate is None or not callable(getattr(candidate, "named_modules", None)):
+            continue
+        try:
+            try:
+                from .layer_sharding import find_dispatchable_text_encoder_layers
+            except ImportError:
+                from kaggle_h3_layer_sharding import (  # type: ignore
+                    find_dispatchable_text_encoder_layers,
+                )
+
+            find_dispatchable_text_encoder_layers(candidate)
+            return candidate
+        except Exception:
+            continue
+    raise H3PhaseError(
+        "The loaded H3 text encoder does not expose a dispatchable Qwen language-layer sequence"
+    )
+
+
+def prepare_text_encoder_for_h3_phase(
+    clip: Any,
+    *,
+    device_ids: tuple[int, ...] = (0, 1),
+    offload_dir: Path | None = None,
+) -> H3TextEncoderPhase:
+    """Dispatch Qwen language layers across both GPUs until conditioning ends."""
+
+    existing = getattr(clip, "_kaggle_h3_text_encoder_phase", None)
+    if isinstance(existing, H3TextEncoderPhase) and not existing.released:
+        return existing
+    try:
+        import torch  # type: ignore
+    except Exception as exc:
+        raise H3PhaseError("H3 text-encoder sharding requires PyTorch") from exc
+    ids = tuple(int(item) for item in device_ids)
+    if len(ids) < 2 or ids[0] == ids[1]:
+        raise H3PhaseError(
+            f"H3 text-encoder sharding requires two distinct GPU ids; got {list(ids)}"
+        )
+    if not torch.cuda.is_available() or int(torch.cuda.device_count()) < max(ids) + 1:
+        raise H3PhaseError(
+            f"H3 text-encoder sharding requested {list(ids)}, but visible CUDA devices are insufficient"
+        )
+    patcher = clip if hasattr(clip, "load_device") else getattr(clip, "patcher", None)
+    if patcher is None:
+        raise H3PhaseError("The H3 text encoder does not expose a Comfy model patcher")
+    encoder = _text_encoder_root(clip)
+    try:
+        from .layer_sharding import dispatch_h3_text_encoder
+
+        _dispatched, report, handles = dispatch_h3_text_encoder(
+            encoder,
+            device_ids=ids,
+            gpu_limit_gib=14.0,
+            cpu_headroom_gib=24.0,
+            offload_dir=offload_dir,
+        )
+    except ImportError:
+        from kaggle_h3_layer_sharding import dispatch_h3_text_encoder  # type: ignore
+
+        _dispatched, report, handles = dispatch_h3_text_encoder(
+            encoder,
+            device_ids=ids,
+            gpu_limit_gib=14.0,
+            cpu_headroom_gib=24.0,
+            offload_dir=offload_dir,
+        )
+    primary = torch.device(f"cuda:{ids[0]}")
+    _retarget_patcher_load_device(patcher, primary)
+    patcher.offload_device = torch.device("cpu")
+    state = H3TextEncoderPhase(
+        clip=clip,
+        patcher=patcher,
+        encoder=encoder,
+        device_ids=ids,
+        report=report,
+        dispatch_handles=list(handles),
+        active=True,
+    )
+    setattr(clip, "_kaggle_h3_text_encoder_phase", state)
+    try:
+        setattr(patcher, "_kaggle_h3_text_encoder_phase", state)
+    except Exception:
+        pass
+    _ACTIVE_TEXT_ENCODER_PHASES.append(state)
+    execution_devices = sorted(
+        {
+            str(item.get("execution_device"))
+            for item in report.get("layers", [])
+            if str(item.get("execution_device", "")).startswith("cuda:")
+        }
+    )
+    print(
+        "[Kaggle H3] Text encoder dispatched across "
+        f"{execution_devices}; CPU third tier=True; "
+        f"language_layers={report['group']['layer_count']}; "
+        f"boundary={report.get('activation_boundary')}. ",
+        flush=True,
+    )
+    return state
+
+
+def release_text_encoder_phase(state: H3TextEncoderPhase | None) -> dict[str, Any]:
+    """Remove temporary Qwen routing and return the encoder to CPU."""
+
+    if state is None or state.released:
+        return {"status": "already_released" if state else "not_started"}
+    state.released = True
+    for handle in state.dispatch_handles:
+        remove = getattr(handle, "remove", None)
+        if callable(remove):
+            try:
+                remove()
+            except Exception:
+                pass
+    state.dispatch_handles.clear()
+    moved_to_cpu = 0
+    try:
+        import torch  # type: ignore
+
+        for item in state.report.get("layers", []):
+            if not str(item.get("device", "")).startswith("cuda:"):
+                continue
+            try:
+                try:
+                    from .layer_sharding import _module_at_path
+                except ImportError:
+                    from kaggle_h3_layer_sharding import _module_at_path  # type: ignore
+
+                _module_at_path(state.encoder, str(item["path"])).to(torch.device("cpu"))
+                moved_to_cpu += 1
+            except Exception:
+                continue
+        unpatch = getattr(state.patcher, "unpatch_model", None)
+        if callable(unpatch):
+            try:
+                unpatch(torch.device("cpu"), unpatch_weights=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _release_comfy_cache()
+    gc.collect()
+    try:
+        import torch  # type: ignore
+
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        setattr(state.clip, "_kaggle_h3_text_encoder_phase", None)
+        setattr(state.patcher, "_kaggle_h3_text_encoder_phase", None)
+    except Exception:
+        pass
+    state.active = False
+    report = {
+        "status": "released",
+        "hooks_removed": True,
+        "layers_returned_to_cpu": moved_to_cpu,
+        "cpu_third_tier": True,
+    }
+    state.report["release"] = report
+    if state in _ACTIVE_TEXT_ENCODER_PHASES:
+        _ACTIVE_TEXT_ENCODER_PHASES.remove(state)
+    print(
+        "[Kaggle H3] Text encoder phase released before transformer dispatch; "
+        f"layers_returned_to_cpu={moved_to_cpu}.",
+        flush=True,
+    )
+    return report
+
+
+def release_all_text_encoder_phases() -> list[dict[str, Any]]:
+    """Release every active text phase without masking a generation error."""
+
+    reports: list[dict[str, Any]] = []
+    for state in list(_ACTIVE_TEXT_ENCODER_PHASES):
+        try:
+            reports.append(release_text_encoder_phase(state))
+        except Exception as exc:
+            reports.append({"status": "cleanup_failed", "error": str(exc)})
+    return reports
+
+
 def _attach_phase_state(model: Any, state: H3TransformerPhase | None) -> None:
     """Keep phase state with the shared Comfy model so ModelPatcher.clone preserves it."""
 
@@ -350,7 +560,7 @@ def build_phase_runtime_config(
     offload = str((offload_dir or phase_offload_dir()).resolve())
     return {
         "strategy": "phase_aware_h3",
-        "text_encoder": "default_gpu_during_conditioning_then_cpu",
+        "text_encoder": "automatic_contiguous_language_layers_cuda_0_cuda_1_then_cpu",
         "transformer": {
             "dispatch": "automatic_contiguous_intact_blocks",
             "device_ids": list(ids),
@@ -427,6 +637,73 @@ def _release_comfy_cache() -> None:
         return
     for name in ("unload_model_clones", "cleanup_models_gc", "soft_empty_cache"):
         _call_zero_argument(model_management, name)
+
+
+def release_h3_runtime_resources() -> dict[str, Any]:
+    """Release temporary H3 allocations without masking the original error."""
+
+    text_reports = release_all_text_encoder_phases()
+    _release_comfy_cache()
+    gc.collect()
+    cache_cleared = False
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+            if callable(ipc_collect):
+                ipc_collect()
+            cache_cleared = True
+    except Exception:
+        pass
+    report = {
+        "status": "released",
+        "text_encoder": text_reports,
+        "comfy_cache_cleared": True,
+        "torch_cuda_cache_cleared": cache_cleared,
+    }
+    print(
+        "[Kaggle H3] Runtime cleanup completed after generation; "
+        f"text_phases={len(text_reports)}, torch_cuda_cache_cleared={cache_cleared}.",
+        flush=True,
+    )
+    return report
+
+
+def release_vae_phase(vae: Any, *, role: str) -> dict[str, Any]:
+    """Return a decoded H3 VAE to CPU and clear temporary CUDA allocations."""
+
+    unpatched = False
+    patcher = getattr(vae, "patcher", None)
+    try:
+        import torch  # type: ignore
+
+        unpatch = getattr(patcher, "unpatch_model", None)
+        if callable(unpatch):
+            unpatch(torch.device("cpu"), unpatch_weights=True)
+            unpatched = True
+    except Exception:
+        pass
+    _release_comfy_cache()
+    gc.collect()
+    try:
+        import torch  # type: ignore
+
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    report = {
+        "status": "released",
+        "role": role,
+        "patcher_unpatched_to_cpu": unpatched,
+    }
+    print(
+        f"[Kaggle H3] {role} VAE phase released after decode; "
+        f"patcher_cpu_release={unpatched}.",
+        flush=True,
+    )
+    return report
 
 
 def _release_non_transformer_comfy_models(active_model: Any) -> list[dict[str, Any]]:

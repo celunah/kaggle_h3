@@ -2,10 +2,12 @@ import unittest
 
 from kaggle_h3.layer_sharding import (
     find_dispatchable_layers,
+    find_dispatchable_text_encoder_layers,
     inspect_dispatched_map,
     is_comfy_quantized_model,
     parameter_bytes,
     plan_layer_device_map,
+    plan_text_encoder_device_map,
 )
 
 
@@ -184,6 +186,48 @@ class LayerShardingTests(unittest.TestCase):
         )
         self.assertEqual(observed["observed_execution_gpu_ids"], [0, 1])
         self.assertTrue(observed["observed_all_requested_gpus"])
+
+    def test_text_encoder_prefers_language_layers_over_vision_blocks(self):
+        vision_blocks = _FakeModule([_FakeModule(parameter_bytes=90)] * 6)
+        language_layers = _FakeModule([_FakeModule(parameter_bytes=100)] * 4)
+        vision = _FakeModule([vision_blocks])
+        language = _FakeModule([language_layers])
+        model = _FakeModule([vision, language])
+        model.named_children = lambda: iter(
+            [("vision_model", vision), ("language_model", language)]
+        )
+        model.named_modules = lambda: iter(
+            [
+                ("", model),
+                ("vision_model", vision),
+                ("vision_model.blocks", vision_blocks),
+                ("language_model", language),
+                ("language_model.layers", language_layers),
+            ]
+            + [
+                (f"language_model.layers.{i}", child)
+                for i, child in enumerate(language_layers._children)
+            ]
+            + [
+                (f"vision_model.blocks.{i}", child)
+                for i, child in enumerate(vision_blocks._children)
+            ]
+        )
+        group = find_dispatchable_text_encoder_layers(model)
+        self.assertEqual(group.container_path, "language_model.layers")
+        plan = plan_text_encoder_device_map(
+            model,
+            device_ids=(0, 1),
+            gpu_budgets={0: 250, 1: 250},
+            cpu_budget_bytes=0,
+            allow_disk=False,
+        )
+        self.assertEqual(
+            [item["device"] for item in plan["layers"]],
+            ["cuda:0", "cuda:0", "cuda:1", "cuda:1"],
+        )
+        self.assertEqual(plan["strategy"], "contiguous_qwen_language_layers")
+        self.assertTrue(plan["uses_all_requested_gpus"])
 
 
 if __name__ == "__main__":

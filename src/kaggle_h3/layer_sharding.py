@@ -182,6 +182,165 @@ def find_dispatchable_layers(model: Any) -> DispatchableLayerGroup:
     )
 
 
+def _text_encoder_candidate_score(path: str, count: int) -> tuple[int, int, int, str]:
+    """Rank indexed module sequences for the Qwen text side of H3.
+
+    Qwen3-VL contains both a language transformer and a vision transformer.
+    The language path is the useful dispatch boundary for H3 conditioning;
+    selecting a visual block list merely because it is longer would leave the
+    actual text encoder on ComfyUI's primary GPU.
+    """
+
+    lower = path.lower()
+    leaf = lower.rsplit(".", 1)[-1]
+    if leaf not in {"layers", "blocks", "transformer_blocks", "resblocks"}:
+        return (-1, count, -path.count("."), path)
+    score = {"layers": 100, "transformer_blocks": 96, "blocks": 88, "resblocks": 84}[leaf]
+    if any(token in lower for token in ("language_model", "text_model", "llm", "decoder")):
+        score += 220
+    if any(token in lower for token in ("vision", "visual", "image_tower")):
+        score -= 260
+    return score, count, -path.count("."), path
+
+
+def find_dispatchable_text_encoder_layers(model: Any) -> DispatchableLayerGroup:
+    """Find the language-layer sequence inside a Qwen3-VL H3 text encoder."""
+
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        raise H3LayerShardingError(
+            "Loaded H3 text encoder does not expose named_modules()"
+        )
+    candidates: list[tuple[tuple[int, int, int, str], str, Any, list[tuple[str, Any]]]] = []
+    for path, module in named_modules():
+        children = _indexed_children(module)
+        if len(children) < 4:
+            continue
+        score = _text_encoder_candidate_score(path, len(children))
+        if score[0] < 0:
+            continue
+        candidates.append((score, path, module, children))
+    if not candidates:
+        raise H3LayerShardingError(
+            "Could not find a language-layer sequence in the H3 text encoder; "
+            "refusing to split arbitrary Qwen/vision submodules."
+        )
+    _, container_path, container, children = max(candidates, key=lambda item: item[0])
+    layers = tuple(
+        DispatchableLayer(
+            index=index,
+            path=f"{container_path}.{name}" if container_path else name,
+            class_name=child.__class__.__name__,
+            size_bytes=parameter_bytes(child),
+        )
+        for index, (name, child) in enumerate(children)
+    )
+    return DispatchableLayerGroup(
+        container_path=container_path,
+        container_class=container.__class__.__name__,
+        layers=layers,
+    )
+
+
+def plan_text_encoder_device_map(
+    model: Any,
+    *,
+    device_ids: Iterable[int],
+    gpu_budgets: dict[int, int] | None = None,
+    cpu_budget_bytes: int = 0,
+    allow_disk: bool = True,
+) -> dict[str, Any]:
+    """Plan contiguous Qwen language-layer placement across the requested GPUs."""
+
+    ids = [int(value) for value in device_ids]
+    if len(ids) < 2:
+        raise H3LayerShardingError(
+            "Automatic H3 text-encoder sharding needs at least two visible CUDA devices"
+        )
+    group = find_dispatchable_text_encoder_layers(model)
+    if gpu_budgets is None:
+        runtime = runtime_memory_budgets(ids)
+        gpu_budgets = {device_id: int(runtime[device_id]) for device_id in ids}
+        cpu_budget_bytes = int(runtime["cpu"])
+    else:
+        gpu_budgets = {int(key): int(value) for key, value in gpu_budgets.items()}
+    if any(gpu_budgets.get(device_id, 0) <= 0 for device_id in ids):
+        raise H3LayerShardingError("The H3 text encoder has no safe GPU dispatch budget")
+
+    split = max(1, min(len(group.layers) - 1, (len(group.layers) + 1) // 2))
+    device_map: dict[str, int | str] = {"": "cpu"}
+    execution_map: dict[str, str] = {}
+    loads = {device_id: 0 for device_id in ids}
+    cpu_used = 0
+    cpu_layers: list[str] = []
+    disk_layers: list[str] = []
+    for layer in group.layers:
+        preferred = ids[0] if layer.index < split else ids[1]
+        if loads[preferred] + layer.size_bytes <= gpu_budgets[preferred]:
+            target: int | str = preferred
+            loads[preferred] += layer.size_bytes
+        elif cpu_used + layer.size_bytes <= cpu_budget_bytes:
+            target = "cpu"
+            cpu_used += layer.size_bytes
+            cpu_layers.append(layer.path)
+        elif allow_disk:
+            target = "disk"
+            disk_layers.append(layer.path)
+        else:
+            raise H3LayerShardingError(
+                f"H3 text-encoder layer {layer.index} ({layer.size_bytes / GIB:.2f} GiB) "
+                "does not fit the configured GPU/CPU budgets"
+            )
+        device_map[layer.path] = target
+        execution_map[layer.path] = _device_label(
+            preferred if isinstance(target, str) else target
+        )
+
+    assigned_gpu_ids = {
+        int(device_map[layer.path])
+        for layer in group.layers
+        if isinstance(device_map.get(layer.path), int)
+    }
+    if not set(ids).issubset(assigned_gpu_ids):
+        raise H3LayerShardingError(
+            "The H3 text-encoder map did not place language layers on every requested GPU"
+        )
+    return {
+        "device_map": device_map,
+        "execution_device_map": execution_map,
+        "group": {
+            "container_path": group.container_path,
+            "container_class": group.container_class,
+            "layer_count": len(group.layers),
+        },
+        "layers": [
+            {
+                "index": layer.index,
+                "path": layer.path,
+                "class_name": layer.class_name,
+                "size_bytes": layer.size_bytes,
+                "size_gib": round(layer.size_bytes / GIB, 4),
+                "device": _device_label(device_map[layer.path]),
+                "execution_device": execution_map[layer.path],
+            }
+            for layer in group.layers
+        ],
+        "gpu_budgets_gib": {
+            str(device_id): round(gpu_budgets[device_id] / GIB, 4) for device_id in ids
+        },
+        "gpu_load_estimates_gib": {
+            str(device_id): round(loads[device_id] / GIB, 4) for device_id in ids
+        },
+        "cpu_budget_gib": round(cpu_budget_bytes / GIB, 4),
+        "cpu_load_estimate_gib": round(cpu_used / GIB, 4),
+        "cpu_layers": cpu_layers,
+        "disk_layers": disk_layers,
+        "uses_all_requested_gpus": True,
+        "strategy": "contiguous_qwen_language_layers",
+        "activation_boundary": f"after {group.container_path}.{split - 1} before {group.container_path}.{split}",
+    }
+
+
 def runtime_memory_budgets(
     device_ids: Iterable[int],
     *,
@@ -742,6 +901,178 @@ def _remove_handles(handles: Iterable[Any]) -> None:
                 pass
 
 
+def dispatch_h3_text_encoder(
+    model: Any,
+    *,
+    device_ids: Iterable[int],
+    gpu_limit_gib: float = DEFAULT_GPU_LIMIT_GIB,
+    cpu_headroom_gib: float = DEFAULT_CPU_HEADROOM_GIB,
+    offload_dir: Path | None = None,
+) -> tuple[Any, dict[str, Any], list[Any]]:
+    """Install a contiguous two-GPU router for the Qwen language encoder.
+
+    ComfyUI's CLIP patcher still owns the outer encoder and may load it on its
+    registered primary device.  The language-layer hooks below immediately
+    move each selected layer to its planned side, route its activation there,
+    and send overflow layers back to CPU after each call.  This preserves the
+    normal Comfy patcher contract while ensuring the same conditioning pass
+    actually executes language layers on both requested GPUs.
+    """
+
+    try:
+        import torch  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional runtime dependency
+        raise H3LayerShardingError(
+            "H3 text-encoder dispatch requires PyTorch"
+        ) from exc
+    ids = [int(value) for value in device_ids]
+    if len(ids) < 2:
+        raise H3LayerShardingError(
+            "H3 text-encoder dispatch requires at least two CUDA devices"
+        )
+    runtime = runtime_memory_budgets(
+        ids,
+        gpu_limit_gib=gpu_limit_gib,
+        cpu_headroom_gib=cpu_headroom_gib,
+    )
+    plan = plan_text_encoder_device_map(
+        model,
+        device_ids=ids,
+        gpu_budgets={device_id: int(runtime[device_id]) for device_id in ids},
+        cpu_budget_bytes=int(runtime["cpu"]),
+        allow_disk=True,
+    )
+    group_path = str(plan["group"]["container_path"])
+    primary = torch.device(_device_label(ids[0]))
+    handles: list[Any] = []
+    movement: list[dict[str, Any]] = []
+
+    def register_pre_hook(module: Any, callback: Any) -> None:
+        register = getattr(module, "register_forward_pre_hook", None)
+        if not callable(register):
+            raise H3LayerShardingError(
+                f"Text-encoder module {module.__class__.__name__} does not support forward pre-hooks"
+            )
+        try:
+            handles.append(register(callback, with_kwargs=True))
+        except TypeError:
+            handles.append(register(lambda _module, args: callback(_module, args, {})))
+
+    def register_post_hook(module: Any, callback: Any) -> None:
+        register = getattr(module, "register_forward_hook", None)
+        if not callable(register):
+            raise H3LayerShardingError(
+                f"Text-encoder module {module.__class__.__name__} does not support forward hooks"
+            )
+        try:
+            handles.append(register(callback, with_kwargs=True))
+        except TypeError:
+            handles.append(register(lambda _module, args, output: callback(_module, args, {}, output)))
+
+    try:
+        for item in plan["layers"]:
+            path = str(item["path"])
+            module = _module_at_path(model, path)
+            target = torch.device(str(item["execution_device"]))
+            planned_residency = str(item["device"])
+            if planned_residency.startswith("cuda:"):
+                try:
+                    module.to(target)
+                except Exception as exc:
+                    raise H3LayerShardingError(
+                        f"Could not place text-encoder layer {path!r} on {target}: {exc}"
+                    ) from exc
+
+            def route_layer_inputs(
+                current: Any,
+                args: tuple[Any, ...],
+                kwargs: dict[str, Any],
+                *,
+                _target=target,
+                _planned=planned_residency,
+                _path=path,
+            ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+                if _planned == "cpu" or _planned == "disk":
+                    try:
+                        current.to(_target)
+                    except Exception as exc:
+                        raise H3LayerShardingError(
+                            f"Could not stage text-encoder layer {_path!r} on {_target}: {exc}"
+                        ) from exc
+                return (
+                    tuple(_move_tensor_tree(value, _target) for value in args),
+                    _move_tensor_tree(kwargs, _target),
+                )
+
+            register_pre_hook(module, route_layer_inputs)
+            if planned_residency == "cpu" or planned_residency == "disk":
+
+                def offload_layer(
+                    current: Any,
+                    _args: tuple[Any, ...],
+                    _kwargs: dict[str, Any],
+                    output: Any,
+                    *,
+                    _path=path,
+                ) -> Any:
+                    try:
+                        current.to(torch.device("cpu"))
+                    except Exception as exc:
+                        raise H3LayerShardingError(
+                            f"Could not return overflow text-encoder layer {_path!r} to CPU: {exc}"
+                        ) from exc
+                    return output
+
+                register_post_hook(module, offload_layer)
+            movement.append(
+                {
+                    "path": path,
+                    "planned_residency": planned_residency,
+                    "execution_device": str(target),
+                }
+            )
+
+        # The parent continues into its final norm/projection after the layer
+        # sequence. Route those inputs back to the primary side so a layer-1
+        # output cannot leak into a cuda:0-only Qwen head.
+        parent_path, separator, container_name = group_path.rpartition(".")
+        parent = _module_at_path(model, parent_path) if separator else model
+        named_children = getattr(parent, "named_children", None)
+        if callable(named_children):
+            for name, sibling in named_children():
+                if name == container_name:
+                    continue
+
+                def route_boundary(
+                    _module: Any,
+                    args: tuple[Any, ...],
+                    kwargs: dict[str, Any],
+                    *,
+                    _target=primary,
+                ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+                    return (
+                        tuple(_move_tensor_tree(value, _target) for value in args),
+                        _move_tensor_tree(kwargs, _target),
+                    )
+
+                register_pre_hook(sibling, route_boundary)
+
+    except Exception:
+        _remove_handles(handles)
+        raise
+
+    plan["movement"] = movement
+    plan["router"] = {
+        "status": "installed",
+        "backend": "comfy_native_text_layer_routing",
+        "cpu_third_tier": True,
+        "offload_dir": str(offload_dir.resolve()) if offload_dir else None,
+        "primary_boundary_device": str(primary),
+        "hook_count": len(handles),
+    }
+    return model, plan, handles
+
+
 def _install_comfy_quantized_router(
     transformer: Any,
     plan: dict[str, Any],
@@ -860,6 +1191,43 @@ def _install_comfy_quantized_router(
             # the outer model wrapper.
             leaf = path.rsplit(".", 1)[-1].lower()
             if leaf in {"final_layer", "norm_out", "proj_out", "audio_proj_out"}:
+                # FinalLayer contains norm, AdaLN, and two output heads. A
+                # parent hook alone is insufficient for Comfy's lazy
+                # quantized operations: one child can still materialize on
+                # cuda:0 while the activation and sibling child are on
+                # cuda:1. Route every final-layer child through the same
+                # device island before its forward call.
+                named_nested = getattr(module, "named_modules", None)
+                if callable(named_nested):
+                    for nested_path, nested_module in named_nested():
+                        if not nested_path:
+                            continue
+
+                        def route_final_child_inputs(
+                            _nested: Any,
+                            nested_args: tuple[Any, ...],
+                            nested_kwargs: dict[str, Any],
+                            *,
+                            _target=torch.device(execution_device),
+                        ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+                            return (
+                                tuple(_move_tensor_tree(value, _target) for value in nested_args),
+                                _move_tensor_tree(nested_kwargs, _target),
+                            )
+
+                        try:
+                            nested_handle = nested_module.register_forward_pre_hook(
+                                route_final_child_inputs,
+                                with_kwargs=True,
+                            )
+                        except TypeError:
+                            nested_handle = nested_module.register_forward_pre_hook(
+                                lambda _nested, nested_args, _target=torch.device(execution_device): tuple(
+                                    _move_tensor_tree(value, _target) for value in nested_args
+                                )
+                            )
+                        handles.append(nested_handle)
+
                 register_forward = getattr(module, "register_forward_hook", None)
                 if callable(register_forward):
 

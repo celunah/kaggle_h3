@@ -81,9 +81,14 @@ try:
         configure_vae_phase,
         phase_state_for_model,
         phase_policy,
+        phase_device_ids,
         prepare_model_for_h3_phase,
+        prepare_text_encoder_for_h3_phase,
         _retarget_patcher_load_device,
         _prepare_sampling_preserving_phase,
+        release_all_text_encoder_phases,
+        release_h3_runtime_resources,
+        release_vae_phase,
         release_transformer_phase,
     )
 except ImportError:
@@ -94,9 +99,14 @@ except ImportError:
             configure_vae_phase,
             phase_state_for_model,
             phase_policy,
+            phase_device_ids,
             prepare_model_for_h3_phase,
+            prepare_text_encoder_for_h3_phase,
             _retarget_patcher_load_device,
             _prepare_sampling_preserving_phase,
+            release_all_text_encoder_phases,
+            release_h3_runtime_resources,
+            release_vae_phase,
             release_transformer_phase,
         )
     except ImportError:
@@ -118,9 +128,14 @@ except ImportError:
         configure_vae_phase = phase_module.configure_vae_phase
         phase_state_for_model = phase_module.phase_state_for_model
         phase_policy = phase_module.phase_policy
+        phase_device_ids = phase_module.phase_device_ids
         prepare_model_for_h3_phase = phase_module.prepare_model_for_h3_phase
+        prepare_text_encoder_for_h3_phase = phase_module.prepare_text_encoder_for_h3_phase
         _retarget_patcher_load_device = phase_module._retarget_patcher_load_device
         _prepare_sampling_preserving_phase = phase_module._prepare_sampling_preserving_phase
+        release_all_text_encoder_phases = phase_module.release_all_text_encoder_phases
+        release_h3_runtime_resources = phase_module.release_h3_runtime_resources
+        release_vae_phase = phase_module.release_vae_phase
         release_transformer_phase = phase_module.release_transformer_phase
 
 
@@ -205,7 +220,7 @@ class KaggleH3ShardedDiffusionLoader:
 
 
 class KaggleH3TextEncoderLoader:
-    """Load the H3 Qwen encoder on one selected GPU for conditioning."""
+    """Load and automatically shard the H3 Qwen language encoder."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -231,13 +246,37 @@ class KaggleH3TextEncoderLoader:
         if not torch.cuda.is_available() or int(device_id) >= int(torch.cuda.device_count()):
             raise H3PhaseError(f"Cannot place the H3 text encoder on cuda:{device_id}")
         clip = nodes.CLIPLoader().load_clip(str(clip_name), str(type), "default")[0]
-        device = torch.device(f"cuda:{int(device_id)}")
-        _set_explicit_patcher_devices(clip, load_device=device, offload_device=torch.device("cpu"))
-        setattr(clip, "_kaggle_h3_conditioning_device", str(device))
-        print(
-            f"[Kaggle H3] Text encoder loader target={device}; offload_device=cpu.",
-            flush=True,
-        )
+        if phase_policy() != "off":
+            ids = tuple(phase_device_ids())
+            if len(ids) < 2:
+                raise H3PhaseError(
+                    "H3 text-encoder sharding requires two visible GPUs; set "
+                    "KAGGLE_H3_PHASE_SHARDING=off only for the explicit fallback."
+                )
+            if int(device_id) != ids[0]:
+                raise H3PhaseError(
+                    "The automatic H3 text-encoder sharding strategy is anchored on "
+                    f"cuda:{ids[0]}; got cuda:{int(device_id)}."
+                )
+            state = prepare_text_encoder_for_h3_phase(
+                clip,
+                device_ids=ids,
+                offload_dir=Path("/kaggle/tmp/minimax-h3-layer-offload/text_encoder"),
+            )
+            setattr(clip, "_kaggle_h3_conditioning_device", "cuda:0,cuda:1")
+            setattr(clip, "_kaggle_h3_text_encoder_report", state.report)
+        else:
+            device = torch.device(f"cuda:{int(device_id)}")
+            _set_explicit_patcher_devices(
+                clip,
+                load_device=device,
+                offload_device=torch.device("cpu"),
+            )
+            setattr(clip, "_kaggle_h3_conditioning_device", str(device))
+            print(
+                f"[Kaggle H3] Text encoder explicit fallback target={device}; offload_device=cpu.",
+                flush=True,
+            )
         return (clip,)
 
 
@@ -296,16 +335,23 @@ class KaggleH3PhaseDispatch:
         runtime_config: dict[str, Any] | None = None,
     ):
         state = phase_state_for_model(model)
-        if state is None:
-            state = begin_transformer_phase(model, runtime_config)
-        else:
-            print(
-                "[Kaggle H3] Phase dispatch barrier found an existing verified transformer map.",
-                flush=True,
-            )
+        text_release: list[dict[str, Any]] = []
+        try:
+            if state is None:
+                state = begin_transformer_phase(model, runtime_config)
+            else:
+                print(
+                    "[Kaggle H3] Phase dispatch barrier found an existing verified transformer map.",
+                    flush=True,
+                )
+        finally:
+            # Conditioning has completed at this node. Release the temporary
+            # Qwen layer router even when transformer dispatch itself fails.
+            text_release = release_all_text_encoder_phases()
         if isinstance(runtime_config, dict):
             execution = dict(runtime_config.get("execution") or {})
             execution["dispatch_barrier"] = "conditioning_complete"
+            execution["text_encoder_phase_release"] = text_release
             runtime_config["execution"] = execution
         return model, conditioning, latent_image, runtime_config
 
@@ -487,20 +533,23 @@ class H3VAEDecode:
         device_id: int = 1,
         runtime_config: dict[str, Any] | None = None,
     ):
-        configure_vae_phase(
-            vae,
-            device_id=int(device_id),
-            role="video",
-            runtime_config=runtime_config,
-        )
-        _enable_h3_decode_weight_casting(vae)
-        latent = _coerce_h3_video_samples(vae, samples)["samples"]
-        if getattr(latent, "is_nested", False):
-            latent = latent.unbind()[0]
-        images = vae.decode(latent)
-        if len(images.shape) == 5:
-            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
-        return (images,)
+        try:
+            configure_vae_phase(
+                vae,
+                device_id=int(device_id),
+                role="video",
+                runtime_config=runtime_config,
+            )
+            _enable_h3_decode_weight_casting(vae)
+            latent = _coerce_h3_video_samples(vae, samples)["samples"]
+            if getattr(latent, "is_nested", False):
+                latent = latent.unbind()[0]
+            images = vae.decode(latent)
+            if len(images.shape) == 5:
+                images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+            return (images,)
+        finally:
+            release_vae_phase(vae, role="video")
 
 
 class H3AudioVAEDecode:
@@ -531,17 +580,20 @@ class H3AudioVAEDecode:
         device_id: int = 0,
         runtime_config: dict[str, Any] | None = None,
     ):
-        configure_vae_phase(
-            vae,
-            device_id=int(device_id),
-            role="audio",
-            runtime_config=runtime_config,
-        )
         try:
-            from comfy_extras.nodes_audio import vae_decode_audio  # type: ignore
-        except ImportError:
-            from nodes_audio import vae_decode_audio  # type: ignore
-        return (vae_decode_audio(vae, samples),)
+            configure_vae_phase(
+                vae,
+                device_id=int(device_id),
+                role="audio",
+                runtime_config=runtime_config,
+            )
+            try:
+                from comfy_extras.nodes_audio import vae_decode_audio  # type: ignore
+            except ImportError:
+                from nodes_audio import vae_decode_audio  # type: ignore
+            return (vae_decode_audio(vae, samples),)
+        finally:
+            release_vae_phase(vae, role="audio")
 
 
 def _install_phase_dispatch_hook(
@@ -870,7 +922,30 @@ class H3TurboSampler:
         finally:
             comfy.sampler_helpers.prepare_sampling = original_prepare_sampling
             phase_state = phase_holder.get("state")
-            release_report = release_transformer_phase(phase_state)
+            original_exception = sys.exc_info()[0] is not None
+            release_report: dict[str, Any]
+            cleanup_error: Exception | None = None
+            try:
+                release_report = release_transformer_phase(phase_state)
+            except Exception as exc:
+                cleanup_error = exc
+                release_report = {"status": "cleanup_failed", "error": str(exc)}
+                print(
+                    f"[Kaggle H3] Transformer cleanup raised after sampling: {exc}",
+                    flush=True,
+                )
+            try:
+                release_h3_runtime_resources()
+            except Exception as exc:
+                cleanup_error = cleanup_error or exc
+                print(
+                    f"[Kaggle H3] Final runtime cleanup raised: {exc}",
+                    flush=True,
+                )
+            if cleanup_error is not None and not original_exception:
+                raise H3PhaseError(
+                    f"H3 runtime cleanup failed after sampling: {cleanup_error}"
+                ) from cleanup_error
             if (
                 phase_state is not None
                 and phase_state.active
@@ -905,7 +980,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "KaggleH3ShardedDiffusionLoader": "Kaggle H3 | Diffusion Shard Loader (GPU0 + GPU1)",
-    "KaggleH3TextEncoderLoader": "Kaggle H3 | Text Encoder (GPU0)",
+    "KaggleH3TextEncoderLoader": "Kaggle H3 | Text Encoder (GPU0 + GPU1)",
     "KaggleH3VAELoader": "Kaggle H3 | VAE Loader",
     "KaggleH3PhaseDispatch": "Kaggle H3 | Transformer Dispatch Barrier",
     "KaggleH3AdapterStack": "Kaggle H3 | Adapter Stack",
