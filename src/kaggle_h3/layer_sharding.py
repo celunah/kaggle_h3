@@ -1344,6 +1344,48 @@ def _install_comfy_quantized_router(
                                 ): _move_tensor_tree(output, _target)
                             )
                         )
+
+        # MiniMax's FinalLayer performs its AdaLN arithmetic directly in its
+        # own forward method. A parent/child pre-hook cannot guarantee that
+        # every tensor participating in ``norm(x) * (1 + scale) + shift`` is
+        # on one device, especially after Comfy has attached quantized casts.
+        # Wrap the complete method and move all positional/keyword tensors as
+        # one device island before any internal arithmetic begins.
+        primary_device = torch.device(_device_label(device_ids[0]))
+        named_modules = getattr(transformer, "named_modules", None)
+        if callable(named_modules):
+            for path, module in named_modules():
+                if str(path).rsplit(".", 1)[-1].lower() != "final_layer":
+                    continue
+                forward = getattr(module, "forward", None)
+                if not callable(forward):
+                    continue
+                module.to(primary_device)
+
+                def final_layer_forward(
+                    *args: Any,
+                    _forward=forward,
+                    _target=primary_device,
+                    **kwargs: Any,
+                ) -> Any:
+                    moved_args = tuple(
+                        _move_tensor_tree(value, _target) for value in args
+                    )
+                    moved_kwargs = _move_tensor_tree(kwargs, _target)
+                    return _forward(*moved_args, **moved_kwargs)
+
+                module.forward = final_layer_forward
+                handles.append(
+                    _AttributeRestoreHandle(module, "forward", forward)
+                )
+                movement.append(
+                    {
+                        "path": str(path),
+                        "planned_residency": "cuda:0",
+                        "execution_device": str(primary_device),
+                        "special_boundary": "complete_final_layer_device_island",
+                    }
+                )
     except Exception:
         _remove_handles(handles)
         raise
@@ -1370,6 +1412,7 @@ def _install_comfy_quantized_router(
         "outer_model_return_device": _device_label(device_ids[0]),
         "quantized_copies": "synchronous",
         "activation_transfers": "synchronous",
+        "final_layer_device_island": _device_label(device_ids[0]),
     }
     return execution_map, plan["comfy_quantized_router"], handles
 
