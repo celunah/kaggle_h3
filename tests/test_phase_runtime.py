@@ -95,7 +95,14 @@ class PhaseRuntimeTests(unittest.TestCase):
         class Transformer(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.blocks = torch.nn.ModuleList([torch.nn.Identity(), torch.nn.Identity()])
+                self.blocks = torch.nn.ModuleList(
+                    [
+                        torch.nn.Identity(),
+                        torch.nn.Identity(),
+                        torch.nn.Identity(),
+                        torch.nn.Identity(),
+                    ]
+                )
 
         transformer = Transformer()
         state = H3TransformerPhase(
@@ -107,6 +114,8 @@ class PhaseRuntimeTests(unittest.TestCase):
                     "layers": [
                         {"path": "blocks.0", "execution_device": "cuda:0"},
                         {"path": "blocks.1", "execution_device": "cuda:1"},
+                        {"path": "blocks.2", "execution_device": "cuda:0"},
+                        {"path": "blocks.3", "execution_device": "cuda:1"},
                     ],
                 }
             },
@@ -114,8 +123,8 @@ class PhaseRuntimeTests(unittest.TestCase):
         _install_transformer_activity_hooks(state)
         try:
             value = torch.ones((1, 2), dtype=torch.float32)
-            transformer.blocks[0](value)
-            transformer.blocks[1](value)
+            for block in transformer.blocks:
+                block(value)
         finally:
             for handle in state.activity_handles:
                 handle.remove()
@@ -131,6 +140,58 @@ class PhaseRuntimeTests(unittest.TestCase):
                 "sampler_gpu1_out",
             },
         )
+        self.assertEqual(
+            state.activity["validated_blocks"],
+            {
+                "input": ["blocks.0", "blocks.1", "blocks.2", "blocks.3"],
+                "output": ["blocks.0", "blocks.1", "blocks.2", "blocks.3"],
+            },
+        )
+
+    def test_transformer_activity_hooks_fail_at_intermediate_gpu1_block_output(self):
+        import torch
+
+        class BadBlock(torch.nn.Module):
+            def forward(self, value):
+                return torch.full_like(value, float("nan"))
+
+        class Transformer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = torch.nn.ModuleList(
+                    [torch.nn.Identity(), torch.nn.Identity(), BadBlock(), torch.nn.Identity()]
+                )
+
+        transformer = Transformer()
+        state = H3TransformerPhase(
+            transformer=transformer,
+            device_ids=(0, 1),
+            report={
+                "planned": {
+                    "group": {"container_path": "blocks"},
+                    "layers": [
+                        {"path": "blocks.0", "execution_device": "cuda:0"},
+                        {"path": "blocks.1", "execution_device": "cuda:0"},
+                        {"path": "blocks.2", "execution_device": "cuda:1"},
+                        {"path": "blocks.3", "execution_device": "cuda:1"},
+                    ],
+                }
+            },
+        )
+        _install_transformer_activity_hooks(state)
+        try:
+            transformer.blocks[0](torch.ones((1, 2), dtype=torch.float32))
+            transformer.blocks[1](torch.ones((1, 2), dtype=torch.float32))
+            with self.assertRaisesRegex(
+                FloatingPointError,
+                r"(?s)stage 'sampler_gpu1_out'.*tensor=blocks\.2\.output",
+            ):
+                transformer.blocks[2](torch.ones((1, 2), dtype=torch.float32))
+        finally:
+            for handle in state.activity_handles:
+                handle.remove()
+
+        self.assertEqual(state.activity["validated_blocks"]["output"], ["blocks.0", "blocks.1"])
 
     def test_transformer_activity_hooks_fail_at_gpu0_segment_output(self):
         import torch

@@ -923,13 +923,14 @@ def _measure_gpu_transfer(device_ids: tuple[int, ...]) -> dict[str, Any]:
 
 
 def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
-    """Record calls and validate the H3 sampler's GPU boundaries."""
+    """Record calls and validate every dispatched H3 block boundary."""
 
     state.activity = {
         "planned_gpu_calls": {str(device_id): 0 for device_id in state.device_ids},
         "input_gpu_ids": [],
         "block_calls": {},
         "diagnostic_checks": {},
+        "validated_blocks": {"input": [], "output": []},
     }
     planned_layers = (state.report.get("planned") or {}).get("layers") or []
     group_path = str((state.report.get("planned") or {}).get("group", {}).get("container_path", ""))
@@ -971,9 +972,12 @@ def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
         and execution_target(layer) == secondary_gpu
     ]
     first_primary_path = primary_blocks[0][1].get("path") if primary_blocks else None
-    last_primary_path = primary_blocks[-1][1].get("path") if primary_blocks else None
     first_secondary_path = secondary_blocks[0][1].get("path") if secondary_blocks else None
-    last_secondary_path = secondary_blocks[-1][1].get("path") if secondary_blocks else None
+
+    def mark_block_check(kind: str, path: str) -> None:
+        checked = state.activity["validated_blocks"][kind]
+        if path not in checked:
+            checked.append(path)
 
     def validate_phase_input(stage: str, value: Any, path: str) -> None:
         validate_finite(
@@ -982,6 +986,7 @@ def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
             tensor_name=f"{path}.input",
         )
         state.activity["diagnostic_checks"][stage] = True
+        mark_block_check("input", path)
 
     for layer in planned_layers:
         # The quantized Comfy router records the GPU where a CPU/disk-tier
@@ -1011,6 +1016,11 @@ def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
             kwargs = _kwargs or {}
             if _path == first_primary_path and "sampler_gpu0" not in state.activity["diagnostic_checks"]:
                 validate_phase_input("sampler_gpu0", (args, kwargs), _path)
+            elif _target == primary_gpu:
+                # Validate every subsequent block input on GPU0, not just the
+                # segment entry. This catches a non-finite activation before it
+                # can be consumed by the next intact block.
+                validate_phase_input("sampler_gpu0", (args, kwargs), _path)
             if _path == first_secondary_path:
                 # The first GPU1 block is the exact destination boundary of
                 # the preceding GPU0 segment. Keep the low-level names first
@@ -1019,6 +1029,10 @@ def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
                 validate_phase_input("sampler_gpu1_in", (args, kwargs), _path)
                 if "sampler_gpu1" not in state.activity["diagnostic_checks"]:
                     validate_phase_input("sampler_gpu1", (args, kwargs), _path)
+            elif _target == secondary_gpu:
+                # Validate every subsequent block input on GPU1. The first
+                # block already receives the low-level handoff checks above.
+                validate_phase_input("sampler_gpu1", (args, kwargs), _path)
 
         def observe_output(
             _module: Any,
@@ -1027,13 +1041,20 @@ def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
             output: Any,
             *,
             _path=path,
+            _target=target,
         ) -> Any:
-            if _path == last_primary_path:
-                validate_finite(output, "sampler_gpu0_out", tensor_name=f"{_path}.output")
-                state.activity["diagnostic_checks"]["sampler_gpu0_out"] = True
-            if _path == last_secondary_path:
-                validate_finite(output, "sampler_gpu1_out", tensor_name=f"{_path}.output")
-                state.activity["diagnostic_checks"]["sampler_gpu1_out"] = True
+            stage = (
+                "sampler_gpu0_out"
+                if _target == primary_gpu
+                else "sampler_gpu1_out"
+            )
+            # Attach this to every dispatched block. The path in the required
+            # exception format identifies the first block that actually
+            # produced non-finite values, rather than only the last block in a
+            # GPU segment.
+            validate_finite(output, stage, tensor_name=f"{_path}.output")
+            state.activity["diagnostic_checks"][stage] = True
+            mark_block_check("output", _path)
             return output
 
         try:
@@ -1044,8 +1065,6 @@ def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
             except Exception:
                 continue
         except Exception:
-            continue
-        if path not in {last_primary_path, last_secondary_path}:
             continue
         register_output = getattr(module, "register_forward_hook", None)
         if not callable(register_output):
@@ -1353,14 +1372,23 @@ def release_transformer_phase(state: H3TransformerPhase | None) -> dict[str, Any
         "planned_gpu_calls": planned_gpu_calls,
         "input_gpu_ids": list(activity.get("input_gpu_ids") or []),
         "block_calls": dict(activity.get("block_calls") or {}),
+        "validated_blocks": {
+            kind: list(paths)
+            for kind, paths in (activity.get("validated_blocks") or {}).items()
+        },
         "observed_gpu_ids": sorted(used_gpu_ids),
         "same_generation_all_requested_gpus": set(state.device_ids).issubset(used_gpu_ids),
     }
     state.report["release"]["generation_activity"] = state.report["generation_activity"]
+    validated_block_counts = ", ".join(
+        f"{kind}={len(paths)}"
+        for kind, paths in state.report["generation_activity"]["validated_blocks"].items()
+    )
     print(
         "[Kaggle H3] Transformer generation activity: "
         f"planned_gpu_calls={planned_gpu_calls}, observed_input_devices="
-        f"{state.report['generation_activity']['input_gpu_ids']}.",
+        f"{state.report['generation_activity']['input_gpu_ids']}, "
+        f"validated_blocks={validated_block_counts}.",
         flush=True,
     )
     print(
