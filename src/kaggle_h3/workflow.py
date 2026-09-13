@@ -502,6 +502,7 @@ def build_workflow(
                 "noise_seed": int(request.seed),
                 "sampler_name": "euler" if request.turbo_mode else "res_multistep",
                 "steps": quality_steps(request),
+                "synchronize_mode": "full",
             },
         }
     else:
@@ -517,6 +518,7 @@ def build_workflow(
                 "noise_seed": int(request.seed),
                 "sampler_name": "res_multistep",
                 "steps": quality_steps(request),
+                "synchronize_mode": "full",
             },
         }
     # The stock H3 video VAE is an FP16 checkpoint.  Use the local decoder

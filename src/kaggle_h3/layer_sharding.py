@@ -891,6 +891,17 @@ def _synchronize_h3_device(device: Any) -> None:
         torch.cuda.synchronize(resolved)
 
 
+def _h3_synchronization_mode(mode_ref: Any = None) -> str:
+    """Read a live router mode, defaulting to the conservative policy."""
+
+    if isinstance(mode_ref, dict):
+        mode = mode_ref.get("value", "full")
+    else:
+        mode = mode_ref or "full"
+    normalized = str(mode).strip().lower()
+    return normalized if normalized in {"full", "safe", "fast"} else "full"
+
+
 def _cuda_devices_in_tree(value: Any) -> list[Any]:
     """Return CUDA tensor devices in traversal order without copying values."""
 
@@ -926,7 +937,9 @@ def _cuda_devices_in_tree(value: Any) -> list[Any]:
     return devices
 
 
-def _synchronize_h3_transfer(value: Any, target: Any) -> None:
+def _synchronize_h3_transfer(
+    value: Any, target: Any, *, synchronization_mode: Any = "full"
+) -> None:
     """Synchronize producers and the destination before a routed copy."""
 
     try:
@@ -936,19 +949,32 @@ def _synchronize_h3_transfer(value: Any, target: Any) -> None:
     except Exception:
         return
     source_devices = _cuda_devices_in_tree(value)
+    mode = _h3_synchronization_mode(synchronization_mode)
     synchronized = {str(device) for device in source_devices}
     for source in source_devices:
-        _synchronize_h3_device(source)
-    if target_device.type == "cuda" and str(target_device) not in synchronized:
+        if mode != "fast" or str(source) != str(target_device):
+            _synchronize_h3_device(source)
+    if (
+        mode != "fast"
+        and target_device.type == "cuda"
+        and str(target_device) not in synchronized
+    ):
         _synchronize_h3_device(target_device)
 
 
-def _move_h3_tree_synchronously(value: Any, device: Any) -> Any:
-    """Move one routed value with explicit producer/copy/consumer barriers."""
+def _move_h3_tree_synchronously(
+    value: Any, device: Any, *, synchronization_mode: Any = "full"
+) -> Any:
+    """Move one routed value with mode-selected transfer barriers."""
 
-    _synchronize_h3_transfer(value, device)
+    mode = _h3_synchronization_mode(synchronization_mode)
+    source_devices = _cuda_devices_in_tree(value)
+    target = str(device)
+    cross_device = any(str(source) != target for source in source_devices)
+    _synchronize_h3_transfer(value, device, synchronization_mode=mode)
     moved = _move_tensor_tree(value, device, non_blocking=False)
-    _synchronize_h3_device(device)
+    if mode != "fast" or cross_device:
+        _synchronize_h3_device(device)
     return moved
 
 
@@ -956,13 +982,20 @@ def _move_h3_arguments_synchronously(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     device: Any,
+    *,
+    synchronization_mode: Any = "full",
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-    """Route a module call as one synchronized activation boundary."""
+    """Route a module call as one mode-selected activation boundary."""
 
-    _synchronize_h3_transfer((args, kwargs), device)
+    mode = _h3_synchronization_mode(synchronization_mode)
+    source_devices = _cuda_devices_in_tree((args, kwargs))
+    target = str(device)
+    cross_device = any(str(source) != target for source in source_devices)
+    _synchronize_h3_transfer((args, kwargs), device, synchronization_mode=mode)
     moved_args = tuple(_move_tensor_tree(value, device, non_blocking=False) for value in args)
     moved_kwargs = _move_tensor_tree(kwargs, device, non_blocking=False)
-    _synchronize_h3_device(device)
+    if mode != "fast" or cross_device:
+        _synchronize_h3_device(device)
     return moved_args, moved_kwargs
 
 
@@ -1348,6 +1381,7 @@ def _install_comfy_quantized_router(
     plan: dict[str, Any],
     *,
     device_ids: list[int],
+    synchronization_mode_ref: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any], list[Any]]:
     """Install a Comfy-safe execution router for a quantized H3 transformer.
 
@@ -1387,6 +1421,7 @@ def _install_comfy_quantized_router(
     execution_map: dict[str, str] = {}
     handles: list[Any] = []
     movement: list[dict[str, Any]] = []
+    sync_ref = synchronization_mode_ref or {"value": "full"}
 
     # ComfyUI calculates this helper inside cast_bias_weight() immediately
     # before it copies a quantized weight. Disable non-blocking transfers for
@@ -1423,6 +1458,22 @@ def _install_comfy_quantized_router(
     # Route all explicitly mapped components, including each intact block.
     # The root entry is a residency default, not a callable module.
     mapped_paths = [path for path in device_map if path]
+    ordered_execution = [
+        (
+            path,
+            _execution_device_for_path(
+                path,
+                device_map[path],
+                group=group,
+                device_ids=device_ids,
+            ),
+        )
+        for path in mapped_paths
+    ]
+    next_execution = {
+        path: ordered_execution[index + 1][1]
+        for index, (path, _target) in enumerate(ordered_execution[:-1])
+    }
     try:
         for path in mapped_paths:
             target = device_map[path]
@@ -1472,7 +1523,12 @@ def _install_comfy_quantized_router(
                 _target=execution_device,
             ) -> tuple[tuple[Any, ...], dict[str, Any]]:
                 target_device = torch.device(_target)
-                return _move_h3_arguments_synchronously(args, kwargs, target_device)
+                return _move_h3_arguments_synchronously(
+                    args,
+                    kwargs,
+                    target_device,
+                    synchronization_mode=sync_ref,
+                )
 
             try:
                 handle = register(route_inputs, with_kwargs=True)
@@ -1481,7 +1537,10 @@ def _install_comfy_quantized_router(
                 # cover H3's positional activation/timestep arguments.
                 handle = register(
                     lambda _module, args, _target=execution_device: _move_h3_arguments_synchronously(
-                        args, {}, torch.device(_target)
+                        args,
+                        {},
+                        torch.device(_target),
+                        synchronization_mode=sync_ref,
                     )[0]
                 )
             handles.append(handle)
@@ -1492,6 +1551,23 @@ def _install_comfy_quantized_router(
                     f"Mapped H3 module {path!r} does not support forward hooks"
                 )
 
+            def synchronize_output_if_needed(output: Any, target: str, path: str) -> Any:
+                mode = _h3_synchronization_mode(sync_ref)
+                next_target = next_execution.get(path)
+                should_synchronize = (
+                    mode in {"full", "safe"}
+                    or next_target is None
+                    or next_target != target
+                    or path.rsplit(".", 1)[-1].lower()
+                    in {"final_layer", "norm_out", "proj_out", "audio_proj_out"}
+                )
+                if should_synchronize:
+                    # Full and safe retain the proven block boundary. Fast
+                    # waits only where the next mapped component changes
+                    # device or at a final/output layer.
+                    _synchronize_h3_device(target)
+                return output
+
             def synchronize_module_output(
                 _module: Any,
                 _args: tuple[Any, ...],
@@ -1499,12 +1575,9 @@ def _install_comfy_quantized_router(
                 output: Any,
                 *,
                 _target=execution_device,
+                _path=path,
             ) -> Any:
-                # This is the deliberate block/component barrier. It replaces
-                # the accidental synchronization caused by scanning every
-                # nested operation with the finite-value diagnostics enabled.
-                _synchronize_h3_device(_target)
-                return output
+                return synchronize_output_if_needed(output, _target, _path)
 
             try:
                 handles.append(
@@ -1513,8 +1586,8 @@ def _install_comfy_quantized_router(
             except TypeError:
                 handles.append(
                     register_output(
-                        lambda _module, _args, output, _target=execution_device: (
-                            _synchronize_h3_device(_target) or output
+                        lambda _module, _args, output, _target=execution_device, _path=path: (
+                            synchronize_output_if_needed(output, _target, _path)
                         )
                     )
                 )
@@ -1546,7 +1619,10 @@ def _install_comfy_quantized_router(
                             _target=torch.device(execution_device),
                         ) -> tuple[tuple[Any, ...], dict[str, Any]]:
                             return _move_h3_arguments_synchronously(
-                                nested_args, nested_kwargs, _target
+                                nested_args,
+                                nested_kwargs,
+                                _target,
+                                synchronization_mode=sync_ref,
                             )
 
                         try:
@@ -1557,7 +1633,10 @@ def _install_comfy_quantized_router(
                         except TypeError:
                             nested_handle = nested_module.register_forward_pre_hook(
                                 lambda _nested, nested_args, _target=torch.device(execution_device): _move_h3_arguments_synchronously(
-                                    nested_args, {}, _target
+                                    nested_args,
+                                    {},
+                                    _target,
+                                    synchronization_mode=sync_ref,
                                 )[0]
                             )
                         handles.append(nested_handle)
@@ -1573,7 +1652,11 @@ def _install_comfy_quantized_router(
                         *,
                         _target=torch.device(_device_label(device_ids[0])),
                     ) -> Any:
-                        return _move_h3_tree_synchronously(output, _target)
+                        return _move_h3_tree_synchronously(
+                            output,
+                            _target,
+                            synchronization_mode=sync_ref,
+                        )
 
                     try:
                         handles.append(register_forward(route_outputs, with_kwargs=True))
@@ -1582,7 +1665,11 @@ def _install_comfy_quantized_router(
                             register_forward(
                                 lambda _module, _args, output, _target=torch.device(
                                     _device_label(device_ids[0])
-                                ): _move_h3_tree_synchronously(output, _target)
+                                ): _move_h3_tree_synchronously(
+                                    output,
+                                    _target,
+                                    synchronization_mode=sync_ref,
+                                )
                             )
                         )
 
@@ -1612,7 +1699,10 @@ def _install_comfy_quantized_router(
                     **kwargs: Any,
                 ) -> Any:
                     moved_args, moved_kwargs = _move_h3_arguments_synchronously(
-                        args, kwargs, _target
+                        args,
+                        kwargs,
+                        _target,
+                        synchronization_mode=sync_ref,
                     )
                     output = _forward(*moved_args, **moved_kwargs)
                     _synchronize_h3_device(_target)
@@ -1654,6 +1744,7 @@ def _install_comfy_quantized_router(
         "cpu_third_tier": True,
         "disk_storage": "Comfy-managed source/offload when available; no Accelerate disk hooks",
         "outer_model_return_device": _device_label(device_ids[0]),
+        "synchronization_mode": _h3_synchronization_mode(sync_ref),
         "quantized_copies": "synchronous",
         "quantized_copy_boundaries": {
             "entry_points": ["comfy.model_management.cast_to", "comfy.model_management.cast_to_gathered"],
@@ -1662,7 +1753,10 @@ def _install_comfy_quantized_router(
         "activation_transfers": "synchronous",
         "activation_boundaries": {
             "policy": "source-device barrier -> direct tensor copy -> destination-device barrier",
-            "block_output_barrier": "cuda.synchronize(execution_device)",
+            "block_output_barrier": (
+                "cuda.synchronize(execution_device) for full/safe; "
+                "device-transition/final-layer boundaries for fast"
+            ),
             "final_output_barrier": "cuda.synchronize(cuda:0)",
         },
         "final_layer_device_island": _device_label(device_ids[0]),
@@ -1739,6 +1833,7 @@ def dispatch_h3_transformer(
     gpu_limit_gib: float = DEFAULT_GPU_LIMIT_GIB,
     cpu_headroom_gib: float = DEFAULT_CPU_HEADROOM_GIB,
     preferred_layout: str = "h3_two_t4_preferred",
+    synchronization_mode: str = "full",
 ) -> tuple[Any, dict[str, Any]]:
     """Compute and apply an actual H3 hierarchical device map.
 
@@ -1748,6 +1843,8 @@ def dispatch_h3_transformer(
     """
 
     ids = [int(value) for value in device_ids]
+    sync_mode = _h3_synchronization_mode(synchronization_mode)
+    sync_ref = {"value": sync_mode}
     runtime = runtime_memory_budgets(
         ids,
         gpu_limit_gib=gpu_limit_gib,
@@ -1774,6 +1871,7 @@ def dispatch_h3_transformer(
             transformer,
             plan,
             device_ids=ids,
+            synchronization_mode_ref=sync_ref,
         )
         try:
             observed = inspect_dispatched_map(
@@ -1797,6 +1895,12 @@ def dispatch_h3_transformer(
                 "offload_dir": str(Path(offload_dir)) if "disk" in plan["device_map"].values() else None,
                 "weight_residency": "Comfy-managed quantized weights; GPU entries moved with native Module._apply; overflow entries remain CPU-owned",
                 "execution_routing": router_report,
+                "synchronization": {
+                    "mode": sync_mode,
+                    "block_outputs": router_report.get("activation_boundaries", {}).get(
+                        "block_output_barrier"
+                    ),
+                },
             }
             if not observed["observed_all_requested_gpus"]:
                 raise H3LayerShardingError(
@@ -1805,6 +1909,7 @@ def dispatch_h3_transformer(
             # The phase runtime removes these hooks after denoising.  Keep the
             # handle out of the JSON report/runtime config.
             setattr(transformer, "_kaggle_h3_dispatch_handles", handles)
+            setattr(transformer, "_kaggle_h3_synchronization_mode_ref", sync_ref)
             return transformer, report
         except Exception:
             _remove_handles(handles)
@@ -1851,6 +1956,11 @@ def dispatch_h3_transformer(
         "cpu_third_tier": True,
         "disk_offload_used": has_disk,
         "offload_dir": str(offload_dir) if has_disk else None,
+        "synchronization": {
+            "mode": sync_mode,
+            "backend": "accelerate.dispatch_model",
+            "sampler_boundary": "selected_by_sampler",
+        },
     }
     if not observed["observed_all_requested_gpus"]:
         raise H3LayerShardingError(

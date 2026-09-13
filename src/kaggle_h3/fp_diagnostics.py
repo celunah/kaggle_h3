@@ -8,11 +8,24 @@ for planning and workflow generation without a CUDA runtime.
 from __future__ import annotations
 
 from collections.abc import Iterator
+import os
 from typing import Any
 
 
 def _tensor_path(path: str, suffix: str) -> str:
     return suffix if not path else f"{path}{suffix}"
+
+
+def finite_diagnostics_enabled() -> bool:
+    """Return whether expensive non-finite scans are enabled for this run.
+
+    The H3 synchronization barriers are independent of this setting and stay
+    active in production.  Diagnostics are opt-in because each check can scan
+    a GPU tensor and synchronize the device while a dispatched block runs.
+    """
+
+    value = os.environ.get("KAGGLE_H3_FP_DIAGNOSTICS", "0").strip().lower()
+    return value in {"1", "true", "yes", "on", "enabled", "full", "blocks"}
 
 
 def _iter_tensors(value: Any, path: str, seen: set[int]) -> Iterator[tuple[str, Any]]:
@@ -105,6 +118,9 @@ def validate_finite(value: Any, stage_name: str, *, tensor_name: str = "root") -
     existing boundaries.
     """
 
+    if not finite_diagnostics_enabled():
+        return value
+
     try:
         import torch  # type: ignore
     except ImportError as exc:  # pragma: no cover - runtime dependency guard
@@ -127,4 +143,4 @@ def validate_finite(value: Any, stage_name: str, *, tensor_name: str = "root") -
     return value
 
 
-__all__ = ["validate_finite"]
+__all__ = ["finite_diagnostics_enabled", "validate_finite"]

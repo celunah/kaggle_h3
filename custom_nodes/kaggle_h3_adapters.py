@@ -8,11 +8,18 @@ dependency-light core makes the resolver and ordering rules unit-testable.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 import os
 from pathlib import Path
 import importlib.util
 import sys
 from typing import Any
+
+
+_H3_SAMPLER_SYNCHRONIZATION_MODE: ContextVar[str] = ContextVar(
+    "kaggle_h3_sampler_synchronization_mode", default="full"
+)
+
 
 try:
     from kaggle_h3.adapters import (
@@ -153,10 +160,13 @@ try:
         prepare_text_encoder_for_h3_phase,
         _retarget_patcher_load_device,
         _prepare_sampling_preserving_phase,
+        h3_synchronization_plan,
+        normalize_h3_synchronization_mode,
         release_all_text_encoder_phases,
         release_h3_runtime_resources,
         release_vae_phase,
         release_transformer_phase,
+        set_h3_synchronization_mode,
         synchronize_h3_devices,
         validate_finite,
     )
@@ -173,10 +183,13 @@ except ImportError:
             prepare_text_encoder_for_h3_phase,
             _retarget_patcher_load_device,
             _prepare_sampling_preserving_phase,
+            h3_synchronization_plan,
+            normalize_h3_synchronization_mode,
             release_all_text_encoder_phases,
             release_h3_runtime_resources,
             release_vae_phase,
             release_transformer_phase,
+            set_h3_synchronization_mode,
             synchronize_h3_devices,
             validate_finite,
         )
@@ -204,10 +217,13 @@ except ImportError:
         prepare_text_encoder_for_h3_phase = phase_module.prepare_text_encoder_for_h3_phase
         _retarget_patcher_load_device = phase_module._retarget_patcher_load_device
         _prepare_sampling_preserving_phase = phase_module._prepare_sampling_preserving_phase
+        h3_synchronization_plan = phase_module.h3_synchronization_plan
+        normalize_h3_synchronization_mode = phase_module.normalize_h3_synchronization_mode
         release_all_text_encoder_phases = phase_module.release_all_text_encoder_phases
         release_h3_runtime_resources = phase_module.release_h3_runtime_resources
         release_vae_phase = phase_module.release_vae_phase
         release_transformer_phase = phase_module.release_transformer_phase
+        set_h3_synchronization_mode = phase_module.set_h3_synchronization_mode
         synchronize_h3_devices = phase_module.synchronize_h3_devices
         validate_finite = phase_module.validate_finite
 
@@ -449,6 +465,17 @@ def _h3_clone_sampler_value(value: Any) -> Any:
     return value
 
 
+def _h3_sampler_boundary_devices(mode: str) -> tuple[int, ...]:
+    """Choose devices for the post-model sampler barrier."""
+
+    device_ids = tuple(phase_device_ids())
+    if mode == "full":
+        return device_ids
+    if mode == "safe":
+        return device_ids[:1]
+    return ()
+
+
 def _h3_res_multistep(
     model: Any,
     x: Any,
@@ -463,8 +490,8 @@ def _h3_res_multistep(
 
     The update equations intentionally mirror ComfyUI v0.34.0's
     ``sample_res_multistep`` entry point (eta=0, non-CFG).  The only H3
-    additions are a deliberate full-model boundary barrier and an owned copy
-    of ``old_denoised``.  Turbo remains on ComfyUI's normal Euler path.
+    additions are the selected H3 synchronization boundary and an owned copy
+    of ``old_denoised``. Turbo remains on ComfyUI's normal Euler path.
     """
 
     import torch
@@ -498,7 +525,7 @@ def _h3_res_multistep(
     for index in range(len(sigmas) - 1):
         denoised = model(x, sigmas[index] * s_in, **extra_args)
         synchronize_h3_devices(
-            phase_device_ids(),
+            _h3_sampler_boundary_devices(_H3_SAMPLER_SYNCHRONIZATION_MODE.get()),
             reason=f"res_multistep model output boundary {index}",
         )
         if callback is not None:
@@ -1281,6 +1308,8 @@ def _install_phase_dispatch_hook(
     sampler_helpers: Any,
     runtime_config: dict[str, Any] | None,
     phase_holder: dict[str, Any],
+    *,
+    synchronization_mode: str = "full",
 ):
     """Install the post-Comfy-load H3 dispatch hook and return the original."""
 
@@ -1297,6 +1326,7 @@ def _install_phase_dispatch_hook(
         existing = phase_state_for_model(phase_model)
         if existing is not None and existing.active:
             phase_holder["state"] = existing
+            set_h3_synchronization_mode(existing, synchronization_mode)
             # A custom phase barrier has already applied the verified H3 map
             # (Comfy-native for quantized H3, Accelerate for ordinary modules).
             # Preserve it while still allowing Comfy to prepare conditioning
@@ -1308,7 +1338,11 @@ def _install_phase_dispatch_hook(
                 kwargs,
             )
         result = original_prepare_sampling(*args, **kwargs)
-        phase_holder["state"] = begin_transformer_phase(phase_model, runtime_config)
+        phase_holder["state"] = begin_transformer_phase(
+            phase_model,
+            runtime_config,
+            synchronization_mode=synchronization_mode,
+        )
         return result
 
     sampler_helpers.prepare_sampling = prepare_sampling_then_dispatch
@@ -1431,6 +1465,10 @@ class H3TurboSampler:
                 "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
                 "sampler_name": (["res_multistep", "euler"], {"default": "res_multistep"}),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 200}),
+                "synchronize_mode": (
+                    ["full", "safe", "fast"],
+                    {"default": "full"},
+                ),
             },
             "optional": {
                 "runtime_config": ("H3_RUNTIME_CONFIG",),
@@ -1525,6 +1563,7 @@ class H3TurboSampler:
         noise_seed: int,
         sampler_name: str,
         steps: int = 20,
+        synchronize_mode: str = "full",
     ):
         import comfy.sample  # type: ignore
         import comfy.samplers  # type: ignore
@@ -1534,10 +1573,16 @@ class H3TurboSampler:
         import latent_preview  # type: ignore
         from comfy_extras.nodes_custom_sampler import Guider_Basic, Noise_RandomNoise  # type: ignore
 
+        synchronize_mode = normalize_h3_synchronization_mode(synchronize_mode)
         schedule, expected_steps = self._resolve_sampling_parameters(
             runtime_config, sampler_name, steps
         )
         turbo = (runtime_config or {}).get("turbo") or {}
+
+        if isinstance(runtime_config, dict):
+            execution = dict(runtime_config.get("execution") or {})
+            execution["synchronization"] = h3_synchronization_plan(synchronize_mode)
+            runtime_config["execution"] = execution
 
         # Keep the sampler safe for hand-edited graphs that bypass the phase
         # dispatch node. The normal Ref2VA graph validates this same boundary
@@ -1560,7 +1605,10 @@ class H3TurboSampler:
         # Installing a narrowly-scoped wrapper is necessary: dispatching before
         # guider.sample() would be undone by ComfyUI's own load_models_gpu call.
         original_prepare_sampling = _install_phase_dispatch_hook(
-            comfy.sampler_helpers, runtime_config, phase_holder
+            comfy.sampler_helpers,
+            runtime_config,
+            phase_holder,
+            synchronization_mode=synchronize_mode,
         )
         try:
             sigmas = comfy.samplers.calculate_sigmas(
@@ -1590,18 +1638,24 @@ class H3TurboSampler:
             callback = latent_preview.prepare_callback(
                 guider.model_patcher, sigmas.shape[-1] - 1, x0_output
             )
-            samples = guider.sample(
-                Noise_RandomNoise(int(noise_seed)).generate_noise(latent),
-                latent_image_tensor,
-                sampler,
-                sigmas,
-                denoise_mask=noise_mask,
-                callback=callback,
-                disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
-                seed=int(noise_seed),
+            synchronization_token = _H3_SAMPLER_SYNCHRONIZATION_MODE.set(
+                synchronize_mode
             )
+            try:
+                samples = guider.sample(
+                    Noise_RandomNoise(int(noise_seed)).generate_noise(latent),
+                    latent_image_tensor,
+                    sampler,
+                    sigmas,
+                    denoise_mask=noise_mask,
+                    callback=callback,
+                    disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
+                    seed=int(noise_seed),
+                )
+            finally:
+                _H3_SAMPLER_SYNCHRONIZATION_MODE.reset(synchronization_token)
             synchronize_h3_devices(
-                phase_device_ids(),
+                _h3_sampler_boundary_devices(synchronize_mode),
                 reason="transformer sampler completion",
             )
             validate_finite(
@@ -1717,7 +1771,8 @@ class H3TurboSampler:
         print(
             f"[Kaggle H3] {resolved_mode} sampler consumed H3 runtime config: "
             f"turbo={bool(turbo.get('enabled'))}, steps={expected_steps}, "
-            f"shift={schedule.get('shift_video')}/{schedule.get('shift_audio')}",
+            f"shift={schedule.get('shift_video')}/{schedule.get('shift_audio')}, "
+            f"synchronize={synchronize_mode}",
             flush=True,
         )
         return (video_output, audio_output, denoised)

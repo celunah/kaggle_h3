@@ -101,6 +101,20 @@ class LayerShardingTests(unittest.TestCase):
             self.assertFalse(call.kwargs["non_blocking"])
         self.assertEqual(synchronize.call_count, 2)
 
+    def test_fast_activation_transfer_skips_redundant_same_device_barriers(self):
+        import torch
+
+        tensor = torch.ones((1, 2), dtype=torch.float32)
+        with patch("kaggle_h3.layer_sharding._synchronize_h3_device") as synchronize, patch(
+            "kaggle_h3.layer_sharding._move_tensor_tree",
+            side_effect=lambda value, _device, **kwargs: value,
+        ):
+            _move_h3_arguments_synchronously(
+                (tensor,), {}, torch.device("cuda:1"), synchronization_mode="fast"
+            )
+
+        self.assertEqual(synchronize.call_count, 0)
+
     def test_comfy_quantized_copy_wrappers_force_blocking_and_restore(self):
         import torch
 

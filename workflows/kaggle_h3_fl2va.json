@@ -55,7 +55,7 @@
   },
   "sample": {
     "class_type": "KaggleH3TurboSampler",
-    "inputs": {"model": ["phase", 0], "conditioning": ["phase", 1], "latent_image": ["phase", 2], "noise_seed": 42, "sampler_name": "res_multistep", "steps": 4},
+    "inputs": {"model": ["phase", 0], "conditioning": ["phase", 1], "latent_image": ["phase", 2], "noise_seed": 42, "sampler_name": "res_multistep", "steps": 4, "synchronize_mode": "full"},
     "_meta": {"title": "Kaggle H3 | H3 Sampler"}
   },
   "decode": {"class_type": "KaggleH3VAEDecode", "inputs": {"samples": ["sample", 0], "vae": ["vae_video", 0], "device_id": 1}, "_meta": {"title": "Kaggle H3 | Video Decode (GPU1)"}},

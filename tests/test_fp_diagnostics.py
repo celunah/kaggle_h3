@@ -1,17 +1,32 @@
+import os
 import unittest
+from unittest.mock import patch
 
 import torch
 
-from kaggle_h3.fp_diagnostics import validate_finite
+from kaggle_h3.fp_diagnostics import finite_diagnostics_enabled, validate_finite
 
 
 class FloatingPointDiagnosticsTests(unittest.TestCase):
+    def test_diagnostics_are_disabled_by_default(self):
+        value = torch.tensor([float("nan")])
+        with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "0"}):
+            self.assertFalse(finite_diagnostics_enabled())
+            self.assertIs(validate_finite(value, "sampler_final_out"), value)
+
+    def test_diagnostics_can_be_enabled_explicitly(self):
+        with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}):
+            self.assertTrue(finite_diagnostics_enabled())
+
     def test_finite_tensors_pass_and_are_not_replaced(self):
         value = {"nested": (torch.tensor([1.0, 2.0]), [torch.tensor(3.0)])}
-        self.assertIs(validate_finite(value, "conditioning_in"), value)
+        with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}):
+            self.assertIs(validate_finite(value, "conditioning_in"), value)
 
     def test_nan_positive_and_negative_infinity_are_counted_separately(self):
-        with self.assertRaises(FloatingPointError) as context:
+        with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}), self.assertRaises(
+            FloatingPointError
+        ) as context:
             validate_finite(
                 torch.tensor([float("nan"), float("inf"), float("-inf")]),
                 "sampler_final_out",
@@ -27,7 +42,7 @@ class FloatingPointDiagnosticsTests(unittest.TestCase):
 
     def test_recursive_nested_tensor_inspection(self):
         value = {"outer": [{"inner": torch.tensor([float("nan")])}]}
-        with self.assertRaisesRegex(
+        with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}), self.assertRaisesRegex(
             FloatingPointError,
             r"(?s)stage 'sampler_gpu1_in'.*tensor=sample\['outer'\]\[0\]\['inner'\]",
         ):
@@ -40,10 +55,13 @@ class FloatingPointDiagnosticsTests(unittest.TestCase):
             "empty": torch.empty((0,), dtype=torch.float32),
             "label": "metadata",
         }
-        validate_finite(value, "vae_video_in")
+        with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}):
+            validate_finite(value, "vae_video_in")
 
     def test_complex_non_finite_values_are_checked(self):
-        with self.assertRaisesRegex(FloatingPointError, r"nan=1, \+inf=1, -inf=1"):
+        with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}), self.assertRaisesRegex(
+            FloatingPointError, r"nan=1, \+inf=1, -inf=1"
+        ):
             validate_finite(
                 torch.tensor([complex(float("nan"), 0), complex(float("inf"), float("-inf"))]),
                 "vae_audio_out",
@@ -55,7 +73,9 @@ class FloatingPointDiagnosticsTests(unittest.TestCase):
         packed = torch.nested.nested_tensor(
             [torch.tensor([1.0]), torch.tensor([float("inf")])]
         )
-        with self.assertRaisesRegex(FloatingPointError, r"stage 'gpu0_to_gpu1'"):
+        with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}), self.assertRaisesRegex(
+            FloatingPointError, r"stage 'gpu0_to_gpu1'"
+        ):
             validate_finite(packed, "gpu0_to_gpu1", tensor_name="av_latent")
 
 

@@ -60,6 +60,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("audio_vae", workflow["h3"]["inputs"])
         self.assertEqual(workflow["sample"]["class_type"], "KaggleH3TurboSampler")
         self.assertEqual(workflow["sample"]["inputs"]["sampler_name"], "res_multistep")
+        self.assertEqual(workflow["sample"]["inputs"]["synchronize_mode"], "full")
 
     def test_model_mode_names_are_case_insensitive(self):
         self.assertIn("ref2va", required_model_files("ref2va")["diffusion_model"][1].lower())
@@ -91,6 +92,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["decode"]["inputs"]["samples"], ["sample", 0])
         self.assertEqual(workflow["decode_audio"]["inputs"]["samples"], ["sample", 1])
         self.assertEqual(workflow["video"]["inputs"]["color_space"], "sRGB")
+        self.assertEqual(workflow["sample"]["inputs"]["synchronize_mode"], "full")
 
     def test_default_turbo_smoke_template_matches_ref2va_active_mode(self):
         root = Path(__file__).parents[1]
@@ -109,6 +111,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["h3"]["class_type"], "KaggleH3Ref2VAConditioning")
         self.assertEqual(workflow["h3_adapter"]["inputs"]["model_variant"], "ref2va")
         self.assertEqual(workflow["h3_adapter"]["inputs"]["adapter_1"], "h3_ref2va_turbo_4step_v0_1")
+        self.assertEqual(workflow["sample"]["inputs"]["synchronize_mode"], "full")
         self.assertIn("ref_image_0", workflow["h3"]["inputs"])
         self.assertEqual(workflow["h3"]["inputs"]["seconds"], 5.0)
 

@@ -11,9 +11,12 @@ from kaggle_h3.phase_runtime import (
     H3PhaseError,
     H3TransformerPhase,
     build_phase_runtime_config,
+    h3_synchronization_plan,
+    normalize_h3_synchronization_mode,
     phase_policy,
     prepare_model_for_h3_phase,
     release_transformer_phase,
+    set_h3_synchronization_mode,
     synchronize_h3_devices,
 )
 
@@ -87,6 +90,26 @@ class PhaseRuntimeTests(unittest.TestCase):
         self.assertEqual(plan["transformer"]["gpu_budget_gib"], 13.0)
         self.assertEqual(plan["transformer"]["cpu_headroom_gib"], 26.0)
         self.assertTrue(plan["release_transformer_before_decode"])
+        self.assertEqual(plan["synchronization"]["mode"], "full")
+
+    def test_synchronization_modes_are_validated_and_described(self):
+        self.assertEqual(normalize_h3_synchronization_mode("safe"), "safe")
+        self.assertEqual(h3_synchronization_plan("fast")["sampler_boundary"], "explicit_block_and_final_handoff_barriers")
+        with self.assertRaisesRegex(H3PhaseError, "Unsupported H3 synchronization mode"):
+            normalize_h3_synchronization_mode("unsafe")
+
+    def test_synchronization_mode_updates_live_dispatch_reference(self):
+        mode_ref = {"value": "full"}
+        state = H3TransformerPhase(
+            transformer=SimpleNamespace(
+                _kaggle_h3_synchronization_mode_ref=mode_ref,
+            ),
+            report={},
+        )
+
+        self.assertEqual(set_h3_synchronization_mode(state, "fast"), "fast")
+        self.assertEqual(mode_ref["value"], "fast")
+        self.assertEqual(state.report["synchronization"]["mode"], "fast")
 
     def test_invalid_phase_policy_is_rejected(self):
         previous = os.environ.get("KAGGLE_H3_PHASE_SHARDING")
@@ -156,14 +179,15 @@ class PhaseRuntimeTests(unittest.TestCase):
                 }
             },
         )
-        _install_transformer_activity_hooks(state)
-        try:
-            value = torch.ones((1, 2), dtype=torch.float32)
-            for block in transformer.blocks:
-                block(value)
-        finally:
-            for handle in state.activity_handles:
-                handle.remove()
+        with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}):
+            _install_transformer_activity_hooks(state)
+            try:
+                value = torch.ones((1, 2), dtype=torch.float32)
+                for block in transformer.blocks:
+                    block(value)
+            finally:
+                for handle in state.activity_handles:
+                    handle.remove()
 
         self.assertEqual(
             set(state.activity["diagnostic_checks"]),
@@ -183,6 +207,42 @@ class PhaseRuntimeTests(unittest.TestCase):
                 "output": ["blocks.0", "blocks.1", "blocks.2", "blocks.3"],
             },
         )
+
+    def test_transformer_activity_hooks_skip_finite_scans_when_disabled(self):
+        import torch
+
+        class Transformer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = torch.nn.ModuleList([torch.nn.Identity(), torch.nn.Identity()])
+
+        transformer = Transformer()
+        state = H3TransformerPhase(
+            transformer=transformer,
+            device_ids=(0, 1),
+            report={
+                "planned": {
+                    "group": {"container_path": "blocks"},
+                    "layers": [
+                        {"path": "blocks.0", "execution_device": "cuda:0"},
+                        {"path": "blocks.1", "execution_device": "cuda:1"},
+                    ],
+                }
+            },
+        )
+        with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "0"}):
+            _install_transformer_activity_hooks(state)
+        try:
+            value = torch.ones((1, 2), dtype=torch.float32)
+            for block in transformer.blocks:
+                block(value)
+        finally:
+            for handle in state.activity_handles:
+                handle.remove()
+
+        self.assertFalse(state.activity["diagnostics_enabled"])
+        self.assertEqual(state.activity["diagnostic_checks"], {})
+        self.assertEqual(state.activity["validated_blocks"], {"input": [], "output": []})
 
     def test_transformer_activity_hooks_fail_at_intermediate_gpu1_block_output(self):
         import torch
@@ -214,18 +274,19 @@ class PhaseRuntimeTests(unittest.TestCase):
                 }
             },
         )
-        _install_transformer_activity_hooks(state)
-        try:
-            transformer.blocks[0](torch.ones((1, 2), dtype=torch.float32))
-            transformer.blocks[1](torch.ones((1, 2), dtype=torch.float32))
-            with self.assertRaisesRegex(
-                FloatingPointError,
-                r"(?s)stage 'sampler_gpu1_out'.*tensor=blocks\.2\.output",
-            ):
-                transformer.blocks[2](torch.ones((1, 2), dtype=torch.float32))
-        finally:
-            for handle in state.activity_handles:
-                handle.remove()
+        with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}):
+            _install_transformer_activity_hooks(state)
+            try:
+                transformer.blocks[0](torch.ones((1, 2), dtype=torch.float32))
+                transformer.blocks[1](torch.ones((1, 2), dtype=torch.float32))
+                with self.assertRaisesRegex(
+                    FloatingPointError,
+                    r"(?s)stage 'sampler_gpu1_out'.*tensor=blocks\.2\.output",
+                ):
+                    transformer.blocks[2](torch.ones((1, 2), dtype=torch.float32))
+            finally:
+                for handle in state.activity_handles:
+                    handle.remove()
 
         self.assertEqual(state.activity["validated_blocks"]["output"], ["blocks.0", "blocks.1"])
 
@@ -255,13 +316,14 @@ class PhaseRuntimeTests(unittest.TestCase):
                 }
             },
         )
-        _install_transformer_activity_hooks(state)
-        try:
-            with self.assertRaisesRegex(FloatingPointError, "stage 'sampler_gpu0_out'"):
-                transformer.blocks[0](torch.ones((1, 2), dtype=torch.float32))
-        finally:
-            for handle in state.activity_handles:
-                handle.remove()
+        with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}):
+            _install_transformer_activity_hooks(state)
+            try:
+                with self.assertRaisesRegex(FloatingPointError, "stage 'sampler_gpu0_out'"):
+                    transformer.blocks[0](torch.ones((1, 2), dtype=torch.float32))
+            finally:
+                for handle in state.activity_handles:
+                    handle.remove()
 
 
 if __name__ == "__main__":

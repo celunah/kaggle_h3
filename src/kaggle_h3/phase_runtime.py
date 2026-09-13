@@ -38,10 +38,13 @@ from typing import Any
 
 
 try:
-    from .fp_diagnostics import validate_finite
+    from .fp_diagnostics import finite_diagnostics_enabled, validate_finite
 except ImportError:
     try:
-        from kaggle_h3_fp_diagnostics import validate_finite  # type: ignore
+        from kaggle_h3_fp_diagnostics import (  # type: ignore
+            finite_diagnostics_enabled,
+            validate_finite,
+        )
     except ImportError:
         _diagnostics_path = Path(__file__).with_name("kaggle_h3_fp_diagnostics.py")
         _diagnostics_spec = importlib.util.spec_from_file_location(
@@ -56,11 +59,59 @@ except ImportError:
         _diagnostics_module = importlib.util.module_from_spec(_diagnostics_spec)
         sys.modules[_diagnostics_spec.name] = _diagnostics_module
         _diagnostics_spec.loader.exec_module(_diagnostics_module)
+        finite_diagnostics_enabled = _diagnostics_module.finite_diagnostics_enabled
         validate_finite = _diagnostics_module.validate_finite
 
 
 class H3PhaseError(RuntimeError):
     """Raised when the requested H3 execution phase cannot be verified."""
+
+
+H3_SYNCHRONIZATION_MODES = ("full", "safe", "fast")
+
+
+def normalize_h3_synchronization_mode(mode: Any) -> str:
+    """Validate the user-selectable synchronization policy."""
+
+    normalized = str(mode or "full").strip().lower()
+    if normalized not in H3_SYNCHRONIZATION_MODES:
+        choices = ", ".join(H3_SYNCHRONIZATION_MODES)
+        raise H3PhaseError(
+            f"Unsupported H3 synchronization mode {mode!r}; select one of: {choices}."
+        )
+    return normalized
+
+
+def h3_synchronization_plan(mode: Any = "full") -> dict[str, Any]:
+    """Describe the barriers enabled by one synchronization policy."""
+
+    normalized = normalize_h3_synchronization_mode(mode)
+    if normalized == "full":
+        return {
+            "mode": normalized,
+            "sampler_boundary": "all_requested_gpus_after_each_model_call",
+            "block_outputs": "every_dispatchable_block",
+            "activation_transfers": "source_and_destination_device_barriers",
+            "quantized_weight_copies": "synchronous_with_source_stream_barriers",
+            "phase_cleanup": "all_requested_gpus",
+        }
+    if normalized == "safe":
+        return {
+            "mode": normalized,
+            "sampler_boundary": "primary_gpu_after_each_model_call",
+            "block_outputs": "every_dispatchable_block",
+            "activation_transfers": "source_and_destination_device_barriers",
+            "quantized_weight_copies": "synchronous_with_source_stream_barriers",
+            "phase_cleanup": "all_requested_gpus",
+        }
+    return {
+        "mode": normalized,
+        "sampler_boundary": "explicit_block_and_final_handoff_barriers",
+        "block_outputs": "device_transitions_and_final_layer_only",
+        "activation_transfers": "cross_device_source_and_destination_barriers",
+        "quantized_weight_copies": "synchronous_with_source_stream_barriers",
+        "phase_cleanup": "all_requested_gpus",
+    }
 
 
 @dataclass
@@ -79,6 +130,8 @@ class H3TransformerPhase:
     activity_handles: list[Any] = field(default_factory=list)
     dispatch_handles: list[Any] = field(default_factory=list)
     activity: dict[str, Any] = field(default_factory=dict)
+    synchronization_mode: str = "full"
+    synchronization_mode_ref: dict[str, str] | None = None
 
 
 @dataclass
@@ -313,6 +366,26 @@ def phase_state_for_model(model: Any) -> H3TransformerPhase | None:
         if isinstance(state, H3TransformerPhase) and not state.released:
             return state
     return None
+
+
+def set_h3_synchronization_mode(state: H3TransformerPhase | None, mode: Any) -> str:
+    """Change the active transformer router policy without redispatching it."""
+
+    normalized = normalize_h3_synchronization_mode(mode)
+    if state is None:
+        return normalized
+    state.synchronization_mode = normalized
+    if isinstance(state.synchronization_mode_ref, dict):
+        state.synchronization_mode_ref["value"] = normalized
+    transformer_ref = getattr(
+        state.transformer, "_kaggle_h3_synchronization_mode_ref", None
+    )
+    if isinstance(transformer_ref, dict):
+        transformer_ref["value"] = normalized
+    state.report["synchronization"] = h3_synchronization_plan(normalized)
+    if state.activity:
+        state.activity["synchronization_mode"] = normalized
+    return normalized
 
 
 def _text_encoder_root(clip: Any) -> Any:
@@ -637,6 +710,7 @@ def build_phase_runtime_config(
         "cpu": "third_offload_tier",
         "disk": offload,
         "release_transformer_before_decode": True,
+        "synchronization": h3_synchronization_plan("full"),
     }
 
 
@@ -967,12 +1041,15 @@ def _measure_gpu_transfer(device_ids: tuple[int, ...]) -> dict[str, Any]:
 
 
 def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
-    """Record calls and validate every dispatched H3 block boundary."""
+    """Record calls and optionally validate dispatched H3 block boundaries."""
+
+    diagnostics_enabled = finite_diagnostics_enabled()
 
     state.activity = {
         "planned_gpu_calls": {str(device_id): 0 for device_id in state.device_ids},
         "input_gpu_ids": [],
         "block_calls": {},
+        "diagnostics_enabled": diagnostics_enabled,
         "diagnostic_checks": {},
         "validated_blocks": {"input": [], "output": []},
     }
@@ -1024,6 +1101,8 @@ def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
             checked.append(path)
 
     def validate_phase_input(stage: str, value: Any, path: str) -> None:
+        if not diagnostics_enabled:
+            return
         validate_finite(
             {"args": value[0], "kwargs": value[1]},
             stage,
@@ -1088,6 +1167,8 @@ def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
             _path=path,
             _target=target,
         ) -> Any:
+            if not diagnostics_enabled:
+                return output
             stage = (
                 "sampler_gpu0_out"
                 if _target == primary_gpu
@@ -1110,6 +1191,9 @@ def _install_transformer_activity_hooks(state: H3TransformerPhase) -> None:
             except Exception:
                 continue
         except Exception:
+            continue
+
+        if not diagnostics_enabled:
             continue
 
         register_output = getattr(module, "register_forward_hook", None)
@@ -1158,15 +1242,33 @@ def _remove_transformer_dispatch_hooks(state: H3TransformerPhase) -> None:
     state.dispatch_handles.clear()
 
 
+def _runtime_synchronization_mode(runtime_config: dict[str, Any] | None) -> str:
+    if not isinstance(runtime_config, dict):
+        return "full"
+    execution = runtime_config.get("execution")
+    if not isinstance(execution, dict):
+        return "full"
+    synchronization = execution.get("synchronization")
+    if not isinstance(synchronization, dict):
+        return "full"
+    return normalize_h3_synchronization_mode(synchronization.get("mode", "full"))
+
+
 def begin_transformer_phase(
     model: Any,
     runtime_config: dict[str, Any] | None = None,
     *,
     device_ids: tuple[int, ...] | None = None,
     offload_dir: Path | None = None,
+    synchronization_mode: str | None = None,
 ) -> H3TransformerPhase:
     """Dispatch H3 blocks across two GPUs and verify the resulting map."""
 
+    requested_synchronization_mode = normalize_h3_synchronization_mode(
+        synchronization_mode
+        if synchronization_mode is not None
+        else _runtime_synchronization_mode(runtime_config)
+    )
     existing = phase_state_for_model(model)
     if existing is not None and existing.active:
         print(
@@ -1178,6 +1280,7 @@ def begin_transformer_phase(
             execution = dict(runtime_config.get("execution") or {})
             execution["transformer_phase"] = existing.report
             runtime_config["execution"] = execution
+        set_h3_synchronization_mode(existing, requested_synchronization_mode)
         return existing
 
     policy = phase_policy()
@@ -1191,6 +1294,7 @@ def begin_transformer_phase(
         return H3TransformerPhase(
             device_ids=ids,
             report={"status": "explicit_fallback_only", "policy": policy},
+            synchronization_mode=requested_synchronization_mode,
         )
     if len(ids) < 2:
         if policy == "required":
@@ -1205,6 +1309,7 @@ def begin_transformer_phase(
         return H3TransformerPhase(
             device_ids=ids,
             report={"status": "explicit_fallback_only", "policy": policy},
+            synchronization_mode=requested_synchronization_mode,
         )
 
     transformer, transformer_path = _find_transformer(model)
@@ -1223,6 +1328,7 @@ def begin_transformer_phase(
             gpu_limit_gib=13.0,
             cpu_headroom_gib=26.0,
             preferred_layout="h3_two_t4_preferred",
+            synchronization_mode=requested_synchronization_mode,
         )
     except Exception as exc:
         raise H3PhaseError(
@@ -1245,6 +1351,7 @@ def begin_transformer_phase(
             f"GPU participated: requested={list(ids)}, observed={list(observed_ids)}"
         )
     report = dict(report)
+    report["synchronization"] = h3_synchronization_plan(requested_synchronization_mode)
     report["comfy_attachment"] = _attach_dispatched_transformer(
         model,
         transformer,
@@ -1304,6 +1411,10 @@ def begin_transformer_phase(
         report=report,
         active=True,
         monitor=monitor,
+        synchronization_mode=requested_synchronization_mode,
+        synchronization_mode_ref=getattr(
+            dispatched, "_kaggle_h3_synchronization_mode_ref", None
+        ),
     )
     state.dispatch_handles = list(
         getattr(dispatched, "_kaggle_h3_dispatch_handles", ())

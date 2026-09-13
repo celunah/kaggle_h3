@@ -8,6 +8,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from kaggle_h3.workflow import H3Request, build_workflow
 
@@ -90,6 +91,9 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertEqual(inputs["required"]["turbo_steps"][0], ["4", "8"])
         self.assertEqual(module.H3AdapterStack.RETURN_TYPES, ("MODEL", "H3_RUNTIME_CONFIG"))
         self.assertEqual(module.H3TurboSampler.RETURN_TYPES, ("LATENT", "LATENT", "LATENT"))
+        sampler_inputs = module.H3TurboSampler.INPUT_TYPES()["required"]
+        self.assertEqual(sampler_inputs["synchronize_mode"][0], ["full", "safe", "fast"])
+        self.assertEqual(sampler_inputs["synchronize_mode"][1]["default"], "full")
         self.assertEqual(
             module.H3TurboSampler.RETURN_NAMES,
             ("video_latent", "audio_latent", "denoised_output"),
@@ -311,7 +315,9 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         ), patch.object(module, "_enable_h3_decode_weight_casting"), patch.object(
             module, "_h3_move_for_consumer", side_effect=lambda tensor, **_: tensor
         ):
-            with self.assertRaisesRegex(FloatingPointError, "stage 'vae_video_out'"):
+            with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}), self.assertRaisesRegex(
+                FloatingPointError, "stage 'vae_video_out'"
+            ):
                 module.H3VAEDecode().decode(
                     vae,
                     {"samples": torch.zeros((1, 4, 2, 2), dtype=torch.float32)},
@@ -323,7 +329,9 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         ), patch.object(module, "_enable_h3_decode_weight_casting"), patch.object(
             module, "_h3_move_for_consumer", side_effect=lambda tensor, **_: tensor
         ):
-            with self.assertRaisesRegex(FloatingPointError, "stage 'vae_video_in'"):
+            with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}), self.assertRaisesRegex(
+                FloatingPointError, "stage 'vae_video_in'"
+            ):
                 module.H3VAEDecode().decode(
                     vae,
                     {"samples": torch.tensor([[[[float("nan")]]]])},
@@ -352,7 +360,9 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         ), patch.object(module, "_h3_move_for_consumer", side_effect=lambda tensor, **_: tensor), patch.object(
             module, "_h3_finite_audio"
         ) as sanitize:
-            with self.assertRaisesRegex(FloatingPointError, "stage 'vae_audio_out'"):
+            with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}), self.assertRaisesRegex(
+                FloatingPointError, "stage 'vae_audio_out'"
+            ):
                 module.H3AudioVAEDecode().decode(
                     object(),
                     {
@@ -371,7 +381,9 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         ), patch.object(module, "_h3_move_for_consumer", side_effect=lambda tensor, **_: tensor), patch.object(
             module, "_h3_finite_audio"
         ) as sanitize:
-            with self.assertRaisesRegex(FloatingPointError, "stage 'vae_audio_in'"):
+            with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}), self.assertRaisesRegex(
+                FloatingPointError, "stage 'vae_audio_in'"
+            ):
                 module.H3AudioVAEDecode().decode(
                     object(),
                     {
@@ -412,6 +424,13 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertEqual(steps, 8)
         with self.assertRaisesRegex(RuntimeError, "requires sampler"):
             module.H3TurboSampler._resolve_sampling_parameters(config, "res_multistep")
+
+    def test_synchronization_modes_select_sampler_boundary_devices(self):
+        module = load_node_module()
+        with patch.object(module, "phase_device_ids", return_value=(0, 1)):
+            self.assertEqual(module._h3_sampler_boundary_devices("full"), (0, 1))
+            self.assertEqual(module._h3_sampler_boundary_devices("safe"), (0,))
+            self.assertEqual(module._h3_sampler_boundary_devices("fast"), ())
 
     def test_base_res_multistep_is_wrapped_but_turbo_euler_is_untouched(self):
         module = load_node_module()
@@ -601,7 +620,7 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         ), patch.object(
             module,
             "_install_phase_dispatch_hook",
-            side_effect=lambda helpers, _config, _holder: helpers.prepare_sampling,
+            side_effect=lambda helpers, _config, _holder, **_kwargs: helpers.prepare_sampling,
         ), patch.object(module, "phase_device_ids", return_value=()), patch.object(
             module, "_h3_move_for_consumer", side_effect=lambda value, **_kwargs: value
         ), patch.object(module, "release_transformer_phase"), patch.object(
@@ -648,7 +667,7 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         helpers = SamplerHelpers()
         holder = {}
         original_begin = module.begin_transformer_phase
-        module.begin_transformer_phase = lambda model, config: (
+        module.begin_transformer_phase = lambda model, config, **_kwargs: (
             events.append(("h3_dispatch", model, config)) or "phase"
         )
         try:

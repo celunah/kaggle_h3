@@ -215,6 +215,12 @@ copies retain ComfyUI's native stream/allocation path but force
 launcher also disables `cudaMallocAsync` for this phase to avoid
 allocator/stream races. The report records both the physical parameter map
 and the actual execution map.
+Finite-value diagnostics are opt-in and disabled by default because a
+recursive `torch.isfinite` scan can synchronize and scan every dispatched
+tensor. Set `KAGGLE_H3_FP_DIAGNOSTICS=1` before starting ComfyUI to enable
+the fail-fast checks. This setting does not disable the explicit CUDA
+synchronization, quantized-copy barriers, transfer barriers, or H3-safe
+`res_multistep` history ownership fix.
 The sampler preserves that map by filtering the already-dispatched H3 model
 out of ComfyUI's subsequent global `load_models_gpu()` call. A lightweight
 monitor logs peak used/allocated/reserved memory for both GPUs and minimum CPU
@@ -223,6 +229,16 @@ ComfyUI patcher to return the model to CPU, and clears the cache before VAE
 decode. The text-encoder and VAE phases have matching cleanup paths, including
 failure cleanup, so a sampler or decode exception does not intentionally retain
 their GPU pages.
+The dedicated `Kaggle H3 | H3 Turbo Sampler` exposes `synchronize_mode`, which
+defaults to `full` so existing workflows retain the proven behavior. `full`
+keeps every device-wide block and per-step barrier. `safe` keeps every block,
+transfer, quantized-copy, and cleanup barrier but limits the redundant
+post-model sampler barrier to the primary GPU. `fast` keeps cross-device
+activation barriers, synchronous quantized-weight copies, final-layer
+handoff, and phase cleanup, while skipping same-device activation waits and
+per-step full-device waits; it is the experimental performance mode and may
+re-expose an asynchronous H3 kernel issue. The selected policy is recorded in
+`H3_RUNTIME_CONFIG` and can be changed directly on the sampler node.
 The explicit VAE loader/decoder nodes then target video at GPU1 and audio at
 GPU0, while retaining CPU as the offload device. The dedicated sampler now
 returns separate `video_latent` and `audio_latent` outputs. The H3 final AV

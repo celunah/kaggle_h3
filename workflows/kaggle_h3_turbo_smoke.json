@@ -101,7 +101,8 @@
       "conditioning": ["phase", 1],
       "latent_image": ["phase", 2],
       "noise_seed": 7,
-      "sampler_name": "euler"
+      "sampler_name": "euler",
+      "synchronize_mode": "full"
     },
     "_meta": {"title": "Kaggle H3 | Turbo Sampler (4 steps)"}
   },
