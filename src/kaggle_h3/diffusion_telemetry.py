@@ -156,6 +156,7 @@ class H3DiffusionTelemetry:
         *,
         step_index: int,
         sigma: Any,
+        timestep: Any = None,
         boundary: str,
         value: Any,
         tensor_name: str,
@@ -166,6 +167,7 @@ class H3DiffusionTelemetry:
         if not self.enabled:
             return
         sigma_value = _scalar(sigma)
+        timestep_value = _scalar(sigma if timestep is None else timestep)
         found = False
         with self._lock:
             for path, tensor in _iter_tensors(value, tensor_name, set()):
@@ -187,7 +189,7 @@ class H3DiffusionTelemetry:
                     "step_index": int(step_index),
                     "stage": f"diffusion_step_{int(step_index)}_{boundary}",
                     "sigma": sigma_value,
-                    "timestep": sigma_value,
+                    "timestep": timestep_value,
                     "tensor": path,
                     **statistics,
                 }
@@ -202,7 +204,7 @@ class H3DiffusionTelemetry:
                     "step_index": int(step_index),
                     "stage": f"diffusion_step_{int(step_index)}_{boundary}",
                     "sigma": sigma_value,
-                    "timestep": sigma_value,
+                    "timestep": timestep_value,
                     "tensor": tensor_name,
                     "present": False,
                     "min": None,

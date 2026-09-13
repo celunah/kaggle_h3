@@ -684,14 +684,139 @@ def _h3_res_multistep(
     return x
 
 
-def _h3_prepare_sampler(sampler_name: str, sampler: Any) -> Any:
-    """Install the H3-safe implementation only for base ``res_multistep``.
+def _h3_euler_with_telemetry(
+    model: Any,
+    x: Any,
+    sigmas: Any,
+    extra_args: dict[str, Any] | None = None,
+    callback: Any = None,
+    disable: Any = None,
+    s_churn: float = 0.0,
+    s_tmin: float = 0.0,
+    s_tmax: float = float("inf"),
+    s_noise: float = 1.0,
+):
+    """Mirror ComfyUI Euler while exposing opt-in H3 boundary telemetry."""
 
-    Turbo's Euler sampler is intentionally left as ComfyUI created it.  The
-    base H3 path keeps its documented ``res_multistep`` algorithm, but owns
-    the retained second-order history so a quantized transformer cannot reuse
-    that buffer on a later sharded forward.
+    import torch
+    from comfy.k_diffusion import sampling as k_diffusion_sampling  # type: ignore
+
+    extra_args = {} if extra_args is None else extra_args
+    s_in = x.new_ones([x.shape[0]])
+    telemetry = _H3_DIFFUSION_TELEMETRY.get()
+    trange = getattr(k_diffusion_sampling, "trange", None)
+    step_iterator = (
+        trange(len(sigmas) - 1, disable=disable)
+        if callable(trange)
+        else range(len(sigmas) - 1)
+    )
+
+    for index in step_iterator:
+        if telemetry is not None:
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigmas[index],
+                boundary="input",
+                value=x,
+                tensor_name="sampler_input",
+            )
+
+        if s_churn > 0:
+            gamma = (
+                min(s_churn / (len(sigmas) - 1), 2**0.5 - 1)
+                if s_tmin <= sigmas[index] <= s_tmax
+                else 0.0
+            )
+        else:
+            gamma = 0.0
+        sigma_hat = sigmas[index] * (gamma + 1)
+
+        if gamma > 0:
+            eps = torch.randn_like(x) * s_noise
+            x = x + eps * (sigma_hat**2 - sigmas[index] ** 2) ** 0.5
+
+        denoised = model(x, sigma_hat * s_in, **extra_args)
+        if telemetry is not None:
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigmas[index],
+                timestep=sigma_hat,
+                boundary="model_output",
+                value=denoised,
+                tensor_name="model_output",
+            )
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigmas[index],
+                timestep=sigma_hat,
+                boundary="denoised",
+                value=denoised,
+                tensor_name="denoised",
+                alias_of="model_output",
+            )
+            # Euler has no retained second-order history. Emit the boundary
+            # explicitly so Euler and res_multistep traces have the same shape.
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigmas[index],
+                timestep=sigma_hat,
+                boundary="history",
+                value=None,
+                tensor_name="history",
+            )
+
+        d = k_diffusion_sampling.to_d(x, sigma_hat, denoised)
+        if callback is not None:
+            callback(
+                {
+                    "x": x,
+                    "i": index,
+                    "sigma": sigmas[index],
+                    "sigma_hat": sigma_hat,
+                    "denoised": denoised,
+                }
+            )
+
+        dt = sigmas[index + 1] - sigma_hat
+        x = x + d * dt
+        if telemetry is not None:
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigmas[index],
+                timestep=sigmas[index + 1],
+                boundary="updated_latent",
+                value=x,
+                tensor_name="updated_latent",
+            )
+
+    return x
+
+
+def _h3_prepare_sampler(sampler_name: str, sampler: Any) -> Any:
+    """Install H3 sampler wrappers while preserving ComfyUI's equations.
+
+    Base H3 ``res_multistep`` uses the owned-history implementation. Turbo's
+    Euler sampler delegates to ComfyUI exactly when telemetry is disabled and
+    uses the mirrored implementation only for opt-in telemetry.
     """
+
+    if sampler_name == "euler":
+        original_sampler_function = getattr(sampler, "sampler_function", None)
+        if not callable(original_sampler_function):
+            raise RuntimeError("H3 could not access ComfyUI's Euler sampler function")
+
+        def euler_sampler_with_optional_telemetry(*args: Any, **kwargs: Any):
+            if _H3_DIFFUSION_TELEMETRY.get() is None:
+                return original_sampler_function(*args, **kwargs)
+            return _h3_euler_with_telemetry(*args, **kwargs)
+
+        sampler.sampler_function = euler_sampler_with_optional_telemetry
+        print(
+            "[Kaggle H3] Turbo Euler preserves ComfyUI execution unless "
+            "diffusion telemetry is enabled.",
+            flush=True,
+        )
+        return sampler
 
     if sampler_name != "res_multistep":
         return sampler

@@ -437,16 +437,17 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
             self.assertEqual(module._h3_sampler_boundary_devices("safe"), (0,))
             self.assertEqual(module._h3_sampler_boundary_devices("fast"), ())
 
-    def test_base_res_multistep_is_wrapped_but_turbo_euler_is_untouched(self):
+    def test_base_res_multistep_and_turbo_euler_wrappers_preserve_disabled_path(self):
         module = load_node_module()
 
-        euler_sampler = types.SimpleNamespace(sampler_function=object())
-        original_euler_function = euler_sampler.sampler_function
-        self.assertIs(
-            module._h3_prepare_sampler("euler", euler_sampler),
-            euler_sampler,
+        sentinel = object()
+        euler_sampler = types.SimpleNamespace(
+            sampler_function=lambda *args, **kwargs: sentinel
         )
-        self.assertIs(euler_sampler.sampler_function, original_euler_function)
+        original_euler_function = euler_sampler.sampler_function
+        self.assertIs(module._h3_prepare_sampler("euler", euler_sampler), euler_sampler)
+        self.assertIsNot(euler_sampler.sampler_function, original_euler_function)
+        self.assertIs(euler_sampler.sampler_function(), sentinel)
 
         res_sampler = types.SimpleNamespace(sampler_function=lambda *args: None)
         self.assertIs(
@@ -612,6 +613,60 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertEqual(telemetry.records[0]["sigma"], 2.0)
         self.assertEqual(telemetry.records[5]["sigma"], 1.0)
         self.assertEqual(telemetry.records[2]["alias_of"], "model_output")
+
+    def test_euler_records_all_requested_diffusion_boundaries(self):
+        module = load_node_module()
+        import torch
+        from unittest.mock import patch
+
+        sampling = types.ModuleType("comfy.k_diffusion.sampling")
+        sampling.to_d = lambda x, sigma, denoised: (x - denoised) / sigma
+        k_diffusion = types.ModuleType("comfy.k_diffusion")
+        k_diffusion.__path__ = []
+        k_diffusion.sampling = sampling
+        comfy = types.ModuleType("comfy")
+        comfy.__path__ = []
+        comfy.k_diffusion = k_diffusion
+
+        class Model:
+            def __call__(self, x, _sigma, **_kwargs):
+                return x * 0.5
+
+        with patch.dict(
+            sys.modules,
+            {
+                "comfy": comfy,
+                "comfy.k_diffusion": k_diffusion,
+                "comfy.k_diffusion.sampling": sampling,
+            },
+        ):
+            telemetry = module.H3DiffusionTelemetry(enabled=True)
+            token = module._H3_DIFFUSION_TELEMETRY.set(telemetry)
+            try:
+                output = module._h3_euler_with_telemetry(
+                    Model(),
+                    torch.ones((1, 1)),
+                    torch.tensor([2.0, 1.0, 0.0]),
+                )
+            finally:
+                module._H3_DIFFUSION_TELEMETRY.reset(token)
+
+        expected = [
+            f"diffusion_step_{step}_{boundary}"
+            for step in range(2)
+            for boundary in (
+                "input",
+                "model_output",
+                "denoised",
+                "history",
+                "updated_latent",
+            )
+        ]
+        self.assertEqual([record["stage"] for record in telemetry.records], expected)
+        self.assertEqual(telemetry.records[2]["timestep"], 2.0)
+        self.assertEqual(telemetry.records[7]["timestep"], 1.0)
+        self.assertFalse(telemetry.records[3]["present"])
+        self.assertTrue(torch.isfinite(output).all())
 
     def test_repeated_seed_sampler_and_vae_outputs_remain_finite_and_stable(self):
         module = load_node_module()
