@@ -1423,21 +1423,28 @@ def _coerce_h3_video_samples(vae: Any, samples: dict[str, Any]) -> dict[str, Any
 def _h3_video_images_to_comfy(images: Any) -> Any:
     """Convert H3 VAE video output to ComfyUI's frame-major IMAGE layout.
 
-    The MiniMax H3 VAE returns video as ``[B, C, T, H, W]``.  ComfyUI image
-    nodes consume a frame batch shaped ``[N, H, W, C]``.  Do not reshape the
-    channel-first tensor directly: that would reinterpret channels as part of
-    the frame geometry and corrupt every decoded frame.
+    Depending on the ComfyUI VAE wrapper/build, the MiniMax H3 decoder is
+    observable either as ``[B, C, T, H, W]`` or as ``[B, T, H, W, C]``.
+    ComfyUI image nodes consume a frame batch shaped ``[N, H, W, C]``.  Detect
+    the channel axis before flattening so neither valid representation is
+    reinterpreted as a different frame geometry.
     """
 
     if len(images.shape) != 5:
         return images
-    if int(images.shape[1]) != 3:
+    if int(images.shape[-1]) == 3:
+        # The current ComfyUI 0.34 H3 VAE wrapper returns this layout already.
+        return images.reshape(-1, images.shape[2], images.shape[3], images.shape[4])
+    if int(images.shape[1]) == 3:
+        # Retain compatibility with the native channel-first decoder layout.
+        images = images.permute(0, 2, 3, 4, 1).contiguous()
+        return images.reshape(-1, images.shape[2], images.shape[3], images.shape[4])
+    if int(images.shape[-1]) != 3 and int(images.shape[1]) != 3:
         raise RuntimeError(
-            "MiniMax H3 video VAE returned an unexpected channel-first shape: "
-            f"{tuple(images.shape)}; expected [batch, 3, time, height, width]."
+            "MiniMax H3 video VAE returned an unexpected shape: "
+            f"{tuple(images.shape)}; expected [batch, time, height, width, 3] "
+            "or [batch, 3, time, height, width]."
         )
-    images = images.permute(0, 2, 3, 4, 1).contiguous()
-    return images.reshape(-1, images.shape[2], images.shape[3], images.shape[4])
 
 
 class H3VAEDecode:

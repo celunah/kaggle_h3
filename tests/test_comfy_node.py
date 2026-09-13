@@ -379,11 +379,25 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertTrue(torch.equal(converted[0, ..., 2], torch.full((4, 5), 200.0)))
         self.assertTrue(torch.equal(converted[1, ..., 0], torch.ones((4, 5))))
 
+    def test_h3_video_vae_accepts_comfy_channel_last_video(self):
+        module = load_node_module()
+        import torch
+
+        images = torch.empty((1, 2, 4, 5, 3), dtype=torch.float32)
+        for frame in range(2):
+            images[0, frame] = frame
+
+        converted = module._h3_video_images_to_comfy(images)
+
+        self.assertEqual(converted.shape, (2, 4, 5, 3))
+        self.assertTrue(torch.equal(converted[0], torch.zeros((4, 5, 3))))
+        self.assertTrue(torch.equal(converted[1], torch.ones((4, 5, 3))))
+
     def test_h3_video_vae_rejects_invalid_channel_first_shape(self):
         module = load_node_module()
         import torch
 
-        with self.assertRaisesRegex(RuntimeError, r"expected \[batch, 3, time, height, width\]"):
+        with self.assertRaisesRegex(RuntimeError, r"expected \[batch, time, height, width, 3\]"):
             module._h3_video_images_to_comfy(torch.zeros((1, 4, 2, 4, 5)))
 
     def test_audio_vae_validates_before_and_after_decode_before_sanitization(self):
