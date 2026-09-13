@@ -22,6 +22,7 @@ explicit one-GPU fallback is intentional.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 import gc
 import importlib.util
@@ -33,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from statistics import median
 from typing import Any
 
@@ -151,6 +153,19 @@ class H3TextEncoderPhase:
 _ACTIVE_TEXT_ENCODER_PHASES: list[H3TextEncoderPhase] = []
 
 
+@dataclass(frozen=True)
+class _H3VAEPhaseRegistration:
+    """Weak registration for a VAE that may need interruption cleanup."""
+
+    reference: Any
+    role: str
+    device_id: int
+
+
+_ACTIVE_VAE_PHASES: dict[int, _H3VAEPhaseRegistration] = {}
+_VAE_PHASE_LOCK = threading.RLock()
+
+
 def synchronize_h3_devices(device_ids: Any, *, reason: str = "") -> list[str]:
     """Synchronize all requested CUDA devices at an H3 phase boundary."""
 
@@ -171,6 +186,107 @@ def synchronize_h3_devices(device_ids: Any, *, reason: str = "") -> list[str]:
         torch.cuda.synchronize(device)
         synchronized.append(str(device))
     return synchronized
+
+
+@contextlib.contextmanager
+def h3_rmsnorm_dtype_alignment():
+    """Align H3 RMSNorm weights to FP32 activations for the sampler scope.
+
+    ComfyUI's sampler carries H3 residual activations in FP32 while some
+    checkpoint normalization weights remain BF16.  PyTorch then skips its
+    fused RMSNorm implementation.  The H3 sampler is the only caller of this
+    context, so the temporary ``torch.rms_norm`` wrapper cannot affect other
+    workflows after the sampler returns.  Only the small normalization weight
+    is converted; quantized linear weights and activations are untouched.
+
+    Set ``KAGGLE_H3_RMSNORM_DTYPE_ALIGNMENT=0`` to disable this compatibility
+    path for an A/B benchmark.
+    """
+
+    report: dict[str, Any] = {
+        "enabled": False,
+        "mode": "disabled",
+        "aligned_calls": 0,
+    }
+    try:
+        import torch  # type: ignore
+    except Exception:
+        yield report
+        return
+
+    configured = os.environ.get("KAGGLE_H3_RMSNORM_DTYPE_ALIGNMENT", "1").strip().lower()
+    if configured in {"0", "false", "no", "off", "disabled"}:
+        yield report
+        return
+
+    original = getattr(torch, "rms_norm", None)
+    if not callable(original):
+        report["mode"] = "unavailable"
+        yield report
+        return
+
+    def aligned_rms_norm(input_tensor, normalized_shape, weight=None, eps=1e-5, *args, **kwargs):
+        if (
+            torch.is_tensor(input_tensor)
+            and input_tensor.is_floating_point()
+            and torch.is_tensor(weight)
+            and weight.is_floating_point()
+            and weight.dtype != input_tensor.dtype
+        ):
+            weight = weight.to(device=input_tensor.device, dtype=input_tensor.dtype)
+            report["aligned_calls"] += 1
+        return original(input_tensor, normalized_shape, weight, eps, *args, **kwargs)
+
+    setattr(torch, "rms_norm", aligned_rms_norm)
+    report["enabled"] = True
+    report["mode"] = "weight_to_activation_dtype"
+    try:
+        yield report
+    finally:
+        if getattr(torch, "rms_norm", None) is aligned_rms_norm:
+            setattr(torch, "rms_norm", original)
+
+
+def register_vae_phase(vae: Any, *, device_id: int, role: str) -> None:
+    """Track a VAE without retaining it beyond the Comfy workflow owner."""
+
+    try:
+        reference = weakref.ref(vae)
+    except TypeError:
+        # ComfyUI's VAE wrapper is weak-referenceable.  Do not add a strong
+        # fallback here: a cleanup registry must never become a model leak.
+        print(
+            f"[Kaggle H3] Could not register non-weak-referenceable {role} VAE; "
+            "interruption cleanup will rely on the node finally block.",
+            flush=True,
+        )
+        return
+    with _VAE_PHASE_LOCK:
+        _ACTIVE_VAE_PHASES[id(vae)] = _H3VAEPhaseRegistration(
+            reference=reference,
+            role=str(role),
+            device_id=int(device_id),
+        )
+
+
+def unregister_vae_phase(vae: Any) -> None:
+    with _VAE_PHASE_LOCK:
+        _ACTIVE_VAE_PHASES.pop(id(vae), None)
+
+
+def _registered_vae_phases() -> list[tuple[Any, str]]:
+    active: list[tuple[Any, str]] = []
+    dead: list[int] = []
+    with _VAE_PHASE_LOCK:
+        for key, registration in _ACTIVE_VAE_PHASES.items():
+            vae = registration.reference()
+            if vae is None:
+                dead.append(key)
+            else:
+                active.append((vae, registration.role))
+        for key in dead:
+            _ACTIVE_VAE_PHASES.pop(key, None)
+    return active
 
 
 def _synchronize_h3_devices_for_cleanup(
@@ -781,6 +897,7 @@ def release_h3_runtime_resources() -> dict[str, Any]:
     """Release temporary H3 allocations without masking the original error."""
 
     text_reports = release_all_text_encoder_phases()
+    vae_reports = release_all_vae_phases()
     _release_comfy_cache()
     gc.collect()
     cache_cleared = False
@@ -795,15 +912,27 @@ def release_h3_runtime_resources() -> dict[str, Any]:
             cache_cleared = True
     except Exception:
         pass
+    cleanup_errors = [
+        str(item.get("error"))
+        for item in (*text_reports, *vae_reports)
+        if item.get("status") in {"cleanup_failed", "released_with_errors"}
+        and item.get("error")
+    ]
+    for item in vae_reports:
+        cleanup_errors.extend(str(error) for error in item.get("errors", []))
     report = {
-        "status": "released",
+        "status": "released" if not cleanup_errors else "released_with_errors",
         "text_encoder": text_reports,
+        "vae": vae_reports,
+        "errors": cleanup_errors,
         "comfy_cache_cleared": True,
         "torch_cuda_cache_cleared": cache_cleared,
     }
     print(
         "[Kaggle H3] Runtime cleanup completed after generation; "
-        f"text_phases={len(text_reports)}, torch_cuda_cache_cleared={cache_cleared}.",
+        f"text_phases={len(text_reports)}, vae_phases={len(vae_reports)}, "
+        f"errors={len(cleanup_errors)}, "
+        f"torch_cuda_cache_cleared={cache_cleared}.",
         flush=True,
     )
     return report
@@ -813,6 +942,7 @@ def release_vae_phase(vae: Any, *, role: str) -> dict[str, Any]:
     """Return a decoded H3 VAE to CPU and clear temporary CUDA allocations."""
 
     unpatched = False
+    errors: list[str] = []
     patcher = getattr(vae, "patcher", None)
     try:
         import torch  # type: ignore
@@ -825,27 +955,44 @@ def release_vae_phase(vae: Any, *, role: str) -> dict[str, Any]:
         if callable(unpatch):
             unpatch(torch.device("cpu"), unpatch_weights=True)
             unpatched = True
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(str(exc))
     _release_comfy_cache()
     gc.collect()
     try:
         import torch  # type: ignore
 
         torch.cuda.empty_cache()
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(f"CUDA cache cleanup failed: {exc}")
+    unregister_vae_phase(vae)
     report = {
-        "status": "released",
+        "status": "released" if not errors else "released_with_errors",
         "role": role,
         "patcher_unpatched_to_cpu": unpatched,
+        "errors": errors,
     }
     print(
         f"[Kaggle H3] {role} VAE phase released after decode; "
-        f"patcher_cpu_release={unpatched}.",
+        f"patcher_cpu_release={unpatched}, errors={len(errors)}.",
         flush=True,
     )
+    for error in errors:
+        print(f"[Kaggle H3] WARNING: {role} VAE cleanup: {error}", flush=True)
     return report
+
+
+def release_all_vae_phases() -> list[dict[str, Any]]:
+    """Release every VAE registered by the current Comfy workflow.
+
+    The weak registry lets an interrupted sampler clean VAEs whose decode
+    nodes were never reached without keeping those VAEs alive indefinitely.
+    """
+
+    reports: list[dict[str, Any]] = []
+    for vae, role in _registered_vae_phases():
+        reports.append(release_vae_phase(vae, role=role))
+    return reports
 
 
 def _release_non_transformer_comfy_models(active_model: Any) -> list[dict[str, Any]]:
@@ -1607,6 +1754,7 @@ def configure_vae_phase(
             (execution or {}).get("transformer_phase", {}).get("release")
         ),
     }
+    register_vae_phase(vae, device_id=int(device_id), role=str(role))
     print(
         f"[Kaggle H3] {role} VAE phase target={observed['device']}; "
         f"CPU offload={observed['offload_device']}.",

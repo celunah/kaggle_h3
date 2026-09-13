@@ -11,17 +11,89 @@ from kaggle_h3.phase_runtime import (
     H3PhaseError,
     H3TransformerPhase,
     build_phase_runtime_config,
+    configure_vae_phase,
     h3_synchronization_plan,
     normalize_h3_synchronization_mode,
     phase_policy,
     prepare_model_for_h3_phase,
+    release_all_vae_phases,
+    release_h3_runtime_resources,
+    release_vae_phase,
     release_transformer_phase,
+    h3_rmsnorm_dtype_alignment,
     set_h3_synchronization_mode,
     synchronize_h3_devices,
 )
 
 
 class PhaseRuntimeTests(unittest.TestCase):
+    def test_rmsnorm_alignment_converts_only_mismatched_weights_and_restores(self):
+        import torch
+
+        original = torch.rms_norm
+        calls = []
+
+        def fake_rms_norm(input_tensor, normalized_shape, weight, eps):
+            calls.append((input_tensor.dtype, weight.dtype, weight.device))
+            return input_tensor
+
+        with patch.object(torch, "rms_norm", fake_rms_norm):
+            with h3_rmsnorm_dtype_alignment() as report:
+                output = torch.rms_norm(
+                    torch.ones((1, 2), dtype=torch.float32),
+                    (2,),
+                    torch.ones((2,), dtype=torch.bfloat16),
+                    1e-5,
+                )
+
+        self.assertEqual(output.dtype, torch.float32)
+        self.assertEqual(calls, [(torch.float32, torch.float32, torch.device("cpu"))])
+        self.assertEqual(report["mode"], "weight_to_activation_dtype")
+        self.assertEqual(report["aligned_calls"], 1)
+        self.assertIs(torch.rms_norm, original)
+
+    def test_vae_phase_registry_releases_interrupted_decode_resources(self):
+        import torch
+
+        class FakeVAE:
+            pass
+
+        releases = []
+        patcher = SimpleNamespace(
+            load_device=torch.device("cuda:0"),
+            offload_device=torch.device("cpu"),
+            unpatch_model=lambda *args, **kwargs: releases.append((args, kwargs)),
+        )
+        vae = FakeVAE()
+        vae.device = torch.device("cuda:0")
+        vae.patcher = patcher
+        with patch("torch.cuda.is_available", return_value=True), patch(
+            "torch.cuda.device_count", return_value=2
+        ), patch("torch.cuda.synchronize"), patch("torch.cuda.empty_cache"):
+            configure_vae_phase(vae, device_id=0, role="audio")
+            report = release_h3_runtime_resources()
+
+        self.assertEqual(len(report["vae"]), 1)
+        self.assertEqual(report["vae"][0]["status"], "released")
+        self.assertEqual(len(releases), 1)
+        self.assertEqual(release_all_vae_phases(), [])
+
+    def test_vae_cleanup_reports_unpatch_errors_instead_of_hiding_them(self):
+        import torch
+
+        patcher = SimpleNamespace(
+            load_device=torch.device("cuda:0"),
+            unpatch_model=lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("unpatch failed")
+            ),
+        )
+        vae = SimpleNamespace(device=torch.device("cuda:0"), patcher=patcher)
+        with patch("torch.cuda.synchronize"), patch("torch.cuda.empty_cache"):
+            report = release_vae_phase(vae, role="video")
+
+        self.assertEqual(report["status"], "released_with_errors")
+        self.assertTrue(any("unpatch failed" in error for error in report["errors"]))
+
     def test_phase_boundary_synchronizes_each_requested_cuda_device(self):
         import torch
 

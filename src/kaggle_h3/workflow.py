@@ -348,6 +348,7 @@ def build_workflow(
         # The custom loader owns the mutually exclusive diffusion checkpoint:
         # it downloads the selected variant only when this graph executes.
         unet_inputs["model_variant"] = "Ref2VA" if canonical_mode == "Ref2VA" else "FL2VA"
+        unet_inputs["precision"] = "auto"
         unet_inputs.update({"gpu_0": int(device_ids[0]), "gpu_1": int(device_ids[1])})
         unet_class = "KaggleH3ShardedDiffusionLoader"
     else:

@@ -166,6 +166,7 @@ try:
         release_h3_runtime_resources,
         release_vae_phase,
         release_transformer_phase,
+        h3_rmsnorm_dtype_alignment,
         set_h3_synchronization_mode,
         synchronize_h3_devices,
         validate_finite,
@@ -189,6 +190,7 @@ except ImportError:
             release_h3_runtime_resources,
             release_vae_phase,
             release_transformer_phase,
+            h3_rmsnorm_dtype_alignment,
             set_h3_synchronization_mode,
             synchronize_h3_devices,
             validate_finite,
@@ -223,6 +225,7 @@ except ImportError:
         release_h3_runtime_resources = phase_module.release_h3_runtime_resources
         release_vae_phase = phase_module.release_vae_phase
         release_transformer_phase = phase_module.release_transformer_phase
+        h3_rmsnorm_dtype_alignment = phase_module.h3_rmsnorm_dtype_alignment
         set_h3_synchronization_mode = phase_module.set_h3_synchronization_mode
         synchronize_h3_devices = phase_module.synchronize_h3_devices
         validate_finite = phase_module.validate_finite
@@ -808,6 +811,13 @@ class KaggleH3ShardedDiffusionLoader:
         return {
             "required": {
                 "model_variant": (["FL2VA", "Ref2VA"], {"default": "Ref2VA"}),
+                "precision": (
+                    ["auto", "fp8_scaled", "int8_convrot"],
+                    {
+                        "default": "auto",
+                        "tooltip": "Auto selects FP8-scaled on T4/CUDA 12.x and INT8 ConvRot on validated CUDA 13+ non-T4 systems.",
+                    },
+                ),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e5m2"], {"default": "default"}),
                 "gpu_0": ("INT", {"default": 0, "min": 0, "max": 7}),
                 "gpu_1": ("INT", {"default": 1, "min": 0, "max": 7}),
@@ -822,6 +832,7 @@ class KaggleH3ShardedDiffusionLoader:
     def load_model(
         self,
         model_variant: str,
+        precision: str = "auto",
         weight_dtype: str = "default",
         gpu_0: int = 0,
         gpu_1: int = 1,
@@ -835,7 +846,9 @@ class KaggleH3ShardedDiffusionLoader:
         try:
             _release_comfy_model_cache_before_h3_switch()
             diffusion_dir = h3_diffusion_directory_from_comfy()
-            switch = H3DiffusionModelManager(diffusion_dir).switch(str(model_variant))
+            switch = H3DiffusionModelManager(diffusion_dir).switch(
+                str(model_variant), precision=str(precision)
+            )
         except H3DiffusionModelError as exc:
             raise H3PhaseError(f"Kaggle H3 diffusion auto-loader failed: {exc}") from exc
         try:
@@ -854,6 +867,7 @@ class KaggleH3ShardedDiffusionLoader:
                 continue
             try:
                 setattr(owner, "h3_model_variant", switch.spec.variant.lower())
+                setattr(owner, "h3_diffusion_precision", switch.spec.precision)
                 setattr(owner, "kaggle_h3_diffusion_path", str(switch.path))
                 setattr(owner, "kaggle_h3_diffusion_revision", switch.spec.revision)
             except Exception:
@@ -861,11 +875,13 @@ class KaggleH3ShardedDiffusionLoader:
             options = getattr(owner, "model_options", None)
             if isinstance(options, dict):
                 options["h3_model_variant"] = switch.spec.variant.lower()
+                options["h3_diffusion_precision"] = switch.spec.precision
                 options["kaggle_h3_diffusion_path"] = str(switch.path)
         if phase_policy() == "off":
             print(
                 "[Kaggle H3] H3 diffusion auto-loader selected "
-                f"{switch.spec.variant}; native ComfyUI loader remains in control "
+                f"{switch.spec.variant} ({switch.spec.precision}; {switch.precision_reason}); "
+                "native ComfyUI loader remains in control "
                 "for the explicit one-GPU fallback.",
                 flush=True,
             )
@@ -878,7 +894,8 @@ class KaggleH3ShardedDiffusionLoader:
         prepare_model_for_h3_phase(model, device_ids=ids)
         print(
             "[Kaggle H3] H3 diffusion auto-loader selected: "
-            f"variant={switch.spec.variant}, checkpoint={switch.path}, "
+            f"variant={switch.spec.variant}, precision={switch.spec.precision}, "
+            f"precision_reason={switch.precision_reason}, checkpoint={switch.path}, "
             f"downloaded={switch.downloaded}, removed={len(switch.removed)}, "
             f"loader_device=cpu, phase_gpus={list(ids)}.",
             flush=True,
@@ -1641,19 +1658,25 @@ class H3TurboSampler:
             synchronization_token = _H3_SAMPLER_SYNCHRONIZATION_MODE.set(
                 synchronize_mode
             )
+            rmsnorm_report: dict[str, Any] = {}
             try:
-                samples = guider.sample(
-                    Noise_RandomNoise(int(noise_seed)).generate_noise(latent),
-                    latent_image_tensor,
-                    sampler,
-                    sigmas,
-                    denoise_mask=noise_mask,
-                    callback=callback,
-                    disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
-                    seed=int(noise_seed),
-                )
+                with h3_rmsnorm_dtype_alignment() as rmsnorm_report:
+                    samples = guider.sample(
+                        Noise_RandomNoise(int(noise_seed)).generate_noise(latent),
+                        latent_image_tensor,
+                        sampler,
+                        sigmas,
+                        denoise_mask=noise_mask,
+                        callback=callback,
+                        disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
+                        seed=int(noise_seed),
+                    )
             finally:
                 _H3_SAMPLER_SYNCHRONIZATION_MODE.reset(synchronization_token)
+            if isinstance(runtime_config, dict):
+                execution = dict(runtime_config.get("execution") or {})
+                execution["rmsnorm_dtype_alignment"] = dict(rmsnorm_report)
+                runtime_config["execution"] = execution
             synchronize_h3_devices(
                 _h3_sampler_boundary_devices(synchronize_mode),
                 reason="transformer sampler completion",
@@ -1745,7 +1768,12 @@ class H3TurboSampler:
                     flush=True,
                 )
             try:
-                release_h3_runtime_resources()
+                runtime_cleanup_report = release_h3_runtime_resources()
+                if runtime_cleanup_report.get("status") == "released_with_errors":
+                    cleanup_error = H3PhaseError(
+                        "H3 runtime cleanup reported errors: "
+                        + "; ".join(runtime_cleanup_report.get("errors", []))
+                    )
             except Exception as exc:
                 cleanup_error = cleanup_error or exc
                 print(

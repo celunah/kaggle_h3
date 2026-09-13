@@ -79,6 +79,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["phase"]["_meta"]["title"], "Kaggle H3 | Transformer Dispatch Barrier")
         self.assertEqual(workflow["unet"]["class_type"], "KaggleH3ShardedDiffusionLoader")
         self.assertEqual(workflow["unet"]["inputs"]["model_variant"], "FL2VA")
+        self.assertEqual(workflow["unet"]["inputs"]["precision"], "auto")
         self.assertNotIn("unet_name", workflow["unet"]["inputs"])
         self.assertEqual(workflow["unet"]["inputs"]["gpu_0"], 0)
         self.assertEqual(workflow["unet"]["inputs"]["gpu_1"], 1)

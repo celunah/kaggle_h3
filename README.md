@@ -105,10 +105,12 @@ kaggle_h3/results/<run_id>/telemetry_attempt_01.jsonl
 
 ## Model and ComfyUI files
 
-The default ComfyUI profile pins the `v0.34.0` ComfyUI release and downloads the shared video/audio VAE and Qwen text encoder from `Comfy-Org/MiniMax-H3`. The files are stored under `/kaggle/tmp/minimax-h3-models/models` so the 20 GiB persistent `/kaggle/working` output limit is not consumed. The diffusion checkpoint is intentionally deferred to the ComfyUI loader. Only one of the two large diffusion variants is present at a time; switching the loader selection removes the other exact known H3 filename before downloading the replacement.
+The default ComfyUI profile pins the `v0.34.0` ComfyUI release and downloads the shared video/audio VAE and Qwen text encoder from `Comfy-Org/MiniMax-H3`. The files are stored under `/kaggle/tmp/minimax-h3-models/models` so the 20 GiB persistent `/kaggle/working` output limit is not consumed. The diffusion checkpoint is intentionally deferred to the ComfyUI loader. Only one H3 diffusion checkpoint is present at a time; switching the loader selection removes the other exact known variant and precision files before downloading the replacement.
 
-- `diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors` for Ref2VA;
-- `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` for FL2VA/T2VA;
+`Kaggle H3 | Diffusion Auto Loader` exposes `precision=auto`, `fp8_scaled`, or `int8_convrot`. Auto selects the FP8-scaled checkpoint on the two-T4 Kaggle profile and on CUDA runtimes below 13, while selecting INT8 ConvRot only on CUDA 13+ non-T4 systems. The explicit choices remain available for controlled comparisons. The corresponding files are:
+
+- `diffusion_models/minimax_h3_ref2va_pruned_fp8_scaled.safetensors` or `minimax_h3_ref2va_pruned_int8_convrot.safetensors` for Ref2VA;
+- `diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors` or `minimax_h3_fl2va_pruned_int8_convrot.safetensors` for FL2VA/T2VA;
 - `text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`;
 - `vae/minimax_h3_video_vae_fp16.safetensors`;
 - `vae/minimax_h3_audio_vae_fp32.safetensors`.

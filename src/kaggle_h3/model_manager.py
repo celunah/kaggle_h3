@@ -6,7 +6,10 @@ variant, removes only the other known H3 diffusion checkpoint, streams the
 pinned file directly into ComfyUI's diffusion-model directory, and then lets
 ComfyUI's native ``UNETLoader`` load it.
 
-The downloader intentionally does not use the Hugging Face cache.  Keeping
+The default T4 profile uses the FP8-scaled assets.  INT8 ConvRot remains an
+explicit opt-in comparison path because the native ConvRot backend is not
+reliably supported by every T4/CUDA combination.  The downloader intentionally
+does not use the Hugging Face cache.  Keeping
 the temporary ``.part`` file beside the destination avoids a second 20 GiB
 copy in Kaggle scratch storage and makes the one-variant storage policy
 observable.
@@ -39,6 +42,7 @@ H3_DIFFUSION_REVISION = os.environ.get(
 class H3DiffusionModelSpec:
     variant: str
     filename: str
+    precision: str = "fp8_scaled"
     repository: str = H3_DIFFUSION_REPOSITORY
     revision: str = H3_DIFFUSION_REVISION
     sha256: str | None = None
@@ -47,13 +51,30 @@ class H3DiffusionModelSpec:
 H3_DIFFUSION_MODEL_SPECS: dict[str, H3DiffusionModelSpec] = {
     "FL2VA": H3DiffusionModelSpec(
         variant="FL2VA",
+        filename="minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+        precision="fp8_scaled",
+    ),
+    "Ref2VA": H3DiffusionModelSpec(
+        variant="Ref2VA",
+        filename="minimax_h3_ref2va_pruned_fp8_scaled.safetensors",
+        precision="fp8_scaled",
+    ),
+}
+
+H3_DIFFUSION_MODEL_ALTERNATIVES: dict[str, H3DiffusionModelSpec] = {
+    "FL2VA": H3DiffusionModelSpec(
+        variant="FL2VA",
         filename="minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        precision="int8_convrot",
     ),
     "Ref2VA": H3DiffusionModelSpec(
         variant="Ref2VA",
         filename="minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        precision="int8_convrot",
     ),
 }
+
+H3_DIFFUSION_PRECISIONS = ("auto", "fp8_scaled", "int8_convrot")
 
 
 class H3DiffusionModelError(RuntimeError):
@@ -67,6 +88,7 @@ class H3DiffusionModelResult:
     downloaded: bool
     removed: tuple[Path, ...]
     free_bytes: int | None
+    precision_reason: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -74,6 +96,8 @@ class H3DiffusionModelResult:
             "repository": self.spec.repository,
             "revision": self.spec.revision,
             "filename": self.spec.filename,
+            "precision": self.spec.precision,
+            "precision_reason": self.precision_reason,
             "path": str(self.path),
             "downloaded": self.downloaded,
             "removed": [str(path) for path in self.removed],
@@ -92,8 +116,78 @@ def canonical_h3_diffusion_variant(value: str) -> str:
     )
 
 
-def h3_diffusion_spec(value: str) -> H3DiffusionModelSpec:
-    return H3_DIFFUSION_MODEL_SPECS[canonical_h3_diffusion_variant(value)]
+def canonical_h3_diffusion_precision(value: str) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "").replace("_", "")
+    if normalized in {"fp8", "fp8scaled", "float8", "float8scaled"}:
+        return "fp8_scaled"
+    if normalized in {"int8", "int8convrot", "convrot"}:
+        return "int8_convrot"
+    raise H3DiffusionModelError(
+        f"Unsupported H3 diffusion precision {value!r}; choose fp8_scaled or int8_convrot."
+    )
+
+
+def select_h3_diffusion_precision(
+    preference: str = "auto",
+    *,
+    cuda_version: str | None = None,
+    device_names: tuple[str, ...] | list[str] | None = None,
+) -> tuple[str, str]:
+    """Choose a diffusion format from the visible runtime and GPU family."""
+
+    normalized = str(preference or "auto").strip().lower()
+    if normalized not in {"auto", "fp8_scaled", "int8_convrot"}:
+        normalized = canonical_h3_diffusion_precision(normalized)
+    if normalized != "auto":
+        return normalized, "explicit loader selection"
+
+    env_override = os.environ.get("KAGGLE_H3_DIFFUSION_PRECISION", "").strip()
+    if env_override and env_override.lower() != "auto":
+        selected = canonical_h3_diffusion_precision(env_override)
+        return selected, "KAGGLE_H3_DIFFUSION_PRECISION override"
+
+    if cuda_version is None or device_names is None:
+        try:
+            import torch  # type: ignore
+
+            if cuda_version is None:
+                cuda_version = getattr(torch.version, "cuda", None)
+            if device_names is None and torch.cuda.is_available():
+                device_names = tuple(
+                    str(torch.cuda.get_device_name(index))
+                    for index in range(int(torch.cuda.device_count()))
+                )
+        except Exception:
+            pass
+
+    names = tuple(device_names or ())
+    if any("t4" in name.lower() for name in names):
+        return "fp8_scaled", "Tesla T4/SM75 uses the conservative FP8-scaled compatibility path"
+    try:
+        cuda_major = int(str(cuda_version or "0").split(".", 1)[0])
+    except ValueError:
+        cuda_major = 0
+    if cuda_major < 13:
+        return "fp8_scaled", "CUDA runtime is below the preferred INT8 ConvRot CUDA 13 profile"
+    return "int8_convrot", "CUDA 13+ on non-T4 GPUs meets the preferred INT8 ConvRot profile"
+
+
+def h3_diffusion_spec(
+    value: str, *, precision: str = "fp8_scaled"
+) -> H3DiffusionModelSpec:
+    variant = canonical_h3_diffusion_variant(value)
+    selected_precision, _reason = select_h3_diffusion_precision(precision)
+    if selected_precision == "fp8_scaled":
+        return H3_DIFFUSION_MODEL_SPECS[variant]
+    return H3_DIFFUSION_MODEL_ALTERNATIVES[variant]
+
+
+def all_h3_diffusion_specs() -> tuple[H3DiffusionModelSpec, ...]:
+    """Return every exact H3 diffusion filename this manager may remove."""
+
+    return tuple(H3_DIFFUSION_MODEL_SPECS.values()) + tuple(
+        H3_DIFFUSION_MODEL_ALTERNATIVES.values()
+    )
 
 
 def h3_diffusion_directory_from_comfy() -> Path:
@@ -165,8 +259,8 @@ class H3DiffusionModelManager:
 
     def _known_paths(self) -> dict[str, Path]:
         return {
-            variant: (self.diffusion_dir / spec.filename).resolve()
-            for variant, spec in H3_DIFFUSION_MODEL_SPECS.items()
+            spec.filename: (self.diffusion_dir / spec.filename).resolve()
+            for spec in all_h3_diffusion_specs()
         }
 
     def _validate_known_path(self, path: Path) -> None:
@@ -246,15 +340,19 @@ class H3DiffusionModelManager:
             flush=True,
         )
 
-    def switch(self, variant: str) -> H3DiffusionModelResult:
-        spec = h3_diffusion_spec(variant)
+    def switch(
+        self, variant: str, *, precision: str = "auto"
+    ) -> H3DiffusionModelResult:
+        selected_precision, precision_reason = select_h3_diffusion_precision(precision)
+        spec = h3_diffusion_spec(variant, precision=selected_precision)
         self.diffusion_dir.mkdir(parents=True, exist_ok=True)
         paths = self._known_paths()
-        selected = paths[spec.variant]
+        selected = paths[spec.filename]
+        selected_temporary = selected.with_name(selected.name + ".part")
         removed: list[Path] = []
         with self._switch_lock:
-            for other_variant, path in paths.items():
-                if other_variant == spec.variant:
+            for filename, path in paths.items():
+                if filename == spec.filename:
                     continue
                 self._validate_known_path(path)
                 if path.is_dir() and not path.is_symlink():
@@ -265,6 +363,11 @@ class H3DiffusionModelManager:
                     path.unlink()
                     removed.append(path)
                     print(f"[Kaggle H3] Removed inactive diffusion checkpoint: {path}", flush=True)
+                stale_part = path.with_name(path.name + ".part")
+                if stale_part.is_file() or stale_part.is_symlink():
+                    stale_part.unlink()
+                    removed.append(stale_part)
+                    print(f"[Kaggle H3] Removed stale partial checkpoint: {stale_part}", flush=True)
 
             if selected.is_dir() and not selected.is_symlink():
                 raise H3DiffusionModelError(
@@ -282,9 +385,10 @@ class H3DiffusionModelManager:
                         downloaded=False,
                         removed=tuple(removed),
                         free_bytes=self._free_bytes(),
+                        precision_reason=precision_reason,
                     )
 
-            temporary = selected.with_name(selected.name + ".part")
+            temporary = selected_temporary
             self._validate_known_path(temporary)
             if temporary.exists() or temporary.is_symlink():
                 temporary.unlink()
@@ -313,6 +417,7 @@ class H3DiffusionModelManager:
                 downloaded=True,
                 removed=tuple(removed),
                 free_bytes=self._free_bytes(),
+                precision_reason=precision_reason,
             )
 
     def _free_bytes(self) -> int | None:
