@@ -1420,6 +1420,26 @@ def _coerce_h3_video_samples(vae: Any, samples: dict[str, Any]) -> dict[str, Any
     return converted
 
 
+def _h3_video_images_to_comfy(images: Any) -> Any:
+    """Convert H3 VAE video output to ComfyUI's frame-major IMAGE layout.
+
+    The MiniMax H3 VAE returns video as ``[B, C, T, H, W]``.  ComfyUI image
+    nodes consume a frame batch shaped ``[N, H, W, C]``.  Do not reshape the
+    channel-first tensor directly: that would reinterpret channels as part of
+    the frame geometry and corrupt every decoded frame.
+    """
+
+    if len(images.shape) != 5:
+        return images
+    if int(images.shape[1]) != 3:
+        raise RuntimeError(
+            "MiniMax H3 video VAE returned an unexpected channel-first shape: "
+            f"{tuple(images.shape)}; expected [batch, 3, time, height, width]."
+        )
+    images = images.permute(0, 2, 3, 4, 1).contiguous()
+    return images.reshape(-1, images.shape[2], images.shape[3], images.shape[4])
+
+
 class H3VAEDecode:
     """H3 video decode node with explicit latent/VAE dtype reconciliation."""
 
@@ -1478,8 +1498,7 @@ class H3VAEDecode:
             )
             validate_finite(images, "vae_video_out", tensor_name="video_frames")
             validate_finite(images, "vae_video", tensor_name="video_frames")
-            if len(images.shape) == 5:
-                images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+            images = _h3_video_images_to_comfy(images)
             # The encoder and CreateVideo do not need GPU-resident frames.
             return (images.to("cpu"),)
         finally:

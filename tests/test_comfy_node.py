@@ -343,6 +343,49 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
                     device_id=0,
                 )
 
+    def test_h3_video_vae_converts_channel_first_video_to_comfy_frames(self):
+        module = load_node_module()
+        import torch
+        from unittest.mock import patch
+
+        # H3's native decoder returns [B, C, T, H, W]. Encode the indices into
+        # the values so the test catches an accidental reshape as well as a
+        # wrong output shape.
+        images = torch.empty((1, 3, 2, 4, 5), dtype=torch.float32)
+        for channel in range(3):
+            for frame in range(2):
+                images[0, channel, frame] = channel * 100 + frame
+
+        class VAE:
+            def decode(self, _samples):
+                return images
+
+        vae = VAE()
+        with patch.object(module, "configure_vae_phase"), patch.object(
+            module, "release_vae_phase"
+        ), patch.object(module, "_enable_h3_decode_weight_casting"), patch.object(
+            module, "_h3_move_for_consumer", side_effect=lambda tensor, **_: tensor
+        ):
+            result = module.H3VAEDecode().decode(
+                vae,
+                {"samples": torch.zeros((1, 24, 2, 1, 1), dtype=torch.float32)},
+                device_id=0,
+            )
+
+        converted = result[0]
+        self.assertEqual(converted.shape, (2, 4, 5, 3))
+        self.assertTrue(torch.equal(converted[0, ..., 0], torch.zeros((4, 5))))
+        self.assertTrue(torch.equal(converted[0, ..., 1], torch.full((4, 5), 100.0)))
+        self.assertTrue(torch.equal(converted[0, ..., 2], torch.full((4, 5), 200.0)))
+        self.assertTrue(torch.equal(converted[1, ..., 0], torch.ones((4, 5))))
+
+    def test_h3_video_vae_rejects_invalid_channel_first_shape(self):
+        module = load_node_module()
+        import torch
+
+        with self.assertRaisesRegex(RuntimeError, r"expected \[batch, 3, time, height, width\]"):
+            module._h3_video_images_to_comfy(torch.zeros((1, 4, 2, 4, 5)))
+
     def test_audio_vae_validates_before_and_after_decode_before_sanitization(self):
         module = load_node_module()
         import sys
