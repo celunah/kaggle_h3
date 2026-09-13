@@ -33,6 +33,7 @@ class BootstrapTests(unittest.TestCase):
             support_dir = comfy_root / "kaggle_h3_support"
             self.assertTrue((support_dir / "__init__.py").is_file())
             self.assertTrue((support_dir / "phase_runtime.py").is_file())
+            self.assertTrue((support_dir / "diffusion_telemetry.py").is_file())
             self.assertEqual(result["support_package"], str(support_dir))
             script = """
 import importlib.util

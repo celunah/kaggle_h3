@@ -38,6 +38,7 @@ class ComfyNodeTests(unittest.TestCase):
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "ref2va.py", node_dir / "kaggle_h3_ref2va.py")
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "fp_diagnostics.py", node_dir / "kaggle_h3_fp_diagnostics.py")
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "model_manager.py", node_dir / "kaggle_h3_model_manager.py")
+            shutil.copy2(ROOT / "src" / "kaggle_h3" / "diffusion_telemetry.py", node_dir / "kaggle_h3_diffusion_telemetry.py")
             shutil.copy2(ROOT / "custom_nodes" / "kaggle_h3_adapter_catalog.json", node_dir / "kaggle_h3_adapter_catalog.json")
             script = """
 import importlib.util
@@ -537,6 +538,80 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
 
         self.assertTrue(torch.equal(actual, expected))
         self.assertEqual(synchronize.call_count, 4)
+
+    def test_res_multistep_records_all_requested_diffusion_boundaries(self):
+        module = load_node_module()
+        import torch
+        from unittest.mock import patch
+
+        sampling = types.ModuleType("comfy.k_diffusion.sampling")
+        sampling.default_noise_sampler = lambda _x, seed=None: (
+            lambda _sigma, _sigma_next: torch.zeros((1, 1))
+        )
+        sampling.get_ancestral_step = lambda sigma_from, sigma_to, eta: (
+            sigma_to,
+            0.0,
+        )
+        sampling.to_d = lambda x, sigma, denoised: (x - denoised) / sigma
+        k_diffusion = types.ModuleType("comfy.k_diffusion")
+        k_diffusion.__path__ = []
+        k_diffusion.sampling = sampling
+        comfy = types.ModuleType("comfy")
+        comfy.__path__ = []
+        comfy.k_diffusion = k_diffusion
+
+        class ModelSampling:
+            noise_scale = 1.0
+
+        class Patcher:
+            def get_model_object(self, _name):
+                return ModelSampling()
+
+        class InnerModel:
+            model_patcher = Patcher()
+
+        class Model:
+            inner_model = InnerModel()
+
+            def __call__(self, _x, _sigma, **_kwargs):
+                return torch.tensor([[0.5]])
+
+        with patch.dict(
+            sys.modules,
+            {
+                "comfy": comfy,
+                "comfy.k_diffusion": k_diffusion,
+                "comfy.k_diffusion.sampling": sampling,
+            },
+        ), patch.object(module, "phase_device_ids", return_value=()), patch.object(
+            module, "synchronize_h3_devices"
+        ):
+            telemetry = module.H3DiffusionTelemetry(enabled=True)
+            token = module._H3_DIFFUSION_TELEMETRY.set(telemetry)
+            try:
+                module._h3_res_multistep(
+                    Model(),
+                    torch.zeros((1, 1)),
+                    torch.tensor([2.0, 1.0, 0.0]),
+                )
+            finally:
+                module._H3_DIFFUSION_TELEMETRY.reset(token)
+
+        expected = [
+            f"diffusion_step_{step}_{boundary}"
+            for step in range(2)
+            for boundary in (
+                "input",
+                "model_output",
+                "denoised",
+                "history",
+                "updated_latent",
+            )
+        ]
+        self.assertEqual([record["stage"] for record in telemetry.records], expected)
+        self.assertEqual(telemetry.records[0]["sigma"], 2.0)
+        self.assertEqual(telemetry.records[5]["sigma"], 1.0)
+        self.assertEqual(telemetry.records[2]["alias_of"], "model_output")
 
     def test_repeated_seed_sampler_and_vae_outputs_remain_finite_and_stable(self):
         module = load_node_module()

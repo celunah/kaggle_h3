@@ -25,6 +25,9 @@ for _import_root in (_H3_NODE_PATH.parents[1], _H3_NODE_PATH.parents[2]):
 _H3_SAMPLER_SYNCHRONIZATION_MODE: ContextVar[str] = ContextVar(
     "kaggle_h3_sampler_synchronization_mode", default="full"
 )
+_H3_DIFFUSION_TELEMETRY: ContextVar[Any] = ContextVar(
+    "kaggle_h3_diffusion_telemetry", default=None
+)
 
 
 try:
@@ -276,6 +279,18 @@ except ImportError:
             set_h3_synchronization_mode = phase_module.set_h3_synchronization_mode
             synchronize_h3_devices = phase_module.synchronize_h3_devices
             validate_finite = phase_module.validate_finite
+
+
+try:
+    from kaggle_h3.diffusion_telemetry import H3DiffusionTelemetry
+except ImportError:
+    try:
+        from kaggle_h3_support.diffusion_telemetry import H3DiffusionTelemetry  # type: ignore
+    except ImportError:
+        try:
+            from kaggle_h3_diffusion_telemetry import H3DiffusionTelemetry  # type: ignore
+        except ImportError:
+            H3DiffusionTelemetry = None  # type: ignore[assignment,misc]
 
 
 def _catalog():
@@ -571,13 +586,48 @@ def _h3_res_multistep(
 
     old_sigma_down = None
     old_denoised = None
+    telemetry = _H3_DIFFUSION_TELEMETRY.get()
 
     for index in range(len(sigmas) - 1):
+        if telemetry is not None:
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigmas[index],
+                boundary="input",
+                value=x,
+                tensor_name="sampler_input",
+            )
         denoised = model(x, sigmas[index] * s_in, **extra_args)
         synchronize_h3_devices(
             _h3_sampler_boundary_devices(_H3_SAMPLER_SYNCHRONIZATION_MODE.get()),
             reason=f"res_multistep model output boundary {index}",
         )
+        if telemetry is not None:
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigmas[index],
+                boundary="model_output",
+                value=denoised,
+                tensor_name="model_output",
+            )
+            # The ComfyUI sampler API exposes the model's denoised prediction
+            # directly. There is no second denoising operation at this layer,
+            # so retain an explicit alias rather than inventing a transformation.
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigmas[index],
+                boundary="denoised",
+                value=denoised,
+                tensor_name="denoised",
+                alias_of="model_output",
+            )
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigmas[index],
+                boundary="history",
+                value=old_denoised,
+                tensor_name="history",
+            )
         if callback is not None:
             callback(
                 {
@@ -622,6 +672,14 @@ def _h3_res_multistep(
         # function and is intentionally limited to the multistep history.
         old_denoised = _h3_clone_sampler_value(denoised)
         old_sigma_down = sigma_down
+        if telemetry is not None:
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigmas[index],
+                boundary="updated_latent",
+                value=x,
+                tensor_name="updated_latent",
+            )
 
     return x
 
@@ -1705,6 +1763,12 @@ class H3TurboSampler:
             synchronization_token = _H3_SAMPLER_SYNCHRONIZATION_MODE.set(
                 synchronize_mode
             )
+            diffusion_telemetry = (
+                H3DiffusionTelemetry() if H3DiffusionTelemetry is not None else None
+            )
+            diffusion_telemetry_token = _H3_DIFFUSION_TELEMETRY.set(
+                diffusion_telemetry
+            )
             rmsnorm_report: dict[str, Any] = {}
             try:
                 with h3_rmsnorm_dtype_alignment() as rmsnorm_report:
@@ -1719,10 +1783,13 @@ class H3TurboSampler:
                         seed=int(noise_seed),
                     )
             finally:
+                _H3_DIFFUSION_TELEMETRY.reset(diffusion_telemetry_token)
                 _H3_SAMPLER_SYNCHRONIZATION_MODE.reset(synchronization_token)
             if isinstance(runtime_config, dict):
                 execution = dict(runtime_config.get("execution") or {})
                 execution["rmsnorm_dtype_alignment"] = dict(rmsnorm_report)
+                if diffusion_telemetry is not None and diffusion_telemetry.enabled:
+                    execution["diffusion_telemetry"] = diffusion_telemetry.summary()
                 runtime_config["execution"] = execution
             synchronize_h3_devices(
                 _h3_sampler_boundary_devices(synchronize_mode),

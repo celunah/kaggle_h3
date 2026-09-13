@@ -224,6 +224,20 @@ tensor. Set `KAGGLE_H3_FP_DIAGNOSTICS=1` before starting ComfyUI to enable
 the fail-fast checks. This setting does not disable the explicit CUDA
 synchronization, quantized-copy barriers, transfer barriers, or H3-safe
 `res_multistep` history ownership fix.
+
+Per-step diffusion telemetry is separately opt-in. Set
+`KAGGLE_H3_DIFFUSION_TELEMETRY=1` to emit structured JSON records for each
+`res_multistep` step at `input`, `model_output`, `denoised`, `history`, and
+`updated_latent`. Every record includes sigma/timestep, min, max, mean, std,
+finite count, dtype, device, and tensor path. The model API exposes the
+denoised prediction directly, so `denoised` is recorded as an explicit alias
+of `model_output`; no extra transformation is performed. To persist a
+machine-readable JSONL stream, also set
+`KAGGLE_H3_DIFFUSION_TELEMETRY_PATH=/path/to/diffusion_telemetry.jsonl`.
+Telemetry intentionally synchronizes and reduces each recorded CUDA tensor,
+so it is for INT8/FP8 numerical comparison and fault isolation, not production
+timing. Turbo Euler runs do not use the custom `res_multistep` loop and are not
+represented by these five res_multistep boundaries.
 The sampler preserves that map by filtering the already-dispatched H3 model
 out of ComfyUI's subsequent global `load_models_gpu()` call. A lightweight
 monitor logs peak used/allocated/reserved memory for both GPUs and minimum CPU
