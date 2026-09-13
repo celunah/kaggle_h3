@@ -163,7 +163,7 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertEqual(
             loader_inputs["precision"][0], ["auto", "fp8_scaled", "int8_convrot"]
         )
-        self.assertEqual(loader_inputs["precision"][1]["default"], "auto")
+        self.assertEqual(loader_inputs["precision"][1]["default"], "int8_convrot")
         self.assertEqual(
             loader_inputs["gpu_1"][1]["default"],
             1,

@@ -3,7 +3,7 @@
     "class_type": "KaggleH3ShardedDiffusionLoader",
     "inputs": {
       "model_variant": "Ref2VA",
-      "precision": "auto",
+      "precision": "int8_convrot",
       "weight_dtype": "default",
       "gpu_0": 0,
       "gpu_1": 1

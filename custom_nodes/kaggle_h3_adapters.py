@@ -861,8 +861,8 @@ class KaggleH3ShardedDiffusionLoader:
                 "precision": (
                     ["auto", "fp8_scaled", "int8_convrot"],
                     {
-                        "default": "auto",
-                        "tooltip": "Auto selects FP8-scaled on T4/CUDA 12.x and INT8 ConvRot on validated CUDA 13+ non-T4 systems.",
+                        "default": "int8_convrot",
+                        "tooltip": "INT8 ConvRot is the default performance path. Select FP8-scaled for lower VRAM use.",
                     },
                 ),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e5m2"], {"default": "default"}),
@@ -879,7 +879,7 @@ class KaggleH3ShardedDiffusionLoader:
     def load_model(
         self,
         model_variant: str,
-        precision: str = "auto",
+        precision: str = "int8_convrot",
         weight_dtype: str = "default",
         gpu_0: int = 0,
         gpu_1: int = 1,

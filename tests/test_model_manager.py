@@ -12,18 +12,26 @@ from kaggle_h3.model_manager import (
 
 
 class DiffusionModelManagerTests(unittest.TestCase):
-    def test_auto_precision_prefers_fp8_on_t4_or_cuda12(self):
+    def test_auto_precision_prefers_int8_for_measured_runtime_profiles(self):
         self.assertEqual(
             select_h3_diffusion_precision(
                 "auto", cuda_version="12.8", device_names=("Tesla T4", "Tesla T4")
             )[0],
-            "fp8_scaled",
+            "int8_convrot",
         )
         self.assertEqual(
             select_h3_diffusion_precision(
                 "auto", cuda_version="13.0", device_names=("NVIDIA L40S",)
             )[0],
             "int8_convrot",
+        )
+
+    def test_fp8_remains_an_explicit_optional_selection(self):
+        self.assertEqual(
+            select_h3_diffusion_precision(
+                "fp8_scaled", cuda_version="12.8", device_names=("Tesla T4",)
+            )[0],
+            "fp8_scaled",
         )
 
     def test_explicit_precision_selection_is_preserved(self):
@@ -34,6 +42,12 @@ class DiffusionModelManagerTests(unittest.TestCase):
         self.assertEqual(
             h3_diffusion_spec("Ref2VA", precision="fp8_scaled").filename,
             "minimax_h3_ref2va_pruned_fp8_scaled.safetensors",
+        )
+
+    def test_default_diffusion_spec_uses_int8(self):
+        self.assertEqual(
+            h3_diffusion_spec("Ref2VA").filename,
+            "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
         )
 
     def test_hugging_face_url_includes_comfy_diffusion_directory(self):

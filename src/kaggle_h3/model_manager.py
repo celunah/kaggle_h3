@@ -6,10 +6,10 @@ variant, removes only the other known H3 diffusion checkpoint, streams the
 pinned file directly into ComfyUI's diffusion-model directory, and then lets
 ComfyUI's native ``UNETLoader`` load it.
 
-The default T4 profile uses the FP8-scaled assets.  INT8 ConvRot remains an
-explicit opt-in comparison path because the native ConvRot backend is not
-reliably supported by every T4/CUDA combination.  The downloader intentionally
-does not use the Hugging Face cache.  Keeping
+The default profile uses the INT8 ConvRot assets for throughput.  FP8-scaled
+assets remain an explicit opt-in fallback when the lower VRAM footprint is more
+important than speed.  The downloader intentionally does not use the Hugging
+Face cache.  Keeping
 the temporary ``.part`` file beside the destination avoids a second 20 GiB
 copy in Kaggle scratch storage and makes the one-variant storage policy
 observable.
@@ -42,7 +42,7 @@ H3_DIFFUSION_REVISION = os.environ.get(
 class H3DiffusionModelSpec:
     variant: str
     filename: str
-    precision: str = "fp8_scaled"
+    precision: str = "int8_convrot"
     repository: str = H3_DIFFUSION_REPOSITORY
     revision: str = H3_DIFFUSION_REVISION
     sha256: str | None = None
@@ -162,18 +162,18 @@ def select_h3_diffusion_precision(
 
     names = tuple(device_names or ())
     if any("t4" in name.lower() for name in names):
-        return "fp8_scaled", "Tesla T4/SM75 uses the conservative FP8-scaled compatibility path"
+        return "int8_convrot", "INT8 ConvRot is the default measured performance path on T4"
     try:
         cuda_major = int(str(cuda_version or "0").split(".", 1)[0])
     except ValueError:
         cuda_major = 0
     if cuda_major < 13:
-        return "fp8_scaled", "CUDA runtime is below the preferred INT8 ConvRot CUDA 13 profile"
-    return "int8_convrot", "CUDA 13+ on non-T4 GPUs meets the preferred INT8 ConvRot profile"
+        return "int8_convrot", "INT8 ConvRot is the default performance selection"
+    return "int8_convrot", "INT8 ConvRot is the default performance selection"
 
 
 def h3_diffusion_spec(
-    value: str, *, precision: str = "fp8_scaled"
+    value: str, *, precision: str = "int8_convrot"
 ) -> H3DiffusionModelSpec:
     variant = canonical_h3_diffusion_variant(value)
     selected_precision, _reason = select_h3_diffusion_precision(precision)

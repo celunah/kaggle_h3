@@ -108,7 +108,7 @@ kaggle_h3/results/<run_id>/telemetry_attempt_01.jsonl
 
 The default ComfyUI profile pins the `v0.34.0` ComfyUI release and downloads the shared video/audio VAE and Qwen text encoder from `Comfy-Org/MiniMax-H3`. The files are stored under `/kaggle/tmp/minimax-h3-models/models` so the 20 GiB persistent `/kaggle/working` output limit is not consumed. The diffusion checkpoint is intentionally deferred to the ComfyUI loader. Only one H3 diffusion checkpoint is present at a time; switching the loader selection removes the other exact known variant and precision files before downloading the replacement.
 
-`Kaggle H3 | Diffusion Auto Loader` exposes `precision=auto`, `fp8_scaled`, or `int8_convrot`. Auto selects the FP8-scaled checkpoint on the two-T4 Kaggle profile and on CUDA runtimes below 13, while selecting INT8 ConvRot only on CUDA 13+ non-T4 systems. The explicit choices remain available for controlled comparisons. The corresponding files are:
+`Kaggle H3 | Diffusion Auto Loader` exposes `precision=auto`, `int8_convrot`, or `fp8_scaled`. INT8 ConvRot is the default performance selection, including the two-T4 Kaggle profile. FP8-scaled remains available as an explicit lower-VRAM option, and the environment variable `KAGGLE_H3_DIFFUSION_PRECISION=fp8_scaled` can override `auto`. The corresponding files are:
 
 - `diffusion_models/minimax_h3_ref2va_pruned_fp8_scaled.safetensors` or `minimax_h3_ref2va_pruned_int8_convrot.safetensors` for Ref2VA;
 - `diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors` or `minimax_h3_fl2va_pruned_int8_convrot.safetensors` for FL2VA/T2VA;
