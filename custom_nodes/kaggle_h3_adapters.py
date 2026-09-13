@@ -421,6 +421,158 @@ def _h3_move_for_consumer(tensor: Any, *, device_id: int, role: str) -> Any:
     return moved
 
 
+def _h3_clone_sampler_value(value: Any) -> Any:
+    """Detach and clone only values retained by a multistep sampler.
+
+    ComfyUI's ``res_multistep`` keeps the previous denoised model output for
+    its second-order history.  H3's quantized execution path can expose a
+    view backed by a temporary output/workspace buffer, so retaining that
+    view across the next model call is unsafe even when all CUDA launches
+    have been synchronized.  Clone the history value without moving it or
+    changing its dtype/device; ordinary metadata remains shared.
+    """
+
+    try:
+        import torch
+    except Exception:
+        return value
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    if isinstance(value, tuple):
+        return tuple(_h3_clone_sampler_value(item) for item in value)
+    if isinstance(value, list):
+        return [_h3_clone_sampler_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _h3_clone_sampler_value(item) for key, item in value.items()
+        }
+    return value
+
+
+def _h3_res_multistep(
+    model: Any,
+    x: Any,
+    sigmas: Any,
+    extra_args: dict[str, Any] | None = None,
+    callback: Any = None,
+    disable: Any = None,
+    s_noise: float = 1.0,
+    noise_sampler: Any = None,
+):
+    """Run ComfyUI's base ``res_multistep`` with safe H3 history ownership.
+
+    The update equations intentionally mirror ComfyUI v0.34.0's
+    ``sample_res_multistep`` entry point (eta=0, non-CFG).  The only H3
+    additions are a deliberate full-model boundary barrier and an owned copy
+    of ``old_denoised``.  Turbo remains on ComfyUI's normal Euler path.
+    """
+
+    import torch
+    from comfy.k_diffusion import sampling as k_diffusion_sampling  # type: ignore
+
+    extra_args = {} if extra_args is None else extra_args
+    seed = extra_args.get("seed", None)
+    if noise_sampler is None:
+        noise_sampler = k_diffusion_sampling.default_noise_sampler(x, seed=seed)
+    model_sampling = model.inner_model.model_patcher.get_model_object(
+        "model_sampling"
+    )
+    s_noise = s_noise * getattr(model_sampling, "noise_scale", 1.0)
+    s_in = x.new_ones([x.shape[0]])
+
+    def sigma_fn(t):
+        return t.neg().exp()
+
+    def t_fn(sigma):
+        return sigma.log().neg()
+
+    def phi1_fn(t):
+        return torch.expm1(t) / t
+
+    def phi2_fn(t):
+        return (phi1_fn(t) - 1.0) / t
+
+    old_sigma_down = None
+    old_denoised = None
+
+    for index in range(len(sigmas) - 1):
+        denoised = model(x, sigmas[index] * s_in, **extra_args)
+        synchronize_h3_devices(
+            phase_device_ids(),
+            reason=f"res_multistep model output boundary {index}",
+        )
+        if callback is not None:
+            callback(
+                {
+                    "x": x,
+                    "i": index,
+                    "sigma": sigmas[index],
+                    "sigma_hat": sigmas[index],
+                    "denoised": denoised,
+                }
+            )
+
+        # eta=0 is the official non-ancestral base-H3 contract. Keep this
+        # call for exact parity with ComfyUI's implementation and to make
+        # the wrapper safe if Comfy changes the helper's scalar behavior.
+        sigma_down, sigma_up = k_diffusion_sampling.get_ancestral_step(
+            sigmas[index], sigmas[index + 1], eta=0.0
+        )
+        if sigma_down == 0 or old_denoised is None:
+            d = k_diffusion_sampling.to_d(x, sigmas[index], denoised)
+            dt = sigma_down - sigmas[index]
+            x = x + d * dt
+        else:
+            t = t_fn(sigmas[index])
+            t_old = t_fn(old_sigma_down)
+            t_next = t_fn(sigma_down)
+            t_prev = t_fn(sigmas[index - 1])
+            h = t_next - t
+            c2 = (t_prev - t_old) / h
+            phi1_value = phi1_fn(-h)
+            phi2_value = phi2_fn(-h)
+            b1 = torch.nan_to_num(phi1_value - phi2_value / c2, nan=0.0)
+            b2 = torch.nan_to_num(phi2_value / c2, nan=0.0)
+            x = sigma_fn(h) * x + h * (b1 * denoised + b2 * old_denoised)
+
+        if sigma_up > 0:
+            x = x + noise_sampler(
+                sigmas[index], sigmas[index + 1]
+            ) * s_noise * sigma_up
+
+        # Do not retain a view/workspace owned by the just-completed H3
+        # forward. This is the key difference from ComfyUI's direct sampler
+        # function and is intentionally limited to the multistep history.
+        old_denoised = _h3_clone_sampler_value(denoised)
+        old_sigma_down = sigma_down
+
+    return x
+
+
+def _h3_prepare_sampler(sampler_name: str, sampler: Any) -> Any:
+    """Install the H3-safe implementation only for base ``res_multistep``.
+
+    Turbo's Euler sampler is intentionally left as ComfyUI created it.  The
+    base H3 path keeps its documented ``res_multistep`` algorithm, but owns
+    the retained second-order history so a quantized transformer cannot reuse
+    that buffer on a later sharded forward.
+    """
+
+    if sampler_name != "res_multistep":
+        return sampler
+    if not callable(getattr(sampler, "sampler_function", None)):
+        raise RuntimeError(
+            "H3 could not access ComfyUI's res_multistep sampler function"
+        )
+    sampler.sampler_function = _h3_res_multistep
+    print(
+        "[Kaggle H3] Using base res_multistep with owned history and "
+        "model-output CUDA barriers.",
+        flush=True,
+    )
+    return sampler
+
+
 def _h3_finite_audio(audio: dict[str, Any]) -> dict[str, Any]:
     """Make the final audio codec boundary finite and CPU-owned.
 
@@ -1277,7 +1429,7 @@ class H3TurboSampler:
                 "conditioning": ("CONDITIONING",),
                 "latent_image": ("LATENT",),
                 "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
-                "sampler_name": (["euler", "res_multistep"], {"default": "euler"}),
+                "sampler_name": (["res_multistep", "euler"], {"default": "res_multistep"}),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 200}),
             },
             "optional": {
@@ -1299,6 +1451,11 @@ class H3TurboSampler:
         """Validate the sampler contract before touching the loaded model."""
 
         if runtime_config is None:
+            if sampler_name != "res_multistep":
+                raise RuntimeError(
+                    "Base H3 sampling requires sampler 'res_multistep'; "
+                    "sampler 'euler' is reserved for Turbo."
+                )
             return (
                 {
                     "steps": None,
@@ -1411,7 +1568,10 @@ class H3TurboSampler:
                 str(schedule.get("scheduler", "simple")),
                 int(expected_steps),
             ).cpu()
-            sampler = comfy.samplers.sampler_object(sampler_name)
+            sampler = _h3_prepare_sampler(
+                sampler_name,
+                comfy.samplers.sampler_object(sampler_name),
+            )
             guider = Guider_Basic(sampling_model)
             guider.set_conds(conditioning)
 

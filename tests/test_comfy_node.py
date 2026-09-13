@@ -413,6 +413,108 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         with self.assertRaisesRegex(RuntimeError, "requires sampler"):
             module.H3TurboSampler._resolve_sampling_parameters(config, "res_multistep")
 
+    def test_base_res_multistep_is_wrapped_but_turbo_euler_is_untouched(self):
+        module = load_node_module()
+
+        euler_sampler = types.SimpleNamespace(sampler_function=object())
+        original_euler_function = euler_sampler.sampler_function
+        self.assertIs(
+            module._h3_prepare_sampler("euler", euler_sampler),
+            euler_sampler,
+        )
+        self.assertIs(euler_sampler.sampler_function, original_euler_function)
+
+        res_sampler = types.SimpleNamespace(sampler_function=lambda *args: None)
+        self.assertIs(
+            module._h3_prepare_sampler("res_multistep", res_sampler),
+            res_sampler,
+        )
+        self.assertIs(res_sampler.sampler_function, module._h3_res_multistep)
+
+        with self.assertRaisesRegex(RuntimeError, "could not access"):
+            module._h3_prepare_sampler("res_multistep", types.SimpleNamespace())
+
+    def test_base_h3_rejects_euler(self):
+        module = load_node_module()
+        with self.assertRaisesRegex(RuntimeError, "reserved for Turbo"):
+            module.H3TurboSampler._resolve_sampling_parameters(None, "euler")
+
+    def test_res_multistep_history_isolated_from_reused_model_output_buffer(self):
+        module = load_node_module()
+        import torch
+        from unittest.mock import patch
+
+        sampling = types.ModuleType("comfy.k_diffusion.sampling")
+        sampling.default_noise_sampler = lambda _x, seed=None: (
+            lambda _sigma, _sigma_next: torch.zeros((1, 1))
+        )
+        sampling.get_ancestral_step = lambda sigma_from, sigma_to, eta: (
+            sigma_to,
+            0.0,
+        )
+        sampling.to_d = lambda x, sigma, denoised: (x - denoised) / sigma
+        k_diffusion = types.ModuleType("comfy.k_diffusion")
+        k_diffusion.__path__ = []
+        k_diffusion.sampling = sampling
+        comfy = types.ModuleType("comfy")
+        comfy.__path__ = []
+        comfy.k_diffusion = k_diffusion
+
+        class ModelSampling:
+            noise_scale = 1.0
+
+        class Patcher:
+            def get_model_object(self, _name):
+                return ModelSampling()
+
+        class InnerModel:
+            model_patcher = Patcher()
+
+        class Model:
+            inner_model = InnerModel()
+
+            def __init__(self, reuse_buffer):
+                self.reuse_buffer = reuse_buffer
+                self.calls = 0
+
+            def __call__(self, x, _sigma, **_kwargs):
+                if self.calls == 0:
+                    value = torch.tensor([[0.5]])
+                    if self.reuse_buffer:
+                        self.buffer = value
+                else:
+                    value = torch.tensor([[0.25]])
+                    if self.reuse_buffer:
+                        self.buffer.copy_(value)
+                        value = self.buffer
+                self.calls += 1
+                return value
+
+        with patch.dict(
+            sys.modules,
+            {
+                "comfy": comfy,
+                "comfy.k_diffusion": k_diffusion,
+                "comfy.k_diffusion.sampling": sampling,
+            },
+        ), patch.object(module, "phase_device_ids", return_value=()), patch.object(
+            module, "synchronize_h3_devices"
+        ) as synchronize:
+            sigmas = torch.tensor([2.0, 1.0, 0.0])
+            expected = module._h3_res_multistep(
+                Model(reuse_buffer=False),
+                torch.zeros((1, 1)),
+                sigmas,
+            )
+            actual = module._h3_res_multistep(
+                Model(reuse_buffer=True),
+                torch.zeros((1, 1)),
+                sigmas,
+            )
+
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(synchronize.call_count, 4)
+
     def test_repeated_seed_sampler_and_vae_outputs_remain_finite_and_stable(self):
         module = load_node_module()
         import torch
@@ -452,7 +554,9 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         comfy_sample.fix_empty_latent_channels = lambda _model, value, *_args: value
         comfy_samplers = types.ModuleType("comfy.samplers")
         comfy_samplers.calculate_sigmas = lambda *_args: torch.ones((3,))
-        comfy_samplers.sampler_object = lambda _name: object()
+        comfy_samplers.sampler_object = lambda _name: types.SimpleNamespace(
+            sampler_function=lambda *args, **kwargs: None
+        )
         comfy_helpers = types.ModuleType("comfy.sampler_helpers")
         comfy_helpers.prepare_sampling = lambda *_args, **_kwargs: None
         comfy_management = types.ModuleType("comfy.model_management")
@@ -506,10 +610,10 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
             module, "release_vae_phase"
         ):
             first = module.H3TurboSampler().sample(
-                object(), None, conditioning, latent, 1234, "euler", 2
+                object(), None, conditioning, latent, 1234, "res_multistep", 2
             )
             second = module.H3TurboSampler().sample(
-                object(), None, conditioning, latent, 1234, "euler", 2
+                object(), None, conditioning, latent, 1234, "res_multistep", 2
             )
             video_vae = types.SimpleNamespace(
                 decode=lambda _samples: torch.ones((1, 2, 2, 3))
