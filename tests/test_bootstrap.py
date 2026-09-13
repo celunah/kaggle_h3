@@ -1,3 +1,4 @@
+import io
 import os
 import subprocess
 import sys
@@ -169,6 +170,24 @@ assert len(module.NODE_CLASS_MAPPINGS) == 10
         self.assertEqual(result["visible_device_ids"], [0, 1])
         cuda_index = result["command"].index("--cuda-device")
         self.assertEqual(result["command"][cuda_index + 1], "0,1")
+
+    def test_comfyui_output_is_teeable_to_console_and_log(self):
+        from unittest.mock import patch
+
+        from kaggle_h3.bootstrap import _stream_comfyui_output
+
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "comfyui.log"
+            output = io.StringIO("[Kaggle H3][diffusion] step\nready\n")
+            with patch("builtins.print") as print_mock:
+                _stream_comfyui_output(output, log_path, show_console=True)
+
+            self.assertEqual(log_path.read_text(encoding="utf-8"), output.getvalue())
+            print_mock.assert_any_call(
+                "[ComfyUI] [Kaggle H3][diffusion] step\n",
+                end="",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

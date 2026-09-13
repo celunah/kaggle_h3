@@ -275,6 +275,12 @@ that fallback explicitly reports the secondary GPU as unused. The video
 decoder still applies the dtype-safe, offload-aware cast without changing
 checkpoint files.
 
+`start_comfyui()` tees ComfyUI stdout/stderr to both `results/comfyui.log` and
+the notebook console, so `[Kaggle H3][diffusion]` telemetry is visible live
+while remaining available for later inspection. Set
+`KAGGLE_H3_STREAM_COMFY_LOGS=0` before launch to disable console streaming
+while keeping the file log.
+
 The adapter node is currently a ComfyUI backend feature. The SGLang and
 Diffusers worker scaffolds do not expose a compatible H3 LoRA contract, so a
 request that selects Turbo/adapters is blocked on those workers instead of

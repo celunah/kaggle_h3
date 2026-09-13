@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,16 +53,39 @@ class ComfyProcess:
     log_path: Path
     command: tuple[str, ...] = ()
     cuda_visible_devices: str | None = None
+    log_thread: threading.Thread | None = None
 
     def stop(self, timeout: float = 10.0) -> None:
-        if self.process.poll() is not None:
-            return
-        self.process.terminate()
-        try:
-            self.process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait(timeout=5)
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        if self.log_thread is not None:
+            self.log_thread.join(timeout=2)
+
+
+def _stream_comfyui_output(
+    process_stdout: Any,
+    log_path: Path,
+    *,
+    show_console: bool,
+) -> None:
+    """Tee ComfyUI output to its durable log and the notebook console."""
+
+    try:
+        with log_path.open("a", encoding="utf-8") as log_file:
+            for line in process_stdout:
+                log_file.write(line)
+                log_file.flush()
+                if show_console:
+                    print(f"[ComfyUI] {line}", end="", flush=True)
+    except (BrokenPipeError, ValueError):
+        # The notebook output stream may close while ComfyUI is still exiting;
+        # the durable log remains the authoritative fallback.
+        return
 
 
 def _safe_json(value: Any) -> Any:
@@ -773,6 +797,7 @@ def start_comfyui(
     enable_cors_header: str | None = None,
     cpu_vae: bool = False,
     disable_cuda_malloc: bool = True,
+    stream_logs_to_console: bool | None = None,
     dry_run: bool = False,
 ) -> ComfyProcess | dict[str, Any]:
     """Start ComfyUI, optionally exposing it beyond loopback."""
@@ -796,6 +821,10 @@ def start_comfyui(
     log_dir = (log_dir or (comfy_root / ".." / "kaggle_h3_runs")).resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "comfyui.log"
+    if stream_logs_to_console is None:
+        stream_logs_to_console = os.environ.get(
+            "KAGGLE_H3_STREAM_COMFY_LOGS", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
     env = os.environ.copy()
     if visible:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(item) for item in visible)
@@ -810,15 +839,23 @@ def start_comfyui(
             "visible_device_ids": visible,
             "status": "would_start",
         }
-    with log_path.open("a", encoding="utf-8") as log_file:
-        process = subprocess.Popen(
-            command,
-            cwd=comfy_root,
-            env=env,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
+    process = subprocess.Popen(
+        command,
+        cwd=comfy_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    log_thread = threading.Thread(
+        target=_stream_comfyui_output,
+        args=(process.stdout, log_path),
+        kwargs={"show_console": bool(stream_logs_to_console)},
+        name="kaggle-h3-comfyui-log",
+        daemon=True,
+    )
+    log_thread.start()
     time.sleep(1.0)
     if process.poll() is not None:
         raise RuntimeError(
@@ -829,6 +866,7 @@ def start_comfyui(
         log_path=log_path,
         command=tuple(command),
         cuda_visible_devices=env.get("CUDA_VISIBLE_DEVICES"),
+        log_thread=log_thread,
     )
 
 
