@@ -6,7 +6,11 @@ from unittest.mock import patch
 from kaggle_h3.layer_sharding import (
     _install_synchronous_comfy_quantized_copies,
     _move_h3_arguments_synchronously,
+    _ordered_h3_execution_paths,
+    _route_h3_activation_output,
     _synchronize_h3_transfer,
+    DispatchableLayer,
+    DispatchableLayerGroup,
     find_dispatchable_layers,
     find_dispatchable_text_encoder_layers,
     inspect_dispatched_map,
@@ -66,6 +70,94 @@ class _FakeModule:
 
 
 class LayerShardingTests(unittest.TestCase):
+    def test_activation_execution_order_inserts_block_sequence_at_tree_position(self):
+        projections = _FakeModule(parameter_bytes=2)
+        blocks = _FakeModule([_FakeModule(parameter_bytes=1) for _ in range(4)])
+        final_layer = _FakeModule(parameter_bytes=2)
+        model = _FakeModule([projections, blocks, final_layer])
+        model.named_children = lambda: iter(
+            [
+                ("proj_in", projections),
+                ("blocks", blocks),
+                ("norm_out", final_layer),
+            ]
+        )
+        group = DispatchableLayerGroup(
+            container_path="blocks",
+            container_class="ModuleList",
+            layers=tuple(
+                DispatchableLayer(
+                    index=index,
+                    path=f"blocks.{index}",
+                    class_name="FakeBlock",
+                    size_bytes=1,
+                )
+                for index in range(4)
+            ),
+        )
+        device_map = {
+            "": "cpu",
+            "proj_in": 0,
+            "norm_out": 0,
+            "blocks.0": 0,
+            "blocks.1": 0,
+            "blocks.2": 1,
+            "blocks.3": 1,
+        }
+
+        ordered = _ordered_h3_execution_paths(
+            model,
+            group=group,
+            device_map=device_map,
+            device_ids=[0, 1],
+        )
+
+        self.assertEqual(
+            [path for path, _device in ordered],
+            ["proj_in", "blocks.0", "blocks.1", "blocks.2", "blocks.3", "norm_out"],
+        )
+        self.assertEqual(
+            [device for _path, device in ordered],
+            ["cuda:0", "cuda:0", "cuda:0", "cuda:1", "cuda:1", "cuda:0"],
+        )
+
+    def test_activation_output_is_returned_on_next_consumer_device(self):
+        import torch
+
+        value = object()
+        with patch(
+            "kaggle_h3.layer_sharding._move_h3_tree_synchronously",
+            return_value="gpu1_activation",
+        ) as move:
+            routed = _route_h3_activation_output(
+                value,
+                current_device="cuda:0",
+                next_device="cuda:1",
+                synchronization_mode={"value": "safe"},
+            )
+
+        self.assertEqual(routed, "gpu1_activation")
+        move.assert_called_once_with(
+            value,
+            torch.device("cuda:1"),
+            synchronization_mode={"value": "safe"},
+        )
+
+    def test_activation_output_is_not_copied_when_next_consumer_is_same_device(self):
+        value = object()
+        with patch(
+            "kaggle_h3.layer_sharding._move_h3_tree_synchronously"
+        ) as move:
+            routed = _route_h3_activation_output(
+                value,
+                current_device="cuda:1",
+                next_device="cuda:1",
+                synchronization_mode={"value": "fast"},
+            )
+
+        self.assertIs(routed, value)
+        move.assert_not_called()
+
     def test_activation_transfer_barrier_orders_source_then_destination(self):
         import torch
 

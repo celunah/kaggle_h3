@@ -1077,6 +1077,89 @@ def _execution_device_for_path(
     return _device_label(preferred if preferred is not None else device_ids[0])
 
 
+def _ordered_h3_execution_paths(
+    transformer: Any,
+    *,
+    group: DispatchableLayerGroup,
+    device_map: dict[str, int | str],
+    device_ids: list[int],
+) -> list[tuple[str, str]]:
+    """Return mapped modules in the transformer's actual forward order.
+
+    ``device_map`` is a residency map and its insertion order is not an
+    execution contract.  In particular, the preferred planner adds top-level
+    siblings before it adds the repeated block entries, which would make a
+    naive ``dict`` walk claim that a final/output module precedes block 0.
+    Activation streaming must follow the module tree's order instead: input
+    components, the intact block sequence, then the output components.
+    """
+
+    mapped_paths = {path for path in device_map if path}
+    ordered: list[str] = []
+    seen: set[str] = set()
+    group_root = group.container_path.split(".")[0]
+
+    named_children = getattr(transformer, "named_children", None)
+    top_children = list(named_children()) if callable(named_children) else []
+    for name, _child in top_children:
+        if name == group_root:
+            candidates = [layer.path for layer in group.layers]
+        else:
+            candidates = [name]
+        for path in candidates:
+            if path in mapped_paths and path not in seen:
+                seen.add(path)
+                ordered.append(path)
+
+    # Preserve a deterministic fallback for mapped nested components that are
+    # not exposed as direct children by a custom H3 wrapper.
+    for path in device_map:
+        if path and path not in seen:
+            seen.add(path)
+            ordered.append(path)
+
+    return [
+        (
+            path,
+            _execution_device_for_path(
+                path,
+                device_map[path],
+                group=group,
+                device_ids=device_ids,
+            ),
+        )
+        for path in ordered
+    ]
+
+
+def _route_h3_activation_output(
+    value: Any,
+    *,
+    current_device: str,
+    next_device: str | None,
+    synchronization_mode: Any,
+) -> Any:
+    """Return an activation on its next consumer's device.
+
+    The hook returns this destination tree to the parent H3 forward loop, so
+    the parent's live hidden-state reference is replaced at the boundary.
+    The completed source activation is then eligible for normal Python and
+    CUDA allocator release instead of being retained as a second live copy.
+    """
+
+    if next_device is None or str(next_device) == str(current_device):
+        return value
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return value
+    return _move_h3_tree_synchronously(
+        value,
+        torch.device(str(next_device)),
+        synchronization_mode=synchronization_mode,
+    )
+
+
 def _remove_handles(handles: Iterable[Any]) -> None:
     for handle in handles:
         remove = getattr(handle, "remove", None)
@@ -1456,20 +1539,20 @@ def _install_comfy_quantized_router(
         pass
 
     # Route all explicitly mapped components, including each intact block.
-    # The root entry is a residency default, not a callable module.
+    # The root entry is a residency default, not a callable module.  The
+    # planner's insertion order is not necessarily forward order, so derive
+    # transitions from the actual H3 module tree.
     mapped_paths = [path for path in device_map if path]
-    ordered_execution = [
-        (
-            path,
-            _execution_device_for_path(
-                path,
-                device_map[path],
-                group=group,
-                device_ids=device_ids,
-            ),
+    ordered_execution = _ordered_h3_execution_paths(
+        transformer,
+        group=group,
+        device_map=device_map,
+        device_ids=device_ids,
+    )
+    if {path for path, _target in ordered_execution} != set(mapped_paths):
+        raise H3LayerShardingError(
+            "Could not establish a complete H3 execution order for activation routing"
         )
-        for path in mapped_paths
-    ]
     next_execution = {
         path: ordered_execution[index + 1][1]
         for index, (path, _target) in enumerate(ordered_execution[:-1])
@@ -1568,7 +1651,7 @@ def _install_comfy_quantized_router(
                     _synchronize_h3_device(target)
                 return output
 
-            def synchronize_module_output(
+            def route_module_output(
                 _module: Any,
                 _args: tuple[Any, ...],
                 _kwargs: dict[str, Any],
@@ -1577,17 +1660,36 @@ def _install_comfy_quantized_router(
                 _target=execution_device,
                 _path=path,
             ) -> Any:
+                next_target = next_execution.get(_path)
+                if next_target is not None and next_target != _target:
+                    # Return the destination activation through the hook. The
+                    # parent H3 loop then replaces its live hidden-state
+                    # reference, making the source copy eligible for release.
+                    return _route_h3_activation_output(
+                        output,
+                        current_device=_target,
+                        next_device=next_target,
+                        synchronization_mode=sync_ref,
+                    )
                 return synchronize_output_if_needed(output, _target, _path)
 
             try:
                 handles.append(
-                    register_output(synchronize_module_output, with_kwargs=True)
+                    register_output(route_module_output, with_kwargs=True)
                 )
             except TypeError:
                 handles.append(
                     register_output(
                         lambda _module, _args, output, _target=execution_device, _path=path: (
-                            synchronize_output_if_needed(output, _target, _path)
+                            _route_h3_activation_output(
+                                output,
+                                current_device=_target,
+                                next_device=next_execution.get(_path),
+                                synchronization_mode=sync_ref,
+                            )
+                            if next_execution.get(_path) is not None
+                            and next_execution.get(_path) != _target
+                            else synchronize_output_if_needed(output, _target, _path)
                         )
                     )
                 )
@@ -1750,9 +1852,21 @@ def _install_comfy_quantized_router(
             "entry_points": ["comfy.model_management.cast_to", "comfy.model_management.cast_to_gathered"],
             "policy": "source/device barrier -> native Comfy copy with non_blocking=False -> destination/device barrier",
         },
-        "activation_transfers": "synchronous",
+        "activation_transfers": "synchronous_direct_boundary_streaming",
         "activation_boundaries": {
             "policy": "source-device barrier -> direct tensor copy -> destination-device barrier",
+            "ownership": "the forward hook returns the destination activation; the parent replaces the source reference",
+            "execution_order": [path for path, _target in ordered_execution],
+            "device_transitions": [
+                {
+                    "from": target,
+                    "to": ordered_execution[index + 1][1],
+                    "after": path,
+                    "before": ordered_execution[index + 1][0],
+                }
+                for index, (path, target) in enumerate(ordered_execution[:-1])
+                if target != ordered_execution[index + 1][1]
+            ],
             "block_output_barrier": (
                 "cuda.synchronize(execution_device) for full/safe; "
                 "device-transition/final-layer boundaries for fast"
