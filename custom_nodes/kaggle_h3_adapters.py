@@ -1,9 +1,9 @@
 """ComfyUI nodes for a metadata-validated MiniMax H3 adapter stack.
 
-The Kaggle bootstrap installs this file together with
-``kaggle_h3_adapter_core.py`` and ``kaggle_h3_adapter_catalog.json`` into
-ComfyUI/custom_nodes. Keeping the Comfy-specific shim separate from the
-dependency-light core makes the resolver and ordering rules unit-testable.
+The Kaggle bootstrap installs this node and its catalog into
+``ComfyUI/custom_nodes``. Dependency-light helpers are installed into the
+private ``kaggle_h3_support`` package beside the ComfyUI application so
+ComfyUI does not mistake them for separate custom nodes.
 """
 
 from __future__ import annotations
@@ -14,6 +14,12 @@ from pathlib import Path
 import importlib.util
 import sys
 from typing import Any
+
+
+_H3_NODE_PATH = Path(__file__).resolve()
+for _import_root in (_H3_NODE_PATH.parents[1], _H3_NODE_PATH.parents[2]):
+    if _import_root.is_dir() and str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
 
 _H3_SAMPLER_SYNCHRONIZATION_MODE: ContextVar[str] = ContextVar(
@@ -33,21 +39,7 @@ try:
     )
 except ImportError:
     try:
-        # This supports loading the node directly from the delivered package
-        # before the bootstrap has copied its core beside the Comfy checkout.
-        node_path = Path(__file__).resolve()
-        # ComfyUI loads a custom-node file by path and does not guarantee that
-        # the package's sibling ``src`` tree or ``custom_nodes`` directory is
-        # importable. Cover both delivered layouts before using the copied
-        # dependency-light core as the final fallback.
-        for import_root in (
-            node_path.parents[1] / "src",
-            node_path.parents[2] / "src",
-            node_path.parent,
-        ):
-            if import_root.is_dir() and str(import_root) not in sys.path:
-                sys.path.insert(0, str(import_root))
-        from kaggle_h3.adapters import (  # type: ignore
+        from kaggle_h3_support.adapters import (  # type: ignore
             AdapterCache,
             H3AdapterError,
             apply_adapter_stack,
@@ -56,28 +48,46 @@ except ImportError:
             load_catalog,
             selector_options,
         )
-    except ImportError:  # installed standalone beside the ComfyUI custom node
-        # ComfyUI loads this file with an importlib file spec. Import the
-        # sibling helper by path so this does not depend on custom_nodes being
-        # present on sys.path.
-        import importlib.util
-
-        core_path = Path(__file__).resolve().with_name("kaggle_h3_adapter_core.py")
-        core_spec = importlib.util.spec_from_file_location(
-            "kaggle_h3_adapter_core", core_path
-        )
-        if core_spec is None or core_spec.loader is None or not core_path.is_file():
-            raise ImportError(f"Cannot load standalone H3 adapter core: {core_path}")
-        core_module = importlib.util.module_from_spec(core_spec)
-        sys.modules[core_spec.name] = core_module
-        core_spec.loader.exec_module(core_module)
-        AdapterCache = core_module.AdapterCache
-        H3AdapterError = core_module.H3AdapterError
-        apply_adapter_stack = core_module.apply_adapter_stack
-        build_runtime_config = core_module.build_runtime_config
-        detect_conditioning_mode = core_module.detect_conditioning_mode
-        load_catalog = core_module.load_catalog
-        selector_options = core_module.selector_options
+    except ImportError:
+        try:
+            # This supports loading the node directly from the delivered
+            # package before the bootstrap has copied its core beside ComfyUI.
+            node_path = Path(__file__).resolve()
+            for import_root in (
+                node_path.parents[1] / "src",
+                node_path.parents[2] / "src",
+                node_path.parent,
+            ):
+                if import_root.is_dir() and str(import_root) not in sys.path:
+                    sys.path.insert(0, str(import_root))
+            from kaggle_h3.adapters import (  # type: ignore
+                AdapterCache,
+                H3AdapterError,
+                apply_adapter_stack,
+                build_runtime_config,
+                detect_conditioning_mode,
+                load_catalog,
+                selector_options,
+            )
+        except ImportError:  # installed standalone beside the ComfyUI custom node
+            # ComfyUI loads this file with an importlib file spec. Import the
+            # sibling helper by path for the legacy standalone bundle.
+            core_path = Path(__file__).resolve().with_name("kaggle_h3_adapter_core.py")
+            core_spec = importlib.util.spec_from_file_location(
+                "kaggle_h3_adapter_core", core_path
+            )
+            if core_spec is None or core_spec.loader is None or not core_path.is_file():
+                raise ImportError(f"Cannot load standalone H3 adapter core: {core_path}")
+            core_module = importlib.util.module_from_spec(core_spec)
+            sys.modules[core_spec.name] = core_module
+            core_spec.loader.exec_module(core_module)
+            AdapterCache = core_module.AdapterCache
+            H3AdapterError = core_module.H3AdapterError
+            apply_adapter_stack = core_module.apply_adapter_stack
+            build_runtime_config = core_module.build_runtime_config
+            detect_conditioning_mode = core_module.detect_conditioning_mode
+            load_catalog = core_module.load_catalog
+            selector_options = core_module.selector_options
 
 
 try:
@@ -90,7 +100,7 @@ try:
     )
 except ImportError:
     try:
-        from kaggle_h3_ref2va import (  # type: ignore
+        from kaggle_h3_support.ref2va import (  # type: ignore
             H3_MAX_SECONDS,
             H3_MIN_FRAMES,
             REF2VA_SIZE_PRESETS,
@@ -98,20 +108,29 @@ except ImportError:
             resolve_ref2va_length,
         )
     except ImportError:
-        ref2va_path = Path(__file__).with_name("kaggle_h3_ref2va.py")
-        ref2va_spec = importlib.util.spec_from_file_location(
-            "kaggle_h3_ref2va", ref2va_path
-        )
-        if ref2va_spec is None or ref2va_spec.loader is None or not ref2va_path.is_file():
-            raise ImportError(f"Cannot load standalone H3 Ref2VA helper: {ref2va_path}")
-        ref2va_module = importlib.util.module_from_spec(ref2va_spec)
-        sys.modules[ref2va_spec.name] = ref2va_module
-        ref2va_spec.loader.exec_module(ref2va_module)
-        H3_MAX_SECONDS = ref2va_module.H3_MAX_SECONDS
-        H3_MIN_FRAMES = ref2va_module.H3_MIN_FRAMES
-        REF2VA_SIZE_PRESETS = ref2va_module.REF2VA_SIZE_PRESETS
-        resolve_ref2va_dimensions = ref2va_module.resolve_ref2va_dimensions
-        resolve_ref2va_length = ref2va_module.resolve_ref2va_length
+        try:
+            from kaggle_h3_ref2va import (  # type: ignore
+                H3_MAX_SECONDS,
+                H3_MIN_FRAMES,
+                REF2VA_SIZE_PRESETS,
+                resolve_ref2va_dimensions,
+                resolve_ref2va_length,
+            )
+        except ImportError:
+            ref2va_path = Path(__file__).with_name("kaggle_h3_ref2va.py")
+            ref2va_spec = importlib.util.spec_from_file_location(
+                "kaggle_h3_ref2va", ref2va_path
+            )
+            if ref2va_spec is None or ref2va_spec.loader is None or not ref2va_path.is_file():
+                raise ImportError(f"Cannot load standalone H3 Ref2VA helper: {ref2va_path}")
+            ref2va_module = importlib.util.module_from_spec(ref2va_spec)
+            sys.modules[ref2va_spec.name] = ref2va_module
+            ref2va_spec.loader.exec_module(ref2va_module)
+            H3_MAX_SECONDS = ref2va_module.H3_MAX_SECONDS
+            H3_MIN_FRAMES = ref2va_module.H3_MIN_FRAMES
+            REF2VA_SIZE_PRESETS = ref2va_module.REF2VA_SIZE_PRESETS
+            resolve_ref2va_dimensions = ref2va_module.resolve_ref2va_dimensions
+            resolve_ref2va_length = ref2va_module.resolve_ref2va_length
 
 
 try:
@@ -122,28 +141,35 @@ try:
     )
 except ImportError:
     try:
-        from kaggle_h3_model_manager import (  # type: ignore
+        from kaggle_h3_support.model_manager import (  # type: ignore
             H3DiffusionModelError,
             H3DiffusionModelManager,
             h3_diffusion_directory_from_comfy,
         )
     except ImportError:
-        model_manager_path = Path(__file__).with_name("kaggle_h3_model_manager.py")
-        model_manager_spec = importlib.util.spec_from_file_location(
-            "kaggle_h3_model_manager", model_manager_path
-        )
-        if (
-            model_manager_spec is None
-            or model_manager_spec.loader is None
-            or not model_manager_path.is_file()
-        ):
-            raise ImportError(f"Cannot load standalone H3 model manager: {model_manager_path}")
-        model_manager_module = importlib.util.module_from_spec(model_manager_spec)
-        sys.modules[model_manager_spec.name] = model_manager_module
-        model_manager_spec.loader.exec_module(model_manager_module)
-        H3DiffusionModelError = model_manager_module.H3DiffusionModelError
-        H3DiffusionModelManager = model_manager_module.H3DiffusionModelManager
-        h3_diffusion_directory_from_comfy = model_manager_module.h3_diffusion_directory_from_comfy
+        try:
+            from kaggle_h3_model_manager import (  # type: ignore
+                H3DiffusionModelError,
+                H3DiffusionModelManager,
+                h3_diffusion_directory_from_comfy,
+            )
+        except ImportError:
+            model_manager_path = Path(__file__).with_name("kaggle_h3_model_manager.py")
+            model_manager_spec = importlib.util.spec_from_file_location(
+                "kaggle_h3_model_manager", model_manager_path
+            )
+            if (
+                model_manager_spec is None
+                or model_manager_spec.loader is None
+                or not model_manager_path.is_file()
+            ):
+                raise ImportError(f"Cannot load standalone H3 model manager: {model_manager_path}")
+            model_manager_module = importlib.util.module_from_spec(model_manager_spec)
+            sys.modules[model_manager_spec.name] = model_manager_module
+            model_manager_spec.loader.exec_module(model_manager_module)
+            H3DiffusionModelError = model_manager_module.H3DiffusionModelError
+            H3DiffusionModelManager = model_manager_module.H3DiffusionModelManager
+            h3_diffusion_directory_from_comfy = model_manager_module.h3_diffusion_directory_from_comfy
 
 
 CATALOG_PATH = Path(__file__).with_name("kaggle_h3_adapter_catalog.json")
@@ -173,7 +199,7 @@ try:
     )
 except ImportError:
     try:
-        from kaggle_h3_phase_runtime import (  # type: ignore
+        from kaggle_h3_support.phase_runtime import (  # type: ignore
             H3PhaseError,
             begin_transformer_phase,
             configure_vae_phase,
@@ -196,39 +222,60 @@ except ImportError:
             validate_finite,
         )
     except ImportError:
-        # The bootstrap copies this helper next to the node. The direct
-        # package import above remains preferred for tests and notebook-side
-        # development; this fallback keeps an installed ComfyUI checkout
-        # self-contained.
-        phase_path = Path(__file__).with_name("kaggle_h3_phase_runtime.py")
-        phase_spec = importlib.util.spec_from_file_location(
-            "kaggle_h3_phase_runtime", phase_path
-        )
-        if phase_spec is None or phase_spec.loader is None or not phase_path.is_file():
-            raise ImportError(f"Cannot load standalone H3 phase runtime: {phase_path}")
-        phase_module = importlib.util.module_from_spec(phase_spec)
-        sys.modules[phase_spec.name] = phase_module
-        phase_spec.loader.exec_module(phase_module)
-        H3PhaseError = phase_module.H3PhaseError
-        begin_transformer_phase = phase_module.begin_transformer_phase
-        configure_vae_phase = phase_module.configure_vae_phase
-        phase_state_for_model = phase_module.phase_state_for_model
-        phase_policy = phase_module.phase_policy
-        phase_device_ids = phase_module.phase_device_ids
-        prepare_model_for_h3_phase = phase_module.prepare_model_for_h3_phase
-        prepare_text_encoder_for_h3_phase = phase_module.prepare_text_encoder_for_h3_phase
-        _retarget_patcher_load_device = phase_module._retarget_patcher_load_device
-        _prepare_sampling_preserving_phase = phase_module._prepare_sampling_preserving_phase
-        h3_synchronization_plan = phase_module.h3_synchronization_plan
-        normalize_h3_synchronization_mode = phase_module.normalize_h3_synchronization_mode
-        release_all_text_encoder_phases = phase_module.release_all_text_encoder_phases
-        release_h3_runtime_resources = phase_module.release_h3_runtime_resources
-        release_vae_phase = phase_module.release_vae_phase
-        release_transformer_phase = phase_module.release_transformer_phase
-        h3_rmsnorm_dtype_alignment = phase_module.h3_rmsnorm_dtype_alignment
-        set_h3_synchronization_mode = phase_module.set_h3_synchronization_mode
-        synchronize_h3_devices = phase_module.synchronize_h3_devices
-        validate_finite = phase_module.validate_finite
+        try:
+            from kaggle_h3_phase_runtime import (  # type: ignore
+                H3PhaseError,
+                begin_transformer_phase,
+                configure_vae_phase,
+                phase_state_for_model,
+                phase_policy,
+                phase_device_ids,
+                prepare_model_for_h3_phase,
+                prepare_text_encoder_for_h3_phase,
+                _retarget_patcher_load_device,
+                _prepare_sampling_preserving_phase,
+                h3_synchronization_plan,
+                normalize_h3_synchronization_mode,
+                release_all_text_encoder_phases,
+                release_h3_runtime_resources,
+                release_vae_phase,
+                release_transformer_phase,
+                h3_rmsnorm_dtype_alignment,
+                set_h3_synchronization_mode,
+                synchronize_h3_devices,
+                validate_finite,
+            )
+        except ImportError:
+            # The legacy standalone bundle kept the helper beside the node.
+            phase_path = Path(__file__).with_name("kaggle_h3_phase_runtime.py")
+            phase_spec = importlib.util.spec_from_file_location(
+                "kaggle_h3_phase_runtime", phase_path
+            )
+            if phase_spec is None or phase_spec.loader is None or not phase_path.is_file():
+                raise ImportError(f"Cannot load standalone H3 phase runtime: {phase_path}")
+            phase_module = importlib.util.module_from_spec(phase_spec)
+            sys.modules[phase_spec.name] = phase_module
+            phase_spec.loader.exec_module(phase_module)
+            H3PhaseError = phase_module.H3PhaseError
+            begin_transformer_phase = phase_module.begin_transformer_phase
+            configure_vae_phase = phase_module.configure_vae_phase
+            phase_state_for_model = phase_module.phase_state_for_model
+            phase_policy = phase_module.phase_policy
+            phase_device_ids = phase_module.phase_device_ids
+            prepare_model_for_h3_phase = phase_module.prepare_model_for_h3_phase
+            prepare_text_encoder_for_h3_phase = phase_module.prepare_text_encoder_for_h3_phase
+            _retarget_patcher_load_device = phase_module._retarget_patcher_load_device
+            _prepare_sampling_preserving_phase = phase_module._prepare_sampling_preserving_phase
+            h3_synchronization_plan = phase_module.h3_synchronization_plan
+            normalize_h3_synchronization_mode = phase_module.normalize_h3_synchronization_mode
+            release_all_text_encoder_phases = phase_module.release_all_text_encoder_phases
+            release_h3_runtime_resources = phase_module.release_h3_runtime_resources
+            release_vae_phase = phase_module.release_vae_phase
+            release_transformer_phase = phase_module.release_transformer_phase
+            h3_rmsnorm_dtype_alignment = phase_module.h3_rmsnorm_dtype_alignment
+            set_h3_synchronization_mode = phase_module.set_h3_synchronization_mode
+            synchronize_h3_devices = phase_module.synchronize_h3_devices
+            validate_finite = phase_module.validate_finite
 
 
 def _catalog():

@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +10,7 @@ from kaggle_h3.bootstrap import (
     configure_comfyui_model_paths,
     download_selected_models,
     ensure_github_checkout,
+    install_h3_adapter_node,
     model_file_status,
     required_model_files,
     stage_smoke_assets,
@@ -15,6 +19,45 @@ from kaggle_h3.bootstrap import (
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_h3_support_modules_are_not_installed_as_custom_nodes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            comfy_root = root / "ComfyUI"
+            result = install_h3_adapter_node(comfy_root, Path(__file__).parents[1])
+
+            custom_nodes = comfy_root / "custom_nodes"
+            self.assertEqual(
+                sorted(path.name for path in custom_nodes.iterdir()),
+                ["kaggle_h3_adapter_catalog.json", "kaggle_h3_adapters.py"],
+            )
+            support_dir = comfy_root / "kaggle_h3_support"
+            self.assertTrue((support_dir / "__init__.py").is_file())
+            self.assertTrue((support_dir / "phase_runtime.py").is_file())
+            self.assertEqual(result["support_package"], str(support_dir))
+            script = """
+import importlib.util
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+node_path = root / "custom_nodes" / "kaggle_h3_adapters.py"
+spec = importlib.util.spec_from_file_location("installed_h3_node", node_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert len(module.NODE_CLASS_MAPPINGS) == 10
+"""
+            environment = os.environ.copy()
+            environment.pop("PYTHONPATH", None)
+            subprocess.run(
+                [sys.executable, "-c", script, str(comfy_root)],
+                cwd=comfy_root,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
     def test_public_tunnel_mode_adds_explicit_cors_flag(self):
         command = comfy_launch_command(
             Path("/tmp/ComfyUI"),

@@ -316,12 +316,12 @@ def install_comfyui_dependencies(
 def install_h3_adapter_node(
     comfy_root: Path, project_root: Path, *, dry_run: bool = False
 ) -> dict[str, Any]:
-    """Install the local H3 adapter node and its dependency-light core.
+    """Install the H3 node and private support package.
 
-    The core is copied beside the custom node because a separately launched
-    ComfyUI process does not necessarily inherit the notebook's ``src`` path.
-    The files are ordinary Python/JSON sources; no model weights are copied and
-    the operation never edits a checkpoint.
+    Only the actual node module is copied into ``custom_nodes``. ComfyUI scans
+    every top-level ``.py`` file there as a node module, so dependency-light
+    helpers live in a private package beside the ComfyUI application instead.
+    No model weights are copied and the operation never edits a checkpoint.
     """
 
     source_node = project_root / "custom_nodes" / "kaggle_h3_adapters.py"
@@ -348,14 +348,19 @@ def install_h3_adapter_node(
     target_dir = comfy_root / "custom_nodes"
     target_files = (
         target_dir / "kaggle_h3_adapters.py",
-        target_dir / "kaggle_h3_adapter_core.py",
         target_dir / "kaggle_h3_adapter_catalog.json",
-        target_dir / "kaggle_h3_phase_runtime.py",
-        target_dir / "kaggle_h3_layer_sharding.py",
-        target_dir / "kaggle_h3_ref2va.py",
-        target_dir / "kaggle_h3_fp_diagnostics.py",
-        target_dir / "kaggle_h3_model_manager.py",
     )
+    support_dir = comfy_root / "kaggle_h3_support"
+    support_sources = (
+        source_core,
+        source_phase_runtime,
+        source_layer_sharding,
+        source_ref2va,
+        source_fp_diagnostics,
+        source_model_manager,
+    )
+    support_targets = tuple(support_dir / path.name for path in support_sources)
+    support_init = support_dir / "__init__.py"
     legacy_target_files = (
         target_dir / "celune_h3_adapters.py",
         target_dir / "celune_h3_adapter_core.py",
@@ -363,12 +368,24 @@ def install_h3_adapter_node(
         target_dir / "celune_h3_phase_runtime.py",
         target_dir / "celune_h3_layer_sharding.py",
         target_dir / "celune_h3_ref2va.py",
+        target_dir / "kaggle_h3_adapter_core.py",
+        target_dir / "kaggle_h3_phase_runtime.py",
+        target_dir / "kaggle_h3_layer_sharding.py",
+        target_dir / "kaggle_h3_ref2va.py",
+        target_dir / "kaggle_h3_fp_diagnostics.py",
+        target_dir / "kaggle_h3_model_manager.py",
     )
     result: dict[str, Any] = {
         "status": "would_install" if dry_run else "installed",
         "sources": [str(path) for path in sources],
         "targets": [str(path) for path in target_files],
-        "removed_legacy_targets": [str(path) for path in legacy_target_files if path.is_file()],
+        "support_package": str(support_dir),
+        "support_targets": [str(path) for path in support_targets],
+        "removed_legacy_targets": [
+            str(path)
+            for path in legacy_target_files
+            if path.is_file() or path.is_symlink()
+        ],
         "node_ids": [
             "KaggleH3SmokeReference",
             "KaggleH3Ref2VAConditioning",
@@ -385,10 +402,17 @@ def install_h3_adapter_node(
     if dry_run:
         return result
     target_dir.mkdir(parents=True, exist_ok=True)
+    support_dir.mkdir(parents=True, exist_ok=True)
     for legacy_target in legacy_target_files:
-        if legacy_target.is_file():
+        if legacy_target.is_file() or legacy_target.is_symlink():
             legacy_target.unlink()
-    for source, target in zip(sources, target_files):
+    for source, target in zip((source_node, source_catalog), target_files):
+        shutil.copy2(source, target)
+    support_init.write_text(
+        '"""Private Kaggle H3 support modules; not ComfyUI custom nodes."""\n',
+        encoding="utf-8",
+    )
+    for source, target in zip(support_sources, support_targets):
         shutil.copy2(source, target)
     return result
 
