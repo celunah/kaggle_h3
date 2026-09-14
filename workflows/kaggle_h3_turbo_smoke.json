@@ -37,20 +37,6 @@
     },
     "_meta": {"title": "Kaggle H3 | Audio VAE (GPU0)"}
   },
-  "character_reference": {
-    "class_type": "KaggleH3SmokeReference",
-    "inputs": {
-      "reference": "character"
-    },
-    "_meta": {"title": "Reference | Subject Image"}
-  },
-  "scene_reference": {
-    "class_type": "KaggleH3SmokeReference",
-    "inputs": {
-      "reference": "scene"
-    },
-    "_meta": {"title": "Reference | Scene Image"}
-  },
   "h3": {
     "class_type": "KaggleH3Conditioning",
     "inputs": {
@@ -63,8 +49,10 @@
       "size_preset": "360p",
       "aspect_ratio": "16:9",
       "ref_image_size": "match",
-      "ref_images.ref_image_0": ["character_reference", 0],
-      "ref_images.ref_image_1": ["scene_reference", 0]
+      "reference_0": "image",
+      "reference_0.file": "CHARACTER_REFERENCE.png",
+      "reference_1": "image",
+      "reference_1.file": "SCENE_REFERENCE.png"
     },
     "_meta": {"title": "Kaggle H3 | Global Conditioning (Ref2VA)"}
   },

@@ -12,6 +12,7 @@ from contextvars import ContextVar
 import os
 from pathlib import Path
 import importlib.util
+import re
 import sys
 from typing import Any
 
@@ -937,6 +938,207 @@ def _compact_h3_autogrow(value: Any, name: str) -> dict[str, Any]:
     return {str(key): item for key, item in value.items() if item is not None}
 
 
+_H3_EMPTY_FILE = "None"
+# One row can be image, video, or audio. The total is bounded by the native
+# H3 limits (9 image + 3 video + 3 audio references).
+_H3_INLINE_REFERENCE_SLOTS = 15
+
+
+def _h3_input_file_options(content_types: list[str]) -> list[str]:
+    """Return upload/select options matching ComfyUI's native input loaders."""
+
+    try:
+        import folder_paths  # type: ignore
+
+        input_dir = folder_paths.get_input_directory()
+        os.makedirs(input_dir, exist_ok=True)
+        files = [
+            name
+            for name in os.listdir(input_dir)
+            if os.path.isfile(os.path.join(input_dir, name))
+        ]
+        files = folder_paths.filter_files_content_types(files, content_types)
+        return [_H3_EMPTY_FILE, *sorted(files)]
+    except Exception:
+        # Keep the node importable in dependency-light tests and old ComfyUI
+        # installations. The upload control still works once ComfyUI supplies
+        # its folder_paths module.
+        return [_H3_EMPTY_FILE]
+
+
+def _h3_selected_file(value: Any) -> str | None:
+    if value is None:
+        return None
+    selected = str(value).strip()
+    if not selected or selected == _H3_EMPTY_FILE:
+        return None
+    return selected
+
+
+def _h3_slot_index(name: str, fallback: int) -> int:
+    match = re.search(r"(\d+)$", str(name))
+    return int(match.group(1)) if match else fallback
+
+
+def _h3_ordered_mapping(value: Any, name: str) -> list[tuple[int, Any]]:
+    """Return non-empty autogrow entries in their numeric slot order."""
+
+    compacted = _compact_h3_autogrow(value, name)
+    entries = [
+        (_h3_slot_index(key, fallback), item)
+        for fallback, (key, item) in enumerate(compacted.items())
+    ]
+    return sorted(entries, key=lambda entry: entry[0])
+
+
+def _load_h3_inline_file(kind: str, filename: str) -> tuple[Any, Any | None]:
+    """Load one inline selector through ComfyUI's native media loaders.
+
+    The second return value is an optional soundtrack extracted from an inline
+    video. H3 expects video references and their audio references in matching
+    slots, so a video's own soundtrack is paired automatically.
+    """
+
+    try:
+        if kind == "image":
+            from nodes import LoadImage  # type: ignore
+
+            return LoadImage().load_image(filename)[0], None
+        if kind == "audio":
+            from comfy_extras.nodes_audio import LoadAudio  # type: ignore
+
+            return _node_output_values(LoadAudio.execute(filename))[0], None
+        if kind == "video":
+            from comfy_extras.nodes_video import GetVideoComponents, LoadVideo  # type: ignore
+
+            video = _node_output_values(LoadVideo.execute(filename))[0]
+            components = _node_output_values(GetVideoComponents.execute(video))
+            return components[0], components[1]
+    except Exception as exc:
+        raise RuntimeError(
+            f"Kaggle H3 Conditioning could not load inline {kind} file "
+            f"{filename!r}: {exc}"
+        ) from exc
+    raise ValueError(f"Kaggle H3 Conditioning has unsupported inline media type {kind!r}.")
+
+
+def _resolve_h3_inline_references(
+    reference_slots: list[Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Load the global mixed-media selector into native H3 reference groups."""
+
+    images: list[Any] = []
+    videos: list[Any] = []
+    video_audios: dict[int, Any] = {}
+    audios: list[Any] = []
+    cache: dict[tuple[str, str], tuple[Any, Any | None]] = {}
+
+    for slot in reference_slots:
+        if not isinstance(slot, dict):
+            continue
+        kind = str(slot.get("reference", slot.get("type", "none"))).strip().lower()
+        if kind not in {"image", "video", "audio"}:
+            # DynamicCombo stores its selected key under the dynamic input's
+            # id (for example ``reference_0``), not necessarily ``reference``.
+            detected_kind = next(
+                (
+                    str(value).strip().lower()
+                    for key, value in slot.items()
+                    if key != "file"
+                    and str(value).strip().lower() in {"image", "video", "audio", "none"}
+                ),
+                kind,
+            )
+            kind = detected_kind
+        filename = _h3_selected_file(slot.get("file"))
+        if kind in {"", "none"} or filename is None:
+            continue
+        if kind not in {"image", "video", "audio"}:
+            raise ValueError(
+                "Kaggle H3 Conditioning reference selector has unsupported "
+                f"type {kind!r}; choose image, video, audio, or None."
+            )
+        cache_key = (kind, filename)
+        if cache_key not in cache:
+            cache[cache_key] = _load_h3_inline_file(kind, filename)
+        media, soundtrack = cache[cache_key]
+        if kind == "image":
+            images.append(media)
+        elif kind == "video":
+            video_index = len(videos)
+            videos.append(media)
+            if soundtrack is not None:
+                video_audios[video_index] = soundtrack
+        else:
+            audios.append(media)
+
+    return (
+        {f"ref_image_{index}": value for index, value in enumerate(images)},
+        {f"ref_video_{index}": value for index, value in enumerate(videos)},
+        {
+            f"ref_video_audio_{index}": value
+            for index, value in sorted(video_audios.items())
+        },
+        {f"ref_audio_{index}": value for index, value in enumerate(audios)},
+    )
+
+
+def _merge_h3_reference_sources(
+    inline: dict[str, Any],
+    sockets: Any,
+    name: str,
+    prefix: str,
+    *,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Append typed socket refs after inline refs without changing either source."""
+
+    merged = dict(inline)
+    for position, (_source_index, item) in enumerate(_h3_ordered_mapping(sockets, name)):
+        merged[f"{prefix}_{offset + position}"] = item
+    return merged
+
+
+def _merge_h3_video_audio_sources(
+    inline: dict[str, Any],
+    sockets: Any,
+    *,
+    video_offset: int,
+    typed_video_indices: list[int],
+) -> dict[str, Any]:
+    merged = dict(inline)
+    typed_video_positions = {
+        source_index: position
+        for position, source_index in enumerate(typed_video_indices)
+    }
+    for source_index, item in _h3_ordered_mapping(sockets, "ref_video_audios"):
+        if source_index not in typed_video_positions:
+            # Preserve the original key so _execute_global_h3_conditioning can
+            # issue its normal matching-slot error with the user's slot name.
+            merged[f"ref_video_audio_{source_index}"] = item
+            continue
+        merged[
+            f"ref_video_audio_{video_offset + typed_video_positions[source_index]}"
+        ] = item
+    return merged
+
+
+def _resolve_h3_inline_frame(
+    selected_file: Any,
+    connected_frame: Any,
+    label: str,
+) -> Any:
+    filename = _h3_selected_file(selected_file)
+    if filename is None:
+        return connected_frame
+    if connected_frame is not None:
+        raise ValueError(
+            f"Kaggle H3 Conditioning {label} has both a file selector and a connected "
+            "IMAGE socket. Use one input, not both."
+        )
+    return _load_h3_inline_file("image", filename)[0]
+
+
 def _execute_global_h3_conditioning(
     *,
     clip: Any,
@@ -1074,10 +1276,54 @@ def _execute_global_h3_conditioning(
 if _H3IO is not None:
 
     class KaggleH3Conditioning(_H3IO.ComfyNode):  # type: ignore[misc, valid-type]
-        """One autogrowing H3 conditioning node for Ref2VA and FL2VA."""
+        """One global H3 conditioner with sockets and inline media selectors."""
 
         @classmethod
         def define_schema(cls):
+            image_files = _h3_input_file_options(["image"])
+            video_files = _h3_input_file_options(["video"])
+            audio_files = _h3_input_file_options(["audio", "video"])
+
+            def inline_file_option(
+                key: str,
+                options: list[str],
+                upload_type: Any,
+                tooltip: str,
+            ):
+                return _H3IO.DynamicCombo.Option(
+                    key,
+                    [
+                        _H3IO.Combo.Input(
+                            "file",
+                            options=options,
+                            default=_H3_EMPTY_FILE,
+                            upload=upload_type,
+                            tooltip=tooltip,
+                        )
+                    ],
+                )
+
+            reference_options = [
+                _H3IO.DynamicCombo.Option("none", []),
+                inline_file_option(
+                    "image",
+                    image_files,
+                    _H3IO.UploadType.image,
+                    "Reference image file from ComfyUI input; upload is supported.",
+                ),
+                inline_file_option(
+                    "video",
+                    video_files,
+                    _H3IO.UploadType.video,
+                    "Reference video file from ComfyUI input; upload is supported.",
+                ),
+                inline_file_option(
+                    "audio",
+                    audio_files,
+                    _H3IO.UploadType.audio,
+                    "Reference audio file from ComfyUI input; upload is supported.",
+                ),
+            ]
             autogrow_image = _H3IO.Autogrow.TemplatePrefix(
                 input=_H3IO.Image.Input(
                     "ref_image",
@@ -1120,7 +1366,8 @@ if _H3IO is not None:
                 category="conditioning/MiniMax H3",
                 description=(
                     "Global H3 conditioning: prompt, Ref2VA/FL2VA mode, "
-                    "optional start/end frames, and auto-growing references."
+                    "inline upload/select controls, optional start/end frames, "
+                    "and socket-based references."
                 ),
                 inputs=[
                     _H3IO.Clip.Input("clip"),
@@ -1128,6 +1375,35 @@ if _H3IO is not None:
                     _H3IO.Vae.Input("audio_vae", optional=True),
                     _H3IO.Image.Input("start_frame", optional=True),
                     _H3IO.Image.Input("end_frame", optional=True),
+                    _H3IO.Combo.Input(
+                        "start_frame_file",
+                        display_name="Start frame (select/upload)",
+                        options=image_files,
+                        default=_H3_EMPTY_FILE,
+                        optional=True,
+                        upload=_H3IO.UploadType.image,
+                    ),
+                    _H3IO.Combo.Input(
+                        "end_frame_file",
+                        display_name="End frame (select/upload)",
+                        options=image_files,
+                        default=_H3_EMPTY_FILE,
+                        optional=True,
+                        upload=_H3IO.UploadType.image,
+                    ),
+                    *[
+                        _H3IO.DynamicCombo.Input(
+                            f"reference_{index}",
+                            options=reference_options,
+                            display_name=f"Reference {index + 1} (type + file)",
+                            optional=True,
+                            tooltip=(
+                                "Choose image, video, audio, or None. "
+                                "Rows are passed to H3 in listed order."
+                            ),
+                        )
+                        for index in range(_H3_INLINE_REFERENCE_SLOTS)
+                    ],
                     _H3IO.Autogrow.Input(
                         "ref_images", optional=True, template=autogrow_image
                     ),
@@ -1195,6 +1471,23 @@ if _H3IO is not None:
             audio_vae=None,
             start_frame=None,
             end_frame=None,
+            start_frame_file=None,
+            end_frame_file=None,
+            reference_0=None,
+            reference_1=None,
+            reference_2=None,
+            reference_3=None,
+            reference_4=None,
+            reference_5=None,
+            reference_6=None,
+            reference_7=None,
+            reference_8=None,
+            reference_9=None,
+            reference_10=None,
+            reference_11=None,
+            reference_12=None,
+            reference_13=None,
+            reference_14=None,
             ref_images=None,
             ref_videos=None,
             ref_video_audios=None,
@@ -1203,6 +1496,61 @@ if _H3IO is not None:
             height=None,
             length=None,
         ):
+            start_frame = _resolve_h3_inline_frame(
+                start_frame_file, start_frame, "start_frame"
+            )
+            end_frame = _resolve_h3_inline_frame(
+                end_frame_file, end_frame, "end_frame"
+            )
+            inline_images, inline_videos, inline_video_audios, inline_audios = (
+                _resolve_h3_inline_references(
+                    [
+                        reference_0,
+                        reference_1,
+                        reference_2,
+                        reference_3,
+                        reference_4,
+                        reference_5,
+                        reference_6,
+                        reference_7,
+                        reference_8,
+                        reference_9,
+                        reference_10,
+                        reference_11,
+                        reference_12,
+                        reference_13,
+                        reference_14,
+                    ]
+                )
+            )
+            typed_video_items = _h3_ordered_mapping(ref_videos, "ref_videos")
+            ref_images = _merge_h3_reference_sources(
+                inline_images,
+                ref_images,
+                "ref_images",
+                "ref_image",
+                offset=len(inline_images),
+            )
+            ref_videos = _merge_h3_reference_sources(
+                inline_videos,
+                ref_videos,
+                "ref_videos",
+                "ref_video",
+                offset=len(inline_videos),
+            )
+            ref_audios = _merge_h3_reference_sources(
+                inline_audios,
+                ref_audios,
+                "ref_audios",
+                "ref_audio",
+                offset=len(inline_audios),
+            )
+            ref_video_audios = _merge_h3_video_audio_sources(
+                inline_video_audios,
+                ref_video_audios,
+                video_offset=len(inline_videos),
+                typed_video_indices=[index for index, _item in typed_video_items],
+            )
             preset_width, preset_height = resolve_ref2va_dimensions(
                 size_preset, aspect_ratio
             )

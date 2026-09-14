@@ -399,21 +399,9 @@ def build_workflow(
             {"width": width, "height": height, "length": length["actual_frames"]}
         )
         if request.first_frame is not None:
-            node_id, output = _load_asset_node(
-                nodes,
-                ReferenceAsset(request.first_frame, "first_frame", "image").normalized(),
-                input_files,
-                90,
-            )
-            h3_inputs["start_frame"] = [node_id, output]
+            h3_inputs["start_frame_file"] = _input_path(input_files, request.first_frame)
         if request.last_frame is not None:
-            node_id, output = _load_asset_node(
-                nodes,
-                ReferenceAsset(request.last_frame, "last_frame", "image").normalized(),
-                input_files,
-                91,
-            )
-            h3_inputs["end_frame"] = [node_id, output]
+            h3_inputs["end_frame_file"] = _input_path(input_files, request.last_frame)
         h3_class = "KaggleH3Conditioning"
     elif canonical_mode == "Ref2VA":
         if request.aspect_ratio not in {"16:9", "4:3"}:
@@ -429,18 +417,19 @@ def build_workflow(
                 "ref_image_size": request.ref_image_size,
             }
         )
-        picture_index = video_index = audio_index = 0
-        for index, asset in enumerate(request.assets()):
-            node_id, output = _load_asset_node(nodes, asset, input_files, index)
-            if asset.media_type == "image":
-                h3_inputs[f"ref_images.ref_image_{picture_index}"] = [node_id, output]
-                picture_index += 1
-            elif asset.media_type == "video":
-                h3_inputs[f"ref_videos.ref_video_{video_index}"] = [node_id, output]
-                video_index += 1
-            else:
-                h3_inputs[f"ref_audios.ref_audio_{audio_index}"] = [node_id, output]
-                audio_index += 1
+        assets = request.assets()
+        if len(assets) > 15:
+            raise ValueError(
+                "Kaggle H3 Conditioning supports at most 15 inline reference rows "
+                "(the native H3 limits are 9 images, 3 videos, and 3 audio refs)."
+            )
+        for reference_index, asset in enumerate(assets):
+            if asset.media_type not in {"image", "video", "audio"}:
+                raise ValueError(f"Unsupported inline H3 reference type: {asset.media_type}")
+            h3_inputs[f"reference_{reference_index}"] = asset.media_type
+            h3_inputs[f"reference_{reference_index}.file"] = _input_path(
+                input_files, asset.path
+            )
         h3_class = "KaggleH3Conditioning"
     else:
         h3_inputs.update(

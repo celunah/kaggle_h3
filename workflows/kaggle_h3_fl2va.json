@@ -25,16 +25,6 @@
     "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors", "role": "audio", "device_id": 0},
     "_meta": {"title": "Kaggle H3 | Audio VAE (GPU0)"}
   },
-  "first_frame": {
-    "class_type": "LoadImage",
-    "inputs": {"image": "FIRST_FRAME.png"},
-    "_meta": {"title": "Input | First Frame"}
-  },
-  "last_frame": {
-    "class_type": "LoadImage",
-    "inputs": {"image": "LAST_FRAME.png"},
-    "_meta": {"title": "Input | Last Frame"}
-  },
   "h3": {
     "class_type": "KaggleH3Conditioning",
     "inputs": {
@@ -49,8 +39,8 @@
       "width": 608,
       "height": 352,
       "length": 124,
-      "start_frame": ["first_frame", 0],
-      "end_frame": ["last_frame", 0]
+      "start_frame_file": "FIRST_FRAME.png",
+      "end_frame_file": "LAST_FRAME.png"
     },
     "_meta": {"title": "Kaggle H3 | Global Conditioning (FL2VA)"}
   },

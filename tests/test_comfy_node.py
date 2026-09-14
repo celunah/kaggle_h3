@@ -202,6 +202,58 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         )
         self.assertEqual(captured["ref_audios"], {"ref_audio_0": "voice"})
 
+    def test_inline_reference_rows_load_in_list_order_and_cache_duplicates(self):
+        module = load_node_module()
+        loaded = []
+        original_loader = module._load_h3_inline_file
+
+        def fake_loader(kind, filename):
+            loaded.append((kind, filename))
+            if kind == "video":
+                return (f"frames:{filename}", f"audio:{filename}")
+            return (f"{kind}:{filename}", None)
+
+        module._load_h3_inline_file = fake_loader
+        try:
+            result = module._resolve_h3_inline_references(
+                [
+                    {"reference_0": "image", "file": "character.png"},
+                    {"reference_1": "video", "file": "motion.mp4"},
+                    {"reference_2": "audio", "file": "voice.wav"},
+                    {"reference_3": "image", "file": "character.png"},
+                    {"reference_4": "none", "file": "None"},
+                ]
+            )
+        finally:
+            module._load_h3_inline_file = original_loader
+
+        self.assertEqual(
+            result,
+            (
+                {"ref_image_0": "image:character.png", "ref_image_1": "image:character.png"},
+                {"ref_video_0": "frames:motion.mp4"},
+                {"ref_video_audio_0": "audio:motion.mp4"},
+                {"ref_audio_0": "audio:voice.wav"},
+            ),
+        )
+        self.assertEqual(
+            loaded,
+            [("image", "character.png"), ("video", "motion.mp4"), ("audio", "voice.wav")],
+        )
+
+    def test_inline_reference_sources_merge_before_socket_sources(self):
+        module = load_node_module()
+        self.assertEqual(
+            module._merge_h3_reference_sources(
+                {"ref_image_0": "inline"},
+                {"ref_image_4": "socket"},
+                "ref_images",
+                "ref_image",
+                offset=1,
+            ),
+            {"ref_image_0": "inline", "ref_image_1": "socket"},
+        )
+
     def test_global_conditioning_routes_fl2va_start_and_end_frames(self):
         module = load_node_module()
         captured = {}
