@@ -254,6 +254,12 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
             {"ref_image_0": "inline", "ref_image_1": "socket"},
         )
 
+    def test_global_conditioning_uses_preset_geometry_for_zero_overrides(self):
+        module = load_node_module()
+        self.assertIsNone(module._h3_optional_override(None))
+        self.assertIsNone(module._h3_optional_override(0))
+        self.assertEqual(module._h3_optional_override(608), 608)
+
     def test_global_conditioning_routes_fl2va_start_and_end_frames(self):
         module = load_node_module()
         captured = {}

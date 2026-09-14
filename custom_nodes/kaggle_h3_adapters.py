@@ -1139,6 +1139,15 @@ def _resolve_h3_inline_frame(
     return _load_h3_inline_file("image", filename)[0]
 
 
+def _h3_optional_override(value: Any) -> int | None:
+    """Treat ComfyUI's zero-valued optional widgets as unset."""
+
+    if value is None:
+        return None
+    parsed = int(value)
+    return None if parsed == 0 else parsed
+
+
 def _execute_global_h3_conditioning(
     *,
     clip: Any,
@@ -1447,9 +1456,18 @@ if _H3IO is not None:
                     # Advanced exact geometry overrides keep API-generated
                     # graphs compatible with the older FL2VA fields; normal
                     # interactive use should prefer seconds + presets.
-                    _H3IO.Int.Input("width", optional=True, min=32, max=8192, step=32),
-                    _H3IO.Int.Input("height", optional=True, min=32, max=8192, step=32),
-                    _H3IO.Int.Input("length", optional=True, min=5, max=3600, step=1),
+                    # ComfyUI may submit an optional integer widget as 0 even
+                    # when it is not configured. Zero is the unset sentinel;
+                    # nonzero values are validated below.
+                    _H3IO.Int.Input(
+                        "width", optional=True, default=0, min=0, max=8192, step=32
+                    ),
+                    _H3IO.Int.Input(
+                        "height", optional=True, default=0, min=0, max=8192, step=32
+                    ),
+                    _H3IO.Int.Input(
+                        "length", optional=True, default=0, min=0, max=3600, step=1
+                    ),
                 ],
                 outputs=[
                     _H3IO.Conditioning.Output(display_name="positive"),
@@ -1496,6 +1514,9 @@ if _H3IO is not None:
             height=None,
             length=None,
         ):
+            width = _h3_optional_override(width)
+            height = _h3_optional_override(height)
+            length = _h3_optional_override(length)
             start_frame = _resolve_h3_inline_frame(
                 start_frame_file, start_frame, "start_frame"
             )
