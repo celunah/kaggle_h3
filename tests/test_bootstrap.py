@@ -29,7 +29,11 @@ class BootstrapTests(unittest.TestCase):
             custom_nodes = comfy_root / "custom_nodes"
             self.assertEqual(
                 sorted(path.name for path in custom_nodes.iterdir()),
-                ["kaggle_h3_adapter_catalog.json", "kaggle_h3_adapters.py"],
+                [
+                    "kaggle_h3_adapter_catalog.json",
+                    "kaggle_h3_adapters.py",
+                    "kaggle_h3_conditioning.py",
+                ],
             )
             support_dir = comfy_root / "kaggle_h3_support"
             self.assertTrue((support_dir / "__init__.py").is_file())

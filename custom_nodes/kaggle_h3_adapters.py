@@ -297,9 +297,8 @@ except ImportError:
 # optional so the legacy adapter module remains importable in dependency-light
 # tests and on older ComfyUI installations.
 try:
-    from comfy_api.latest import ComfyExtension as _H3ComfyExtension, io as _H3IO  # type: ignore
+    from comfy_api.latest import io as _H3IO  # type: ignore
 except ImportError:
-    _H3ComfyExtension = None  # type: ignore[assignment,misc]
     _H3IO = None  # type: ignore[assignment,misc]
 
 
@@ -2466,19 +2465,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "KaggleH3VAEDecode": "Kaggle H3 | Video VAE Decode (GPU1)",
     "KaggleH3AudioVAEDecode": "Kaggle H3 | Audio VAE Decode (GPU0)",
 }
-
-
-if _H3ComfyExtension is not None and KaggleH3Conditioning is not None:
-
-    class KaggleH3ConditioningExtension(_H3ComfyExtension):  # type: ignore[misc, valid-type]
-        async def get_node_list(self):
-            return [KaggleH3Conditioning]
-
-
-    async def comfy_entrypoint():
-        """Expose the autogrowing global conditioner through ComfyUI V3."""
-
-        return KaggleH3ConditioningExtension()
 
 
 _install_standard_h3_decode_compatibility()

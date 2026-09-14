@@ -42,7 +42,8 @@ The final Kaggle report must be read from the run manifest. It must not claim bo
 - `workflows/kaggle_h3_fl2va.json`: first/last-frame API-format graph.
 - `workflows/kaggle_h3_t2va.json`: text-to-video/audio API-format graph.
 - `workflows/kaggle_h3_turbo_smoke.json`: Ref2VA 360p/16:9, 5-second, 4-step adapter smoke graph using the checked-in character and scene reference images.
-- `custom_nodes/kaggle_h3_adapters.py`: the auto-resolved smoke reference loader, V3 `Kaggle H3 Conditioning` node with auto-growing references and Ref2VA/FL2VA selection, the legacy bounded Ref2VA wrapper, just-in-time diffusion auto-loader, explicit H3 text-encoder/VAE loaders, a conditioning-complete phase barrier, `H3 Adapter Stack`, phase-aware H3 sampler, and GPU0/GPU1 audio/video VAE decode nodes.
+- `custom_nodes/kaggle_h3_adapters.py`: the auto-resolved smoke reference loader, global conditioning implementation, legacy bounded Ref2VA wrapper, just-in-time diffusion auto-loader, explicit H3 text-encoder/VAE loaders, a conditioning-complete phase barrier, `H3 Adapter Stack`, phase-aware H3 sampler, and GPU0/GPU1 audio/video VAE decode nodes.
+- `custom_nodes/kaggle_h3_conditioning.py`: the separate V3 entrypoint that registers the autogrowing `Kaggle H3 Conditioning` node; it is separate because ComfyUI prioritizes legacy mappings over a same-module V3 entrypoint.
 - At runtime, the bootstrap copies only the node module and adapter catalog into `ComfyUI/custom_nodes`; dependency-light helpers are installed under the private `ComfyUI/kaggle_h3_support/` package so ComfyUI does not scan them as separate custom nodes.
 - `src/kaggle_h3/model_manager.py`: pinned, one-variant-at-a-time H3 diffusion download and exact inactive-checkpoint removal used by the ComfyUI loader.
 - `src/kaggle_h3/ref2va.py`: shared Ref2VA seconds, 17*k+5 frame alignment, and 32-pixel canvas-preset rules.

@@ -349,6 +349,7 @@ def install_h3_adapter_node(
     """
 
     source_node = project_root / "custom_nodes" / "kaggle_h3_adapters.py"
+    source_conditioning = project_root / "custom_nodes" / "kaggle_h3_conditioning.py"
     source_core = project_root / "src" / "kaggle_h3" / "adapters.py"
     source_catalog = project_root / "custom_nodes" / "kaggle_h3_adapter_catalog.json"
     source_phase_runtime = project_root / "src" / "kaggle_h3" / "phase_runtime.py"
@@ -359,6 +360,7 @@ def install_h3_adapter_node(
     source_diffusion_telemetry = project_root / "src" / "kaggle_h3" / "diffusion_telemetry.py"
     sources = (
         source_node,
+        source_conditioning,
         source_core,
         source_catalog,
         source_phase_runtime,
@@ -374,6 +376,7 @@ def install_h3_adapter_node(
     target_dir = comfy_root / "custom_nodes"
     target_files = (
         target_dir / "kaggle_h3_adapters.py",
+        target_dir / "kaggle_h3_conditioning.py",
         target_dir / "kaggle_h3_adapter_catalog.json",
     )
     support_dir = comfy_root / "kaggle_h3_support"
@@ -434,7 +437,9 @@ def install_h3_adapter_node(
     for legacy_target in legacy_target_files:
         if legacy_target.is_file() or legacy_target.is_symlink():
             legacy_target.unlink()
-    for source, target in zip((source_node, source_catalog), target_files):
+    for source, target in zip(
+        (source_node, source_conditioning, source_catalog), target_files
+    ):
         shutil.copy2(source, target)
     support_init.write_text(
         '"""Private Kaggle H3 support modules; not ComfyUI custom nodes."""\n',
