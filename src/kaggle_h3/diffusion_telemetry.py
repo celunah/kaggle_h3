@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -81,6 +82,7 @@ def _tensor_statistics(tensor: Any) -> dict[str, Any]:
     if tensor.numel() == 0:
         return {
             "present": True,
+            "shape": list(tensor.shape),
             "min": None,
             "max": None,
             "mean": None,
@@ -106,6 +108,7 @@ def _tensor_statistics(tensor: Any) -> dict[str, Any]:
         std = _scalar(values.float().std(unbiased=False))
     return {
         "present": True,
+        "shape": list(tensor.shape),
         "min": minimum,
         "max": maximum,
         "mean": mean,
@@ -115,6 +118,29 @@ def _tensor_statistics(tensor: Any) -> dict[str, Any]:
         "dtype": str(tensor.dtype),
         "device": str(tensor.device),
     }
+
+
+def _tensor_checksum(tensor: Any) -> str:
+    """Return a SHA-256 checksum of a tensor's raw values.
+
+    The tensor is never modified.  A contiguous view is used only for the
+    byte serialization, and CUDA values are copied to CPU solely for hashing.
+    This is intentionally part of opt-in diagnostics because the copy is
+    expensive and synchronizes the producing CUDA stream.
+    """
+
+    import torch  # type: ignore
+
+    if bool(getattr(tensor, "is_cuda", False)):
+        torch.cuda.synchronize(tensor.device)
+    with torch.no_grad():
+        raw = tensor.detach().contiguous()
+        if raw.device.type != "cpu":
+            raw = raw.cpu()
+        # Viewing as bytes works for float, bfloat16, float8, complex, integer,
+        # and boolean tensors without casting their values or changing dtype.
+        raw_bytes = raw.view(torch.uint8).numpy().tobytes()
+    return hashlib.sha256(raw_bytes).hexdigest()
 
 
 class H3DiffusionTelemetry:
@@ -164,10 +190,51 @@ class H3DiffusionTelemetry:
     ) -> None:
         """Record all numerical tensor leaves at one named sampler boundary."""
 
+        self._record_value(
+            step_index=int(step_index),
+            stage=f"diffusion_step_{int(step_index)}_{boundary}",
+            sigma=sigma,
+            timestep=sigma if timestep is None else timestep,
+            value=value,
+            tensor_name=tensor_name,
+            alias_of=alias_of,
+        )
+
+    def record_phase(
+        self,
+        *,
+        stage: str,
+        value: Any,
+        tensor_name: str,
+    ) -> None:
+        """Record a non-step boundary such as a VAE input or output."""
+
+        self._record_value(
+            step_index=None,
+            stage=str(stage),
+            sigma=None,
+            timestep=None,
+            value=value,
+            tensor_name=tensor_name,
+        )
+
+    def _record_value(
+        self,
+        *,
+        step_index: int | None,
+        stage: str,
+        sigma: Any,
+        timestep: Any,
+        value: Any,
+        tensor_name: str,
+        alias_of: str | None = None,
+    ) -> None:
+        """Serialize tensor statistics and checksums for one boundary."""
+
         if not self.enabled:
             return
         sigma_value = _scalar(sigma)
-        timestep_value = _scalar(sigma if timestep is None else timestep)
+        timestep_value = _scalar(timestep)
         found = False
         with self._lock:
             for path, tensor in _iter_tensors(value, tensor_name, set()):
@@ -183,16 +250,26 @@ class H3DiffusionTelemetry:
                     }
                 if not statistics:
                     continue
+                try:
+                    checksum = _tensor_checksum(tensor)
+                    checksum_error = None
+                except Exception as exc:
+                    checksum = None
+                    checksum_error = str(exc)
                 record = {
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                     "generation_id": self.generation_id,
-                    "step_index": int(step_index),
-                    "stage": f"diffusion_step_{int(step_index)}_{boundary}",
+                    "step_index": step_index,
+                    "stage": stage,
                     "sigma": sigma_value,
                     "timestep": timestep_value,
                     "tensor": path,
+                    "checksum_algorithm": "sha256_raw_contiguous",
+                    "checksum": checksum,
                     **statistics,
                 }
+                if checksum_error is not None:
+                    record["checksum_error"] = checksum_error
                 if alias_of is not None:
                     record["alias_of"] = alias_of
                 self.records.append(record)
@@ -201,11 +278,13 @@ class H3DiffusionTelemetry:
                 record = {
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                     "generation_id": self.generation_id,
-                    "step_index": int(step_index),
-                    "stage": f"diffusion_step_{int(step_index)}_{boundary}",
+                    "step_index": step_index,
+                    "stage": stage,
                     "sigma": sigma_value,
                     "timestep": timestep_value,
                     "tensor": tensor_name,
+                    "checksum_algorithm": "sha256_raw_contiguous",
+                    "checksum": None,
                     "present": False,
                     "min": None,
                     "max": None,

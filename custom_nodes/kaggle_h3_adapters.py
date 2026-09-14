@@ -2185,6 +2185,64 @@ def _h3_video_images_to_comfy(images: Any) -> Any:
         )
 
 
+def _h3_phase_telemetry(runtime_config: dict[str, Any] | None) -> Any:
+    """Create opt-in boundary telemetry for a VAE phase.
+
+    The sampler and VAE nodes are separate ComfyUI executions, so the VAE
+    cannot use the sampler's ContextVar directly. Reuse its generation id and
+    output path from the serializable runtime config when available, allowing
+    sampler and decode records to be compared in one trace.
+    """
+
+    if H3DiffusionTelemetry is None:
+        return None
+    existing: dict[str, Any] = {}
+    if isinstance(runtime_config, dict):
+        execution = runtime_config.get("execution")
+        if isinstance(execution, dict):
+            candidate = execution.get("diffusion_telemetry")
+            if isinstance(candidate, dict):
+                existing = candidate
+    output_path = existing.get("output_path")
+    telemetry = H3DiffusionTelemetry(output_path=output_path or None)
+    if not telemetry.enabled:
+        return None
+    generation_id = existing.get("generation_id")
+    if generation_id:
+        telemetry.generation_id = str(generation_id)
+    return telemetry
+
+
+def _h3_store_phase_telemetry(
+    runtime_config: dict[str, Any] | None,
+    telemetry: Any,
+) -> None:
+    """Attach VAE records to the runtime config without affecting decoding."""
+
+    if telemetry is None or not getattr(telemetry, "records", None):
+        return
+    if not isinstance(runtime_config, dict):
+        return
+    execution = dict(runtime_config.get("execution") or {})
+    previous = execution.get("vae_telemetry")
+    previous_records = (
+        list(previous.get("records") or [])
+        if isinstance(previous, dict)
+        else []
+    )
+    records = previous_records + list(telemetry.records)
+    execution["vae_telemetry"] = {
+        "enabled": bool(getattr(telemetry, "enabled", False)),
+        "generation_id": getattr(telemetry, "generation_id", None),
+        "record_count": len(records),
+        "output_path": (
+            str(telemetry.output_path) if telemetry.output_path is not None else None
+        ),
+        "records": records,
+    }
+    runtime_config["execution"] = execution
+
+
 class H3VAEDecode:
     """H3 video decode node with explicit latent/VAE dtype reconciliation."""
 
@@ -2213,6 +2271,7 @@ class H3VAEDecode:
         device_id: int = 1,
         runtime_config: dict[str, Any] | None = None,
     ):
+        telemetry = _h3_phase_telemetry(runtime_config)
         try:
             configure_vae_phase(
                 vae,
@@ -2230,10 +2289,22 @@ class H3VAEDecode:
                 "vae_video_in",
                 tensor_name="video_latent.source",
             )
+            if telemetry is not None:
+                telemetry.record_phase(
+                    stage="vae_video_in_source",
+                    value=video_samples["samples"],
+                    tensor_name="video_latent.source",
+                )
             video_samples = _coerce_h3_video_samples(vae, video_samples)
             latent = _h3_move_for_consumer(
                 video_samples["samples"], device_id=int(device_id), role="video VAE"
             )
+            if telemetry is not None:
+                telemetry.record_phase(
+                    stage="vae_video_in",
+                    value=latent,
+                    tensor_name="video_latent",
+                )
             validate_finite(latent, "vae_video_in", tensor_name="video_latent")
             validate_finite(latent, "vae_video", tensor_name="video_latent")
             images = vae.decode(latent)
@@ -2243,10 +2314,24 @@ class H3VAEDecode:
             )
             validate_finite(images, "vae_video_out", tensor_name="video_frames")
             validate_finite(images, "vae_video", tensor_name="video_frames")
+            if telemetry is not None:
+                telemetry.record_phase(
+                    stage="vae_video_out",
+                    value=images,
+                    tensor_name="video_frames",
+                )
             images = _h3_video_images_to_comfy(images)
             # The encoder and CreateVideo do not need GPU-resident frames.
-            return (images.to("cpu"),)
+            output = images.to("cpu")
+            if telemetry is not None:
+                telemetry.record_phase(
+                    stage="vae_video_output",
+                    value=output,
+                    tensor_name="video_frames.cpu",
+                )
+            return (output,)
         finally:
+            _h3_store_phase_telemetry(runtime_config, telemetry)
             release_vae_phase(vae, role="video")
 
 
@@ -2278,6 +2363,7 @@ class H3AudioVAEDecode:
         device_id: int = 0,
         runtime_config: dict[str, Any] | None = None,
     ):
+        telemetry = _h3_phase_telemetry(runtime_config)
         try:
             configure_vae_phase(
                 vae,
@@ -2292,6 +2378,12 @@ class H3AudioVAEDecode:
             audio_samples = {
                 "samples": _h3_stream_tensor(samples, "audio"),
             }
+            if telemetry is not None:
+                telemetry.record_phase(
+                    stage="vae_audio_in_source",
+                    value=audio_samples["samples"],
+                    tensor_name="audio_latent.source",
+                )
             validate_finite(
                 audio_samples["samples"],
                 "vae_audio_in",
@@ -2300,6 +2392,12 @@ class H3AudioVAEDecode:
             audio_tensor = _h3_move_for_consumer(
                 audio_samples["samples"], device_id=int(device_id), role="audio VAE"
             )
+            if telemetry is not None:
+                telemetry.record_phase(
+                    stage="vae_audio_in",
+                    value=audio_tensor,
+                    tensor_name="audio_latent",
+                )
             validate_finite(audio_tensor, "vae_audio_in", tensor_name="audio_latent")
             validate_finite(audio_tensor, "vae_audio", tensor_name="audio_latent")
             audio = vae_decode_audio(vae, {"samples": audio_tensor})
@@ -2310,8 +2408,22 @@ class H3AudioVAEDecode:
             )
             validate_finite(audio, "vae_audio_out", tensor_name="audio_output")
             validate_finite(audio, "vae_audio", tensor_name="audio_output")
-            return (_h3_finite_audio(audio),)
+            if telemetry is not None:
+                telemetry.record_phase(
+                    stage="vae_audio_out",
+                    value=audio,
+                    tensor_name="audio_output",
+                )
+            output = _h3_finite_audio(audio)
+            if telemetry is not None:
+                telemetry.record_phase(
+                    stage="vae_audio_output",
+                    value=output,
+                    tensor_name="audio_output.sanitized",
+                )
+            return (output,)
         finally:
+            _h3_store_phase_telemetry(runtime_config, telemetry)
             release_vae_phase(vae, role="audio")
 
 

@@ -249,10 +249,15 @@ denoised prediction directly, so `denoised` is recorded as an explicit alias
 of `model_output`; no extra transformation is performed. To persist a
 machine-readable JSONL stream, also set
 `KAGGLE_H3_DIFFUSION_TELEMETRY_PATH=/path/to/diffusion_telemetry.jsonl`.
-Telemetry intentionally synchronizes and reduces each recorded CUDA tensor,
-so it is for INT8/FP8 numerical comparison and fault isolation, not production
-timing. Euler has no retained second-order history, so its history record is
-explicitly marked absent.
+Each floating-point record also includes its tensor shape and a
+`sha256_raw_contiguous` checksum of the tensor bytes. The same telemetry
+stream records VAE boundaries (`vae_video_in_source`, `vae_video_in`,
+`vae_video_out`, `vae_video_output`, and the corresponding audio stages), so a
+sampler latent can be compared with the exact values entering and leaving each
+decoder. Checksums intentionally copy each recorded tensor to CPU after
+synchronizing its CUDA device; this is diagnostic-only and should not be used
+for production timing. Euler has no retained second-order history, so its
+history record is explicitly marked absent.
 The sampler preserves that map by filtering the already-dispatched H3 model
 out of ComfyUI's subsequent global `load_models_gpu()` call. A lightweight
 monitor logs peak used/allocated/reserved memory for both GPUs and minimum CPU

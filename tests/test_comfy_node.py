@@ -604,6 +604,96 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         with self.assertRaisesRegex(RuntimeError, r"expected \[batch, time, height, width, 3\]"):
             module._h3_video_images_to_comfy(torch.zeros((1, 4, 2, 4, 5)))
 
+    def test_vae_boundaries_are_recorded_with_checksums(self):
+        module = load_node_module()
+        import sys
+        import types
+        import torch
+        from unittest.mock import patch
+
+        runtime_config = {
+            "execution": {
+                "diffusion_telemetry": {
+                    "generation_id": "telemetry-generation",
+                    "output_path": None,
+                }
+            }
+        }
+
+        class VideoVAE:
+            def decode(self, samples):
+                self.received = samples
+                return torch.ones((1, 2, 2, 3), dtype=torch.float32)
+
+        with patch.object(module, "configure_vae_phase"), patch.object(
+            module, "release_vae_phase"
+        ), patch.object(module, "_enable_h3_decode_weight_casting"), patch.object(
+            module, "_h3_move_for_consumer", side_effect=lambda tensor, **_: tensor
+        ), patch.dict(
+            os.environ, {"KAGGLE_H3_DIFFUSION_TELEMETRY": "1"}
+        ):
+            module.H3VAEDecode().decode(
+                VideoVAE(),
+                {"samples": torch.zeros((1, 4, 2, 2), dtype=torch.float32)},
+                device_id=1,
+                runtime_config=runtime_config,
+            )
+
+        video_telemetry = runtime_config["execution"]["vae_telemetry"]
+        video_stages = [record["stage"] for record in video_telemetry["records"]]
+        self.assertEqual(
+            video_stages,
+            [
+                "vae_video_in_source",
+                "vae_video_in",
+                "vae_video_out",
+                "vae_video_output",
+            ],
+        )
+        self.assertEqual(video_telemetry["generation_id"], "telemetry-generation")
+        self.assertTrue(all(record["checksum"] for record in video_telemetry["records"]))
+
+        audio_module = types.ModuleType("comfy_extras.nodes_audio")
+        audio_module.vae_decode_audio = lambda _vae, _samples: {
+            "waveform": torch.ones((1, 1, 4), dtype=torch.float32),
+            "sample_rate": 32000,
+        }
+        comfy_extras = types.ModuleType("comfy_extras")
+        comfy_extras.__path__ = []
+        with patch.dict(
+            sys.modules,
+            {"comfy_extras": comfy_extras, "comfy_extras.nodes_audio": audio_module},
+        ), patch.object(module, "configure_vae_phase"), patch.object(
+            module, "release_vae_phase"
+        ), patch.object(
+            module, "_h3_move_for_consumer", side_effect=lambda tensor, **_: tensor
+        ), patch.dict(
+            os.environ, {"KAGGLE_H3_DIFFUSION_TELEMETRY": "1"}
+        ):
+            module.H3AudioVAEDecode().decode(
+                object(),
+                {
+                    "samples": torch.zeros((1, 4, 2, 2), dtype=torch.float32),
+                    "_kaggle_h3_stream": "audio",
+                },
+                device_id=0,
+                runtime_config=runtime_config,
+            )
+
+        audio_telemetry = runtime_config["execution"]["vae_telemetry"]
+        audio_stages = [record["stage"] for record in audio_telemetry["records"]]
+        self.assertEqual(
+            audio_stages,
+            video_stages
+            + [
+                "vae_audio_in_source",
+                "vae_audio_in",
+                "vae_audio_out",
+                "vae_audio_output",
+            ],
+        )
+        self.assertTrue(all(record["checksum"] for record in audio_telemetry["records"]))
+
     def test_audio_vae_validates_before_and_after_decode_before_sanitization(self):
         module = load_node_module()
         import sys
