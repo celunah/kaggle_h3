@@ -58,7 +58,7 @@
       "vae": ["vae_video", 0],
       "audio_vae": ["vae_audio", 0],
       "mode": "Ref2VA",
-      "prompt": "Mode: Ref2VA.\nPreserve the subject identity from <Picture 1> and the forest composition from <Picture 2>.\nA short coherent video of the same red-haired traveler in a blue outdoor jacket walking slowly along the forest path at dawn. The camera makes a gentle push-in while mist drifts between the pine trees. The subject's face and body remain stable and consistent, with subtle natural movement in the hair and jacket. Keep the cool blue-green forest light and warm sunrise on the horizon consistent throughout. Natural synchronized ambient forest audio.",
+      "prompt": "Mode: Ref2VA.\nPreserve the subject identity from <Picture 1> and the open-field composition from <Picture 2>.\nA short coherent video of the same woman in a plain blue shirt standing in a bright open grassy field during clear daytime. She makes only a small natural movement, gently turns her head, and shifts her weight while remaining in the same place. Keep the face, hair, shirt, bright daylight, blue sky, flat horizon, and simple field stable throughout. Use a mostly static camera and simple synchronized outdoor ambience.",
       "seconds": 5.0,
       "size_preset": "360p",
       "aspect_ratio": "16:9",
