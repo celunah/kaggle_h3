@@ -156,6 +156,152 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
                 ref_video_audio_1="orphan-audio",
             )
 
+    def test_global_conditioning_routes_ref2va_autogrow_inputs_to_native(self):
+        module = load_node_module()
+        captured = {}
+
+        class Result:
+            result = ("positive", "latent")
+
+        class NativeRef2VA:
+            @classmethod
+            def execute(cls, **kwargs):
+                captured.update(kwargs)
+                return Result()
+
+        original_loader = module._native_ref2va_conditioning
+        module._native_ref2va_conditioning = lambda: NativeRef2VA
+        try:
+            result = module._execute_global_h3_conditioning(
+                clip="clip",
+                vae="video_vae",
+                audio_vae="audio_vae",
+                prompt="preserve the subject",
+                mode="Ref2VA",
+                width=640,
+                height=352,
+                length=124,
+                ref_image_size="match",
+                ref_images={
+                    "ref_image_0": "character",
+                    "ref_image_1": None,
+                },
+                ref_videos={"ref_video_0": "motion"},
+                ref_video_audios={"ref_video_audio_0": "motion-audio"},
+                ref_audios={"ref_audio_0": "voice"},
+            )
+        finally:
+            module._native_ref2va_conditioning = original_loader
+
+        self.assertEqual(result, ("positive", "latent"))
+        self.assertEqual(captured["ref_images"], {"ref_image_0": "character"})
+        self.assertEqual(captured["ref_videos"], {"ref_video_0": "motion"})
+        self.assertEqual(
+            captured["ref_video_audios"],
+            {"ref_video_audio_0": "motion-audio"},
+        )
+        self.assertEqual(captured["ref_audios"], {"ref_audio_0": "voice"})
+
+    def test_global_conditioning_routes_fl2va_start_and_end_frames(self):
+        module = load_node_module()
+        captured = {}
+
+        class Result:
+            result = ("positive", "latent")
+
+        class NativeFL2VA:
+            @classmethod
+            def execute(cls, **kwargs):
+                captured.update(kwargs)
+                return Result()
+
+        original_loader = module._native_fl2va_conditioning
+        module._native_fl2va_conditioning = lambda: NativeFL2VA
+        try:
+            result = module._execute_global_h3_conditioning(
+                clip="clip",
+                vae="video_vae",
+                audio_vae=None,
+                prompt="move from start to end",
+                mode="FL2VA",
+                width=640,
+                height=352,
+                length=124,
+                ref_image_size="match",
+                start_frame="start",
+                end_frame="end",
+            )
+        finally:
+            module._native_fl2va_conditioning = original_loader
+
+        self.assertEqual(result, ("positive", "latent"))
+        self.assertEqual(captured["first_frame"], "start")
+        self.assertEqual(captured["last_frame"], "end")
+
+    def test_global_conditioning_rejects_refs_in_fl2va_mode(self):
+        module = load_node_module()
+
+        with self.assertRaisesRegex(ValueError, "FL2VA accepts start_frame/end_frame only"):
+            module._execute_global_h3_conditioning(
+                clip="clip",
+                vae="video_vae",
+                audio_vae=None,
+                prompt="prompt",
+                mode="FL2VA",
+                width=640,
+                height=352,
+                length=124,
+                ref_image_size="match",
+                ref_images={"ref_image_0": "image"},
+            )
+
+    def test_global_conditioning_appends_ref2va_start_and_end_guides(self):
+        module = load_node_module()
+        guide_calls = []
+
+        class Result:
+            def __init__(self, *values):
+                self.result = values
+
+        class NativeRef2VA:
+            @classmethod
+            def execute(cls, **kwargs):
+                return Result("base-positive", "latent")
+
+        class NativeGuide:
+            @classmethod
+            def execute(cls, **kwargs):
+                guide_calls.append(kwargs)
+                return Result(f"guided-{len(guide_calls)}")
+
+        original_ref_loader = module._native_ref2va_conditioning
+        original_guide_loader = module._native_h3_add_guide
+        module._native_ref2va_conditioning = lambda: NativeRef2VA
+        module._native_h3_add_guide = lambda: NativeGuide
+        try:
+            result = module._execute_global_h3_conditioning(
+                clip="clip",
+                vae="video_vae",
+                audio_vae="audio_vae",
+                prompt="prompt",
+                mode="Ref2VA",
+                width=640,
+                height=352,
+                length=124,
+                ref_image_size="match",
+                start_frame="start",
+                end_frame="end",
+                ref_images={"ref_image_0": "image"},
+            )
+        finally:
+            module._native_ref2va_conditioning = original_ref_loader
+            module._native_h3_add_guide = original_guide_loader
+
+        self.assertEqual(result, ("guided-2", "latent"))
+        self.assertEqual([call["frame_idx"] for call in guide_calls], [0, 123])
+        self.assertEqual(guide_calls[0]["image"], "start")
+        self.assertEqual(guide_calls[1]["image"], "end")
+
     def test_explicit_loader_interfaces_have_phase_targets(self):
         module = load_node_module()
         loader_inputs = module.KaggleH3ShardedDiffusionLoader.INPUT_TYPES()["required"]

@@ -415,6 +415,7 @@ def install_h3_adapter_node(
         ],
         "node_ids": [
             "KaggleH3SmokeReference",
+            "KaggleH3Conditioning",
             "KaggleH3Ref2VAConditioning",
             "KaggleH3ShardedDiffusionLoader",
             "KaggleH3TextEncoderLoader",

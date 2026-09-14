@@ -23,19 +23,19 @@ ASPECT_RATIOS: dict[str, tuple[int, int]] = {
 
 WORKFLOW_REGISTRY: dict[str, dict[str, str]] = {
     "Ref2VA": {
-        "class_type": "KaggleH3Ref2VAConditioning",
+        "class_type": "KaggleH3Conditioning",
         "template": "workflows/kaggle_h3_ref2va.json",
         "model_role": "ref2va",
         "label": "Kaggle H3 | Ref2VA reference-to-video",
     },
     "FL2VA": {
-        "class_type": "MiniMaxH3ImageToVideo",
+        "class_type": "KaggleH3Conditioning",
         "template": "workflows/kaggle_h3_fl2va.json",
         "model_role": "fl2va",
         "label": "Kaggle H3 | FL2VA first/last-frame video",
     },
     "T2VA": {
-        "class_type": "MiniMaxH3ImageToVideo",
+        "class_type": "KaggleH3Conditioning",
         "template": "workflows/kaggle_h3_t2va.json",
         "model_role": "fl2va",
         "label": "Kaggle H3 | T2VA text-to-video",
@@ -384,14 +384,19 @@ def build_workflow(
         "clip": ["clip", 0],
         "vae": ["vae_video", 0],
         "prompt": build_prompt(request, canonical_mode),
+        "mode": "Ref2VA" if canonical_mode == "Ref2VA" else "FL2VA",
+        "seconds": float(request.duration_seconds),
+        "size_preset": quality_mode_to_ref2va_preset(request.quality_mode),
+        "aspect_ratio": (
+            request.aspect_ratio
+            if request.aspect_ratio in {"16:9", "4:3"}
+            else "16:9"
+        ),
+        "ref_image_size": request.ref_image_size,
     }
     if canonical_mode == "FL2VA":
         h3_inputs.update(
-            {
-                "width": width,
-                "height": height,
-                "length": length["actual_frames"],
-            }
+            {"width": width, "height": height, "length": length["actual_frames"]}
         )
         if request.first_frame is not None:
             node_id, output = _load_asset_node(
@@ -400,7 +405,7 @@ def build_workflow(
                 input_files,
                 90,
             )
-            h3_inputs["first_frame"] = [node_id, output]
+            h3_inputs["start_frame"] = [node_id, output]
         if request.last_frame is not None:
             node_id, output = _load_asset_node(
                 nodes,
@@ -408,8 +413,8 @@ def build_workflow(
                 input_files,
                 91,
             )
-            h3_inputs["last_frame"] = [node_id, output]
-        h3_class = "MiniMaxH3ImageToVideo"
+            h3_inputs["end_frame"] = [node_id, output]
+        h3_class = "KaggleH3Conditioning"
     elif canonical_mode == "Ref2VA":
         if request.aspect_ratio not in {"16:9", "4:3"}:
             raise ValueError(
@@ -419,7 +424,6 @@ def build_workflow(
         h3_inputs.update(
             {
                 "audio_vae": ["vae_audio", 0],
-                "seconds": float(request.duration_seconds),
                 "size_preset": quality_mode_to_ref2va_preset(request.quality_mode),
                 "aspect_ratio": request.aspect_ratio,
                 "ref_image_size": request.ref_image_size,
@@ -429,24 +433,20 @@ def build_workflow(
         for index, asset in enumerate(request.assets()):
             node_id, output = _load_asset_node(nodes, asset, input_files, index)
             if asset.media_type == "image":
-                h3_inputs[f"ref_image_{picture_index}"] = [node_id, output]
+                h3_inputs[f"ref_images.ref_image_{picture_index}"] = [node_id, output]
                 picture_index += 1
             elif asset.media_type == "video":
-                h3_inputs[f"ref_video_{video_index}"] = [node_id, output]
+                h3_inputs[f"ref_videos.ref_video_{video_index}"] = [node_id, output]
                 video_index += 1
             else:
-                h3_inputs[f"ref_audio_{audio_index}"] = [node_id, output]
+                h3_inputs[f"ref_audios.ref_audio_{audio_index}"] = [node_id, output]
                 audio_index += 1
-        h3_class = "KaggleH3Ref2VAConditioning"
+        h3_class = "KaggleH3Conditioning"
     else:
         h3_inputs.update(
-            {
-                "width": width,
-                "height": height,
-                "length": length["actual_frames"],
-            }
+            {"width": width, "height": height, "length": length["actual_frames"]}
         )
-        h3_class = "MiniMaxH3ImageToVideo"
+        h3_class = "KaggleH3Conditioning"
     nodes["h3"] = {"class_type": h3_class, "inputs": h3_inputs}
     uses_adapter_stack = bool(
         request.turbo_mode
@@ -579,9 +579,9 @@ def build_workflow(
         )
         if node_id == "h3":
             label = (
-                "Kaggle H3 | Ref2VA Conditioning (Seconds + Presets)"
+                "Kaggle H3 | Global Conditioning (Ref2VA)"
                 if canonical_mode == "Ref2VA"
-                else f"Kaggle H3 | {canonical_mode} Conditioning"
+                else f"Kaggle H3 | Global Conditioning ({canonical_mode})"
             )
         elif node_id == "unet" and use_explicit_h3_loaders:
             selected_variant = "Ref2VA" if canonical_mode == "Ref2VA" else "FL2VA"

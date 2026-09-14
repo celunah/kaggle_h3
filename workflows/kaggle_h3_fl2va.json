@@ -36,18 +36,23 @@
     "_meta": {"title": "Input | Last Frame"}
   },
   "h3": {
-    "class_type": "MiniMaxH3ImageToVideo",
+    "class_type": "KaggleH3Conditioning",
     "inputs": {
       "clip": ["clip", 0],
       "vae": ["vae_video", 0],
+      "mode": "FL2VA",
+      "seconds": 5.0,
+      "size_preset": "360p",
+      "aspect_ratio": "16:9",
+      "ref_image_size": "match",
       "prompt": "The subject moves continuously from the first frame composition to the last frame composition with stable identity.",
       "width": 608,
       "height": 352,
       "length": 124,
-      "first_frame": ["first_frame", 0],
-      "last_frame": ["last_frame", 0]
+      "start_frame": ["first_frame", 0],
+      "end_frame": ["last_frame", 0]
     },
-    "_meta": {"title": "Kaggle H3 | FL2VA Conditioning"}
+    "_meta": {"title": "Kaggle H3 | Global Conditioning (FL2VA)"}
   },
   "phase": {
     "class_type": "KaggleH3PhaseDispatch",

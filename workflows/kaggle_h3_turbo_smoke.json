@@ -52,20 +52,21 @@
     "_meta": {"title": "Reference | Scene Image"}
   },
   "h3": {
-    "class_type": "KaggleH3Ref2VAConditioning",
+    "class_type": "KaggleH3Conditioning",
     "inputs": {
       "clip": ["clip", 0],
       "vae": ["vae_video", 0],
       "audio_vae": ["vae_audio", 0],
+      "mode": "Ref2VA",
       "prompt": "Mode: Ref2VA.\nPreserve the subject identity from <Picture 1> and the forest composition from <Picture 2>.\nA short coherent video of the same red-haired traveler in a blue outdoor jacket walking slowly along the forest path at dawn. The camera makes a gentle push-in while mist drifts between the pine trees. The subject's face and body remain stable and consistent, with subtle natural movement in the hair and jacket. Keep the cool blue-green forest light and warm sunrise on the horizon consistent throughout. Natural synchronized ambient forest audio.",
       "seconds": 5.0,
       "size_preset": "360p",
       "aspect_ratio": "16:9",
       "ref_image_size": "match",
-      "ref_image_0": ["character_reference", 0],
-      "ref_image_1": ["scene_reference", 0]
+      "ref_images.ref_image_0": ["character_reference", 0],
+      "ref_images.ref_image_1": ["scene_reference", 0]
     },
-    "_meta": {"title": "Kaggle H3 | Ref2VA Conditioning (Seconds + Presets)"}
+    "_meta": {"title": "Kaggle H3 | Global Conditioning (Ref2VA)"}
   },
   "h3_adapter": {
     "class_type": "KaggleH3AdapterStack",

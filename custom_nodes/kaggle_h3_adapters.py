@@ -293,6 +293,16 @@ except ImportError:
             H3DiffusionTelemetry = None  # type: ignore[assignment,misc]
 
 
+# ComfyUI's current MiniMax H3 nodes use the V3 schema.  Keep this import
+# optional so the legacy adapter module remains importable in dependency-light
+# tests and on older ComfyUI installations.
+try:
+    from comfy_api.latest import ComfyExtension as _H3ComfyExtension, io as _H3IO  # type: ignore
+except ImportError:
+    _H3ComfyExtension = None  # type: ignore[assignment,misc]
+    _H3IO = None  # type: ignore[assignment,misc]
+
+
 def _catalog():
     return load_catalog(CATALOG_PATH)
 
@@ -885,6 +895,366 @@ def _native_ref2va_conditioning():
             "that includes MiniMax H3 support."
         ) from exc
     return MiniMaxH3ReferenceToVideo
+
+
+def _native_fl2va_conditioning():
+    """Load ComfyUI's native FL2VA/T2VA conditioner only when needed."""
+
+    try:
+        from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Kaggle H3 Conditioning requires ComfyUI's native "
+            "comfy_extras.nodes_minimax_h3 module. Update ComfyUI to a build "
+            "that includes MiniMax H3 support."
+        ) from exc
+    return MiniMaxH3ImageToVideo
+
+
+def _native_h3_add_guide():
+    """Load the native arbitrary-frame H3 guide helper when required."""
+
+    try:
+        from comfy_extras.nodes_minimax_h3 import MiniMaxH3AddGuide  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Ref2VA start/end guides require ComfyUI's native "
+            "MiniMaxH3AddGuide node. Update ComfyUI to a build that includes "
+            "MiniMax H3 guide support."
+        ) from exc
+    return MiniMaxH3AddGuide
+
+
+def _compact_h3_autogrow(value: Any, name: str) -> dict[str, Any]:
+    """Normalize a V3 autogrow dictionary and omit disconnected sockets."""
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"Kaggle H3 Conditioning expected {name} to be an autogrow mapping; "
+            f"got {type(value).__name__}."
+        )
+    return {str(key): item for key, item in value.items() if item is not None}
+
+
+def _execute_global_h3_conditioning(
+    *,
+    clip: Any,
+    vae: Any,
+    audio_vae: Any,
+    prompt: str,
+    mode: str,
+    width: int,
+    height: int,
+    length: int,
+    ref_image_size: str,
+    start_frame: Any = None,
+    end_frame: Any = None,
+    ref_images: dict[str, Any] | None = None,
+    ref_videos: dict[str, Any] | None = None,
+    ref_video_audios: dict[str, Any] | None = None,
+    ref_audios: dict[str, Any] | None = None,
+) -> tuple[Any, Any]:
+    """Execute one global H3 conditioning contract for both model variants."""
+
+    normalized_mode = str(mode).strip()
+    if normalized_mode not in {"Ref2VA", "FL2VA"}:
+        raise ValueError(
+            f"Kaggle H3 Conditioning mode must be Ref2VA or FL2VA; got {mode!r}."
+        )
+    if not prompt or not str(prompt).strip():
+        raise ValueError("Kaggle H3 Conditioning prompt must not be empty")
+
+    images = _compact_h3_autogrow(ref_images, "ref_images")
+    videos = _compact_h3_autogrow(ref_videos, "ref_videos")
+    video_audios = _compact_h3_autogrow(ref_video_audios, "ref_video_audios")
+    audios = _compact_h3_autogrow(ref_audios, "ref_audios")
+    if normalized_mode == "FL2VA":
+        if images or videos or video_audios or audios:
+            raise ValueError(
+                "Kaggle H3 Conditioning FL2VA accepts start_frame/end_frame only. "
+                "Select Ref2VA for image, video, or audio references."
+            )
+        native = _native_fl2va_conditioning()
+        try:
+            result = native.execute(
+                clip=clip,
+                vae=vae,
+                prompt=prompt,
+                width=int(width),
+                height=int(height),
+                length=int(length),
+                first_frame=start_frame,
+                last_frame=end_frame,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Kaggle H3 FL2VA conditioning failed: {exc}") from exc
+        values = _node_output_values(result)
+        if len(values) != 2:
+            raise RuntimeError(
+                "Kaggle H3 native FL2VA conditioner did not return conditioning and latent"
+            )
+        return values[0], values[1]
+
+    if video_audios:
+        orphan_audio = sorted(
+            key
+            for key in video_audios
+            if f"ref_video_{key.rsplit('_', 1)[-1]}" not in videos
+        )
+        if orphan_audio:
+            raise ValueError(
+                "Each ref_video_audio_N must be connected with the matching "
+                f"ref_video_N; orphan audio slot(s): {', '.join(orphan_audio)}."
+            )
+    if (
+        not images
+        and not videos
+        and start_frame is None
+        and end_frame is None
+    ):
+        raise ValueError(
+            "Kaggle H3 Conditioning Ref2VA needs at least one image/video "
+            "reference or a start/end frame guide; audio alone is insufficient."
+        )
+
+    native = _native_ref2va_conditioning()
+    try:
+        result = native.execute(
+            clip=clip,
+            vae=vae,
+            audio_vae=audio_vae,
+            prompt=prompt,
+            width=int(width),
+            height=int(height),
+            length=int(length),
+            ref_image_size=ref_image_size,
+            ref_images=images,
+            ref_videos=videos,
+            ref_video_audios=video_audios,
+            ref_audios=audios,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Kaggle H3 Ref2VA conditioning failed: {exc}") from exc
+    values = _node_output_values(result)
+    if len(values) != 2:
+        raise RuntimeError(
+            "Kaggle H3 native Ref2VA conditioner did not return conditioning and latent"
+        )
+    conditioning, latent = values
+
+    # Ref2VA's native reference conditioner has no first/last-frame inputs.
+    # Use the native guide contract so these controls remain real conditioning
+    # rather than a UI-only label.  Guides are appended in temporal order.
+    guide = _native_h3_add_guide if (start_frame is not None or end_frame is not None) else None
+    if guide is not None:
+        guide_node = guide()
+        actual_frame_count = int(length)
+        if start_frame is not None:
+            guided = guide_node.execute(
+                positive=conditioning,
+                latent=latent,
+                frame_idx=0,
+                vae=vae,
+                image=start_frame,
+            )
+            conditioning = _node_output_values(guided)[0]
+        if end_frame is not None:
+            guided = guide_node.execute(
+                positive=conditioning,
+                latent=latent,
+                frame_idx=actual_frame_count - 1,
+                vae=vae,
+                image=end_frame,
+            )
+            conditioning = _node_output_values(guided)[0]
+    return conditioning, latent
+
+
+if _H3IO is not None:
+
+    class KaggleH3Conditioning(_H3IO.ComfyNode):  # type: ignore[misc, valid-type]
+        """One autogrowing H3 conditioning node for Ref2VA and FL2VA."""
+
+        @classmethod
+        def define_schema(cls):
+            autogrow_image = _H3IO.Autogrow.TemplatePrefix(
+                input=_H3IO.Image.Input(
+                    "ref_image",
+                    tooltip="Reference image; order becomes <Picture i>.",
+                ),
+                prefix="ref_image_",
+                min=0,
+                max=9,
+            )
+            autogrow_video = _H3IO.Autogrow.TemplatePrefix(
+                input=_H3IO.Image.Input(
+                    "ref_video",
+                    tooltip="Reference video frames; order becomes <Video i>.",
+                ),
+                prefix="ref_video_",
+                min=0,
+                max=3,
+            )
+            autogrow_video_audio = _H3IO.Autogrow.TemplatePrefix(
+                input=_H3IO.Audio.Input(
+                    "ref_video_audio",
+                    tooltip="Audio paired with the same-numbered reference video.",
+                ),
+                prefix="ref_video_audio_",
+                min=0,
+                max=3,
+            )
+            autogrow_audio = _H3IO.Autogrow.TemplatePrefix(
+                input=_H3IO.Audio.Input(
+                    "ref_audio",
+                    tooltip="Standalone reference audio.",
+                ),
+                prefix="ref_audio_",
+                min=0,
+                max=3,
+            )
+            return _H3IO.Schema(
+                node_id="KaggleH3Conditioning",
+                display_name="Kaggle H3 Conditioning",
+                category="conditioning/MiniMax H3",
+                description=(
+                    "Global H3 conditioning: prompt, Ref2VA/FL2VA mode, "
+                    "optional start/end frames, and auto-growing references."
+                ),
+                inputs=[
+                    _H3IO.Clip.Input("clip"),
+                    _H3IO.Vae.Input("vae", optional=True),
+                    _H3IO.Vae.Input("audio_vae", optional=True),
+                    _H3IO.Image.Input("start_frame", optional=True),
+                    _H3IO.Image.Input("end_frame", optional=True),
+                    _H3IO.Autogrow.Input(
+                        "ref_images", optional=True, template=autogrow_image
+                    ),
+                    _H3IO.Autogrow.Input(
+                        "ref_videos", optional=True, template=autogrow_video
+                    ),
+                    _H3IO.Autogrow.Input(
+                        "ref_video_audios",
+                        optional=True,
+                        template=autogrow_video_audio,
+                    ),
+                    _H3IO.Autogrow.Input(
+                        "ref_audios", optional=True, template=autogrow_audio
+                    ),
+                    _H3IO.String.Input(
+                        "prompt", multiline=True, dynamic_prompts=True
+                    ),
+                    _H3IO.Combo.Input(
+                        "mode", options=["Ref2VA", "FL2VA"], default="Ref2VA"
+                    ),
+                    _H3IO.Float.Input(
+                        "seconds",
+                        default=5.0,
+                        min=H3_MIN_FRAMES / 24.0,
+                        max=H3_MAX_SECONDS,
+                        step=0.001,
+                    ),
+                    _H3IO.Combo.Input(
+                        "size_preset",
+                        options=list(REF2VA_SIZE_PRESETS),
+                        default="360p",
+                    ),
+                    _H3IO.Combo.Input(
+                        "aspect_ratio",
+                        options=["16:9", "4:3"],
+                        default="16:9",
+                    ),
+                    _H3IO.Combo.Input(
+                        "ref_image_size", options=["match", "max"], default="match"
+                    ),
+                    # Advanced exact geometry overrides keep API-generated
+                    # graphs compatible with the older FL2VA fields; normal
+                    # interactive use should prefer seconds + presets.
+                    _H3IO.Int.Input("width", optional=True, min=32, max=8192, step=32),
+                    _H3IO.Int.Input("height", optional=True, min=32, max=8192, step=32),
+                    _H3IO.Int.Input("length", optional=True, min=5, max=3600, step=1),
+                ],
+                outputs=[
+                    _H3IO.Conditioning.Output(display_name="positive"),
+                    _H3IO.Latent.Output(),
+                ],
+            )
+
+        @classmethod
+        def execute(
+            cls,
+            clip,
+            prompt,
+            mode,
+            seconds,
+            size_preset,
+            aspect_ratio,
+            ref_image_size="match",
+            vae=None,
+            audio_vae=None,
+            start_frame=None,
+            end_frame=None,
+            ref_images=None,
+            ref_videos=None,
+            ref_video_audios=None,
+            ref_audios=None,
+            width=None,
+            height=None,
+            length=None,
+        ):
+            preset_width, preset_height = resolve_ref2va_dimensions(
+                size_preset, aspect_ratio
+            )
+            if (width is None) != (height is None):
+                raise ValueError(
+                    "Kaggle H3 Conditioning width and height overrides must be supplied together."
+                )
+            resolved_width = int(preset_width if width is None else width)
+            resolved_height = int(preset_height if height is None else height)
+            if resolved_width % 32 or resolved_height % 32:
+                raise ValueError(
+                    "Kaggle H3 Conditioning width and height must be multiples of 32."
+                )
+            duration = resolve_ref2va_length(seconds)
+            resolved_length = int(duration["actual_frames"] if length is None else length)
+            if resolved_length < H3_MIN_FRAMES or (resolved_length - 5) % 17:
+                raise ValueError(
+                    "Kaggle H3 Conditioning length must use H3's 17*k+5 frame grid."
+                )
+            print(
+                "[Kaggle H3] Global conditioning: "
+                f"mode={mode}, canvas={resolved_width}x{resolved_height}, "
+                f"requested_seconds={float(seconds):g}, "
+                f"frames={resolved_length}, "
+                f"actual_seconds={resolved_length / 24.0:.4f}, "
+                f"images={len(_compact_h3_autogrow(ref_images, 'ref_images'))}, "
+                f"videos={len(_compact_h3_autogrow(ref_videos, 'ref_videos'))}, "
+                f"audio={len(_compact_h3_autogrow(ref_audios, 'ref_audios'))}.",
+                flush=True,
+            )
+            conditioning, latent = _execute_global_h3_conditioning(
+                clip=clip,
+                vae=vae,
+                audio_vae=audio_vae,
+                prompt=prompt,
+                mode=mode,
+                width=resolved_width,
+                height=resolved_height,
+                length=resolved_length,
+                ref_image_size=ref_image_size,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                ref_images=ref_images,
+                ref_videos=ref_videos,
+                ref_video_audios=ref_video_audios,
+                ref_audios=ref_audios,
+            )
+            return _H3IO.NodeOutput(conditioning, latent)
+
+else:
+    KaggleH3Conditioning = None  # type: ignore[assignment,misc]
 
 
 def _node_output_values(result: Any) -> tuple[Any, ...]:
@@ -2096,6 +2466,19 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "KaggleH3VAEDecode": "Kaggle H3 | Video VAE Decode (GPU1)",
     "KaggleH3AudioVAEDecode": "Kaggle H3 | Audio VAE Decode (GPU0)",
 }
+
+
+if _H3ComfyExtension is not None and KaggleH3Conditioning is not None:
+
+    class KaggleH3ConditioningExtension(_H3ComfyExtension):  # type: ignore[misc, valid-type]
+        async def get_node_list(self):
+            return [KaggleH3Conditioning]
+
+
+    async def comfy_entrypoint():
+        """Expose the autogrowing global conditioner through ComfyUI V3."""
+
+        return KaggleH3ConditioningExtension()
 
 
 _install_standard_h3_decode_compatibility()

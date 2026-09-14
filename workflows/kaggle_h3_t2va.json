@@ -30,16 +30,21 @@
       "_meta": {"title": "Kaggle H3 | Audio VAE (GPU0)"}
   },
   "h3": {
-    "class_type": "MiniMaxH3ImageToVideo",
+    "class_type": "KaggleH3Conditioning",
     "inputs": {
       "clip": ["clip", 0],
       "vae": ["vae_video", 0],
+      "mode": "FL2VA",
       "prompt": "A calm subject test shot with stable identity and gentle ambient audio.",
+      "seconds": 5.0,
+      "size_preset": "360p",
+      "aspect_ratio": "16:9",
+      "ref_image_size": "match",
       "width": 608,
       "height": 352,
       "length": 124
     },
-    "_meta": {"title": "Kaggle H3 | T2VA Conditioning"}
+    "_meta": {"title": "Kaggle H3 | Global Conditioning (FL2VA / T2VA)"}
   },
   "phase": {
     "class_type": "KaggleH3PhaseDispatch",

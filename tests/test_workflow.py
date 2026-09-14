@@ -42,13 +42,13 @@ class WorkflowTests(unittest.TestCase):
             quality_mode="quick",
         )
         workflow = build_workflow(request)
-        self.assertEqual(workflow["h3"]["class_type"], "KaggleH3Ref2VAConditioning")
+        self.assertEqual(workflow["h3"]["class_type"], "KaggleH3Conditioning")
         self.assertIn("audio_vae", workflow["h3"]["inputs"])
         self.assertEqual(workflow["h3"]["inputs"]["seconds"], 5.0)
         self.assertEqual(workflow["h3"]["inputs"]["size_preset"], "360p")
         self.assertEqual(workflow["h3"]["inputs"]["aspect_ratio"], "16:9")
-        self.assertIn("ref_image_0", workflow["h3"]["inputs"])
-        self.assertIn("ref_image_1", workflow["h3"]["inputs"])
+        self.assertIn("ref_images.ref_image_0", workflow["h3"]["inputs"])
+        self.assertIn("ref_images.ref_image_1", workflow["h3"]["inputs"])
         self.assertIn("<Picture 1>", workflow["h3"]["inputs"]["prompt"])
         self.assertEqual(workflow["ref_00"]["_meta"]["title"], "Kaggle H3 | Character Reference")
         self.assertEqual(workflow["ref_01"]["_meta"]["title"], "Kaggle H3 | Scene Reference")
@@ -56,8 +56,11 @@ class WorkflowTests(unittest.TestCase):
 
     def test_keyframe_workflow_uses_current_native_inputs(self):
         workflow = build_workflow(H3Request("start to end", first_frame="first.png", last_frame="last.png"))
-        self.assertEqual(workflow["h3"]["class_type"], "MiniMaxH3ImageToVideo")
+        self.assertEqual(workflow["h3"]["class_type"], "KaggleH3Conditioning")
         self.assertNotIn("audio_vae", workflow["h3"]["inputs"])
+        self.assertEqual(workflow["h3"]["inputs"]["mode"], "FL2VA")
+        self.assertIn("start_frame", workflow["h3"]["inputs"])
+        self.assertIn("end_frame", workflow["h3"]["inputs"])
         self.assertEqual(workflow["sample"]["class_type"], "KaggleH3TurboSampler")
         self.assertEqual(workflow["sample"]["inputs"]["sampler_name"], "res_multistep")
         self.assertEqual(workflow["sample"]["inputs"]["synchronize_mode"], "full")
@@ -109,11 +112,11 @@ class WorkflowTests(unittest.TestCase):
             workflow["scene_reference"]["class_type"],
             "KaggleH3SmokeReference",
         )
-        self.assertEqual(workflow["h3"]["class_type"], "KaggleH3Ref2VAConditioning")
+        self.assertEqual(workflow["h3"]["class_type"], "KaggleH3Conditioning")
         self.assertEqual(workflow["h3_adapter"]["inputs"]["model_variant"], "ref2va")
         self.assertEqual(workflow["h3_adapter"]["inputs"]["adapter_1"], "h3_ref2va_turbo_4step_v0_1")
         self.assertEqual(workflow["sample"]["inputs"]["synchronize_mode"], "full")
-        self.assertIn("ref_image_0", workflow["h3"]["inputs"])
+        self.assertIn("ref_images.ref_image_0", workflow["h3"]["inputs"])
         self.assertEqual(workflow["h3"]["inputs"]["seconds"], 5.0)
 
 
