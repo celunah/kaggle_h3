@@ -103,6 +103,9 @@ class H3Request:
     adapter_3: str = "None"
     adapter_3_strength: float = 1.0
     conditioning_mode: str = "auto"
+    model_profile: str = "auto"
+    sage_attention: bool = False
+    synchronize_mode: str = "full"
 
     def assets(self) -> list[ReferenceAsset]:
         assets: list[ReferenceAsset] = []
@@ -349,6 +352,7 @@ def build_workflow(
         # it downloads the selected variant only when this graph executes.
         unet_inputs["model_variant"] = "Ref2VA" if canonical_mode == "Ref2VA" else "FL2VA"
         unet_inputs["precision"] = "int8_convrot"
+        unet_inputs["model_profile"] = request.model_profile
         unet_inputs.update({"gpu_0": int(device_ids[0]), "gpu_1": int(device_ids[1])})
         unet_class = "KaggleH3ShardedDiffusionLoader"
     else:
@@ -490,9 +494,10 @@ def build_workflow(
                 "conditioning": ["phase", 1] if use_explicit_h3_loaders else ["h3", 0],
                 "latent_image": ["phase", 2] if use_explicit_h3_loaders else ["h3", 1],
                 "noise_seed": int(request.seed),
-                "sampler_name": "euler" if request.turbo_mode else "res_multistep",
+                "sampler_name": "euler_dualclock" if request.turbo_mode else "res_multistep",
                 "steps": quality_steps(request),
-                "synchronize_mode": "full",
+                "synchronize_mode": request.synchronize_mode,
+                "sage_attention": bool(request.sage_attention),
             },
         }
     else:
@@ -508,7 +513,8 @@ def build_workflow(
                 "noise_seed": int(request.seed),
                 "sampler_name": "res_multistep",
                 "steps": quality_steps(request),
-                "synchronize_mode": "full",
+                "synchronize_mode": request.synchronize_mode,
+                "sage_attention": bool(request.sage_attention),
             },
         }
     # The stock H3 video VAE is an FP16 checkpoint.  Use the local decoder
@@ -574,10 +580,21 @@ def build_workflow(
             )
         elif node_id == "unet" and use_explicit_h3_loaders:
             selected_variant = "Ref2VA" if canonical_mode == "Ref2VA" else "FL2VA"
+            profile_label = (
+                "auto Singularity INT8"
+                if request.model_profile == "auto" and selected_variant == "Ref2VA"
+                else "auto official INT8"
+                if request.model_profile == "auto"
+                else request.model_profile
+            )
             label = (
                 "Kaggle H3 | Diffusion Auto Loader "
-                f"({selected_variant}; replaces inactive checkpoint)"
+                f"({selected_variant}; {profile_label}; replaces inactive checkpoint)"
             )
+        elif node_id == "sample":
+            sampler_label = "euler_dualclock" if request.turbo_mode else "res_multistep"
+            sage_label = "; SageAttention" if request.sage_attention else ""
+            label = f"Kaggle H3 | H3 Sampler ({sampler_label}{sage_label})"
         node["_meta"] = {"title": label}
     return nodes
 

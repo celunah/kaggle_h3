@@ -358,6 +358,7 @@ def install_h3_adapter_node(
     source_fp_diagnostics = project_root / "src" / "kaggle_h3" / "fp_diagnostics.py"
     source_model_manager = project_root / "src" / "kaggle_h3" / "model_manager.py"
     source_diffusion_telemetry = project_root / "src" / "kaggle_h3" / "diffusion_telemetry.py"
+    source_sage_attention = project_root / "src" / "kaggle_h3" / "sage_attention.py"
     sources = (
         source_node,
         source_conditioning,
@@ -369,6 +370,7 @@ def install_h3_adapter_node(
         source_fp_diagnostics,
         source_model_manager,
         source_diffusion_telemetry,
+        source_sage_attention,
     )
     missing = [str(path) for path in sources if not path.is_file()]
     if missing:
@@ -388,6 +390,7 @@ def install_h3_adapter_node(
         source_fp_diagnostics,
         source_model_manager,
         source_diffusion_telemetry,
+        source_sage_attention,
     )
     support_targets = tuple(support_dir / path.name for path in support_sources)
     support_init = support_dir / "__init__.py"

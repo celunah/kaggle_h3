@@ -36,6 +36,11 @@ H3_DIFFUSION_REVISION = os.environ.get(
     "KAGGLE_H3_MODEL_REVISION",
     "a98869194787969724c7425d95d0ed73ce9202af",
 )
+H3_SINGULARITY_REPOSITORY = "WarmBloodAban/Minimax-h3_Singularity"
+H3_SINGULARITY_REVISION = os.environ.get(
+    "KAGGLE_H3_SINGULARITY_REVISION",
+    "4150ff9",
+)
 
 
 @dataclass(frozen=True)
@@ -46,6 +51,8 @@ class H3DiffusionModelSpec:
     repository: str = H3_DIFFUSION_REPOSITORY
     revision: str = H3_DIFFUSION_REVISION
     sha256: str | None = None
+    profile: str = "base_h3"
+    repository_path: str | None = None
 
 
 H3_DIFFUSION_MODEL_SPECS: dict[str, H3DiffusionModelSpec] = {
@@ -74,7 +81,25 @@ H3_DIFFUSION_MODEL_ALTERNATIVES: dict[str, H3DiffusionModelSpec] = {
     ),
 }
 
+# The currently published Singularity repository contains a Ref2VA-only
+# pruned INT8 checkpoint.  It is intentionally not advertised as an FL2VA
+# replacement: selecting Singularity for FL2VA must fail before any file is
+# removed or downloaded.
+H3_SINGULARITY_DIFFUSION_SPECS: dict[str, H3DiffusionModelSpec] = {
+    "Ref2VA": H3DiffusionModelSpec(
+        variant="Ref2VA",
+        filename="Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors",
+        precision="int8_convrot",
+        repository=H3_SINGULARITY_REPOSITORY,
+        revision=H3_SINGULARITY_REVISION,
+        sha256="412a7b126595a958964193f3b42513d7cf2df4196ef04223a0f05e3622949cce",
+        profile="singularity",
+        repository_path="Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors",
+    ),
+}
+
 H3_DIFFUSION_PRECISIONS = ("auto", "fp8_scaled", "int8_convrot")
+H3_DIFFUSION_PROFILES = ("auto", "base_h3", "singularity")
 
 
 class H3DiffusionModelError(RuntimeError):
@@ -97,6 +122,7 @@ class H3DiffusionModelResult:
             "revision": self.spec.revision,
             "filename": self.spec.filename,
             "precision": self.spec.precision,
+            "profile": self.spec.profile,
             "precision_reason": self.precision_reason,
             "path": str(self.path),
             "downloaded": self.downloaded,
@@ -124,6 +150,19 @@ def canonical_h3_diffusion_precision(value: str) -> str:
         return "int8_convrot"
     raise H3DiffusionModelError(
         f"Unsupported H3 diffusion precision {value!r}; choose fp8_scaled or int8_convrot."
+    )
+
+
+def canonical_h3_diffusion_profile(value: str) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "").replace("_", "")
+    if normalized in {"auto", ""}:
+        return "auto"
+    if normalized in {"base", "baseh3", "official", "comfy"}:
+        return "base_h3"
+    if normalized in {"singularity", "h3singularity"}:
+        return "singularity"
+    raise H3DiffusionModelError(
+        f"Unsupported H3 diffusion profile {value!r}; choose auto, base_h3, or singularity."
     )
 
 
@@ -173,10 +212,37 @@ def select_h3_diffusion_precision(
 
 
 def h3_diffusion_spec(
-    value: str, *, precision: str = "int8_convrot"
+    value: str,
+    *,
+    precision: str = "int8_convrot",
+    profile: str = "base_h3",
 ) -> H3DiffusionModelSpec:
     variant = canonical_h3_diffusion_variant(value)
     selected_precision, _reason = select_h3_diffusion_precision(precision)
+    selected_profile = canonical_h3_diffusion_profile(profile)
+    if selected_profile == "auto":
+        profile_override = os.environ.get("KAGGLE_H3_MODEL_PROFILE", "").strip()
+        selected_profile = (
+            canonical_h3_diffusion_profile(profile_override)
+            if profile_override and profile_override.lower() != "auto"
+            else (
+                "singularity"
+                if variant == "Ref2VA" and selected_precision == "int8_convrot"
+                else "base_h3"
+            )
+        )
+    if selected_profile == "singularity":
+        if variant not in H3_SINGULARITY_DIFFUSION_SPECS:
+            raise H3DiffusionModelError(
+                "MiniMax H3 Singularity currently provides only a Ref2VA checkpoint; "
+                f"it cannot load {variant}. Select the base_h3 profile for FL2VA/T2VA."
+            )
+        if selected_precision != "int8_convrot":
+            raise H3DiffusionModelError(
+                "MiniMax H3 Singularity currently provides only the pinned pruned INT8 "
+                "checkpoint; select int8_convrot or the base_h3 profile."
+            )
+        return H3_SINGULARITY_DIFFUSION_SPECS[variant]
     if selected_precision == "fp8_scaled":
         return H3_DIFFUSION_MODEL_SPECS[variant]
     return H3_DIFFUSION_MODEL_ALTERNATIVES[variant]
@@ -185,8 +251,10 @@ def h3_diffusion_spec(
 def all_h3_diffusion_specs() -> tuple[H3DiffusionModelSpec, ...]:
     """Return every exact H3 diffusion filename this manager may remove."""
 
-    return tuple(H3_DIFFUSION_MODEL_SPECS.values()) + tuple(
-        H3_DIFFUSION_MODEL_ALTERNATIVES.values()
+    return (
+        tuple(H3_DIFFUSION_MODEL_SPECS.values())
+        + tuple(H3_DIFFUSION_MODEL_ALTERNATIVES.values())
+        + tuple(H3_SINGULARITY_DIFFUSION_SPECS.values())
     )
 
 
@@ -239,7 +307,7 @@ def _hf_resolve_url(spec: H3DiffusionModelSpec) -> str:
     repository = urllib.parse.quote(spec.repository, safe="/")
     # The local destination is already the diffusion_models directory, but
     # Hugging Face resolves paths relative to the repository root.
-    repository_path = f"{H3_DIFFUSION_REPOSITORY_DIRECTORY}/{spec.filename}"
+    repository_path = spec.repository_path or f"{H3_DIFFUSION_REPOSITORY_DIRECTORY}/{spec.filename}"
     filename = urllib.parse.quote(repository_path, safe="/")
     revision = urllib.parse.quote(spec.revision, safe="")
     return f"{endpoint}/{repository}/resolve/{revision}/{filename}?download=true"
@@ -341,10 +409,12 @@ class H3DiffusionModelManager:
         )
 
     def switch(
-        self, variant: str, *, precision: str = "auto"
+        self, variant: str, *, precision: str = "auto", profile: str = "base_h3"
     ) -> H3DiffusionModelResult:
         selected_precision, precision_reason = select_h3_diffusion_precision(precision)
-        spec = h3_diffusion_spec(variant, precision=selected_precision)
+        spec = h3_diffusion_spec(
+            variant, precision=selected_precision, profile=profile
+        )
         self.diffusion_dir.mkdir(parents=True, exist_ok=True)
         paths = self._known_paths()
         selected = paths[spec.filename]

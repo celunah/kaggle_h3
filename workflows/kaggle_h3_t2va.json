@@ -3,12 +3,13 @@
     "class_type": "KaggleH3ShardedDiffusionLoader",
     "inputs": {
       "model_variant": "FL2VA",
+      "model_profile": "auto",
       "precision": "int8_convrot",
       "weight_dtype": "default",
       "gpu_0": 0,
       "gpu_1": 1
     },
-    "_meta": {"title": "Kaggle H3 | Diffusion Auto Loader (FL2VA; T2VA uses FL2VA)"}
+    "_meta": {"title": "Kaggle H3 | Diffusion Auto Loader (FL2VA; auto official INT8; T2VA)"}
   },
   "clip": {
       "class_type": "KaggleH3TextEncoderLoader",
@@ -53,7 +54,7 @@
   },
   "sample": {
     "class_type": "KaggleH3TurboSampler",
-    "inputs": {"model": ["phase", 0], "conditioning": ["phase", 1], "latent_image": ["phase", 2], "noise_seed": 42, "sampler_name": "res_multistep", "steps": 4, "synchronize_mode": "full"},
+    "inputs": {"model": ["phase", 0], "conditioning": ["phase", 1], "latent_image": ["phase", 2], "noise_seed": 42, "sampler_name": "res_multistep", "steps": 4, "synchronize_mode": "full", "sage_attention": false},
     "_meta": {"title": "Kaggle H3 | H3 Sampler"}
   },
   "decode": {

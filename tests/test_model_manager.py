@@ -6,6 +6,8 @@ from kaggle_h3.model_manager import (
     H3DiffusionModelError,
     H3DiffusionModelManager,
     _hf_resolve_url,
+    H3_SINGULARITY_DIFFUSION_SPECS,
+    canonical_h3_diffusion_profile,
     h3_diffusion_spec,
     select_h3_diffusion_precision,
 )
@@ -49,6 +51,31 @@ class DiffusionModelManagerTests(unittest.TestCase):
             h3_diffusion_spec("Ref2VA").filename,
             "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
         )
+
+    def test_auto_profile_selects_pinned_singularity_for_ref2va(self):
+        spec = h3_diffusion_spec("Ref2VA", profile="auto")
+        self.assertIs(spec, H3_SINGULARITY_DIFFUSION_SPECS["Ref2VA"])
+        self.assertEqual(spec.precision, "int8_convrot")
+        self.assertEqual(spec.profile, "singularity")
+        self.assertIn("/resolve/4150ff9/", _hf_resolve_url(spec))
+        self.assertNotIn("diffusion_models/", _hf_resolve_url(spec))
+
+    def test_auto_profile_keeps_explicit_fp8_on_base_checkpoint(self):
+        spec = h3_diffusion_spec(
+            "Ref2VA", precision="fp8_scaled", profile="auto"
+        )
+        self.assertEqual(spec.profile, "base_h3")
+        self.assertEqual(spec.precision, "fp8_scaled")
+
+    def test_singularity_profile_rejects_fl2va_and_fp8(self):
+        with self.assertRaisesRegex(H3DiffusionModelError, "only a Ref2VA checkpoint"):
+            h3_diffusion_spec("FL2VA", profile="singularity")
+        with self.assertRaisesRegex(H3DiffusionModelError, "only the pinned pruned INT8"):
+            h3_diffusion_spec("Ref2VA", profile="singularity", precision="fp8_scaled")
+
+    def test_profile_aliases_are_canonical(self):
+        self.assertEqual(canonical_h3_diffusion_profile("H3-Singularity"), "singularity")
+        self.assertEqual(canonical_h3_diffusion_profile("official"), "base_h3")
 
     def test_hugging_face_url_includes_comfy_diffusion_directory(self):
         spec = h3_diffusion_spec("Ref2VA")

@@ -49,6 +49,19 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(ref_eight.schedule_for(8)["shift_video"], 6.0)
         self.assertEqual(ref_eight.schedule_for(8)["resolution"], "768p")
 
+    def test_turbo_runtime_contract_selects_explicit_dual_clock_sampler(self):
+        model = FakeH3Model()
+        config = build_runtime_config(
+            model,
+            builtin_catalog(),
+            turbo_mode=True,
+            turbo_steps=4,
+            adapter_slots=(("h3_fl2va_turbo_4step_v1_0_768p", 1.0), ("None", 1.0)),
+        )
+        self.assertEqual(config["sampler"]["sampler_name"], "euler_dualclock")
+        self.assertEqual(config["sampler"]["base_sampler_name"], "euler")
+        self.assertTrue(config["sampler"]["dual_clock"])
+
     def test_invalid_metadata_rejects_unsafe_or_unsupported_files(self):
         base = {
             "adapter_id": "bad",

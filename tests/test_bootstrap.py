@@ -39,6 +39,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertTrue((support_dir / "__init__.py").is_file())
             self.assertTrue((support_dir / "phase_runtime.py").is_file())
             self.assertTrue((support_dir / "diffusion_telemetry.py").is_file())
+            self.assertTrue((support_dir / "sage_attention.py").is_file())
             self.assertEqual(result["support_package"], str(support_dir))
             script = """
 import importlib.util

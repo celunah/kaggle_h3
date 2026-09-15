@@ -294,6 +294,41 @@ except ImportError:
             H3DiffusionTelemetry = None  # type: ignore[assignment,misc]
 
 
+try:
+    from kaggle_h3.sage_attention import (
+        H3SageAttentionError,
+        h3_sage_attention,
+        sage_attention_status,
+    )
+except ImportError:
+    try:
+        from kaggle_h3_support.sage_attention import (  # type: ignore
+            H3SageAttentionError,
+            h3_sage_attention,
+            sage_attention_status,
+        )
+    except ImportError:
+        try:
+            from kaggle_h3_sage_attention import (  # type: ignore
+                H3SageAttentionError,
+                h3_sage_attention,
+                sage_attention_status,
+            )
+        except ImportError:
+            sage_path = Path(__file__).with_name("kaggle_h3_sage_attention.py")
+            sage_spec = importlib.util.spec_from_file_location(
+                "kaggle_h3_sage_attention", sage_path
+            )
+            if sage_spec is None or sage_spec.loader is None or not sage_path.is_file():
+                raise ImportError(f"Cannot load standalone H3 SageAttention helper: {sage_path}")
+            sage_module = importlib.util.module_from_spec(sage_spec)
+            sys.modules[sage_spec.name] = sage_module
+            sage_spec.loader.exec_module(sage_module)
+            H3SageAttentionError = sage_module.H3SageAttentionError
+            h3_sage_attention = sage_module.h3_sage_attention
+            sage_attention_status = sage_module.sage_attention_status
+
+
 # ComfyUI's current MiniMax H3 nodes use the V3 schema.  Keep this import
 # optional so the legacy adapter module remains importable in dependency-light
 # tests and on older ComfyUI installations.
@@ -802,7 +837,9 @@ def _h3_euler_with_telemetry(
     return x
 
 
-def _h3_prepare_sampler(sampler_name: str, sampler: Any) -> Any:
+def _h3_prepare_sampler(
+    sampler_name: str, sampler: Any, *, dual_clock: bool = False
+) -> Any:
     """Install H3 sampler wrappers while preserving ComfyUI's equations.
 
     Base H3 ``res_multistep`` uses the owned-history implementation. Turbo's
@@ -821,11 +858,19 @@ def _h3_prepare_sampler(sampler_name: str, sampler: Any) -> Any:
             return _h3_euler_with_telemetry(*args, **kwargs)
 
         sampler.sampler_function = euler_sampler_with_optional_telemetry
-        print(
-            "[Kaggle H3] Turbo Euler preserves ComfyUI execution unless "
-            "diffusion telemetry is enabled.",
-            flush=True,
-        )
+        if dual_clock:
+            print(
+                "[Kaggle H3] euler_dualclock selected: using stock Euler with "
+                "native ModelSamplingAV video/audio clocks (12.0/3.0 or the "
+                "Turbo schedule's explicit shifts).",
+                flush=True,
+            )
+        else:
+            print(
+                "[Kaggle H3] Turbo Euler preserves ComfyUI execution unless "
+                "diffusion telemetry is enabled.",
+                flush=True,
+            )
         return sampler
 
     if sampler_name != "res_multistep":
@@ -1779,6 +1824,13 @@ class KaggleH3ShardedDiffusionLoader:
         return {
             "required": {
                 "model_variant": (["FL2VA", "Ref2VA"], {"default": "Ref2VA"}),
+                "model_profile": (
+                    ["auto", "singularity", "base_h3"],
+                    {
+                        "default": "auto",
+                        "tooltip": "Auto selects Singularity INT8 for Ref2VA and the official H3 checkpoint for FL2VA/T2VA.",
+                    },
+                ),
                 "precision": (
                     ["auto", "fp8_scaled", "int8_convrot"],
                     {
@@ -1800,6 +1852,7 @@ class KaggleH3ShardedDiffusionLoader:
     def load_model(
         self,
         model_variant: str,
+        model_profile: str = "auto",
         precision: str = "int8_convrot",
         weight_dtype: str = "default",
         gpu_0: int = 0,
@@ -1815,7 +1868,9 @@ class KaggleH3ShardedDiffusionLoader:
             _release_comfy_model_cache_before_h3_switch()
             diffusion_dir = h3_diffusion_directory_from_comfy()
             switch = H3DiffusionModelManager(diffusion_dir).switch(
-                str(model_variant), precision=str(precision)
+                str(model_variant),
+                precision=str(precision),
+                profile=str(model_profile),
             )
         except H3DiffusionModelError as exc:
             raise H3PhaseError(f"Kaggle H3 diffusion auto-loader failed: {exc}") from exc
@@ -1836,6 +1891,7 @@ class KaggleH3ShardedDiffusionLoader:
             try:
                 setattr(owner, "h3_model_variant", switch.spec.variant.lower())
                 setattr(owner, "h3_diffusion_precision", switch.spec.precision)
+                setattr(owner, "h3_diffusion_profile", switch.spec.profile)
                 setattr(owner, "kaggle_h3_diffusion_path", str(switch.path))
                 setattr(owner, "kaggle_h3_diffusion_revision", switch.spec.revision)
             except Exception:
@@ -1844,6 +1900,7 @@ class KaggleH3ShardedDiffusionLoader:
             if isinstance(options, dict):
                 options["h3_model_variant"] = switch.spec.variant.lower()
                 options["h3_diffusion_precision"] = switch.spec.precision
+                options["h3_diffusion_profile"] = switch.spec.profile
                 options["kaggle_h3_diffusion_path"] = str(switch.path)
         if phase_policy() == "off":
             print(
@@ -1863,6 +1920,7 @@ class KaggleH3ShardedDiffusionLoader:
         print(
             "[Kaggle H3] H3 diffusion auto-loader selected: "
             f"variant={switch.spec.variant}, precision={switch.spec.precision}, "
+            f"profile={switch.spec.profile}, "
             f"precision_reason={switch.precision_reason}, checkpoint={switch.path}, "
             f"downloaded={switch.downloaded}, removed={len(switch.removed)}, "
             f"loader_device=cpu, phase_gpus={list(ids)}.",
@@ -2586,11 +2644,24 @@ class H3TurboSampler:
                 "conditioning": ("CONDITIONING",),
                 "latent_image": ("LATENT",),
                 "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
-                "sampler_name": (["res_multistep", "euler"], {"default": "res_multistep"}),
+                "sampler_name": (
+                    ["res_multistep", "euler_dualclock", "euler"],
+                    {
+                        "default": "res_multistep",
+                        "tooltip": "euler_dualclock uses H3's separate video/audio clock shifts through ModelSamplingAV.",
+                    },
+                ),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 200}),
                 "synchronize_mode": (
                     ["full", "safe", "fast"],
                     {"default": "full"},
+                ),
+                "sage_attention": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Opt-in SageAttention for the H3 transformer only; VAE attention is unchanged.",
+                    },
                 ),
             },
             "optional": {
@@ -2615,7 +2686,7 @@ class H3TurboSampler:
             if sampler_name != "res_multistep":
                 raise RuntimeError(
                     "Base H3 sampling requires sampler 'res_multistep'; "
-                    "sampler 'euler' is reserved for Turbo."
+                    "samplers 'euler' and 'euler_dualclock' are reserved for Turbo."
                 )
             return (
                 {
@@ -2637,10 +2708,19 @@ class H3TurboSampler:
         if turbo.get("enabled"):
             if expected_steps not in (4, 8):
                 raise RuntimeError(f"H3 runtime config contains unsupported Turbo steps: {expected_steps!r}")
-            if sampler_name != schedule.get("sampler_name"):
+            expected_sampler_name = schedule.get("sampler_name")
+            compatible_euler_alias = {
+                str(sampler_name),
+                str(expected_sampler_name),
+            } == {"euler", "euler_dualclock"}
+            if sampler_name != expected_sampler_name and not compatible_euler_alias:
                 raise RuntimeError(
-                    f"H3 Turbo schedule requires sampler {schedule.get('sampler_name')!r}; got {sampler_name!r}"
+                    f"H3 Turbo schedule requires sampler {expected_sampler_name!r}; got {sampler_name!r}"
                 )
+            if sampler_name == "euler_dualclock" or expected_sampler_name == "euler_dualclock":
+                schedule["sampler_name"] = "euler_dualclock"
+                schedule["base_sampler_name"] = "euler"
+                schedule["dual_clock"] = True
         elif expected_steps is not None:
             raise RuntimeError("Non-Turbo H3 runtime config must not contain a Turbo step count")
         elif sampler_name != schedule.get("sampler_name", sampler_name):
@@ -2654,6 +2734,13 @@ class H3TurboSampler:
         """Apply H3's official clone-based AV sigma-shift operation."""
 
         import comfy.model_sampling  # type: ignore
+
+        if not hasattr(comfy.model_sampling, "ModelSamplingAV"):
+            raise RuntimeError(
+                "This ComfyUI build does not provide ModelSamplingAV, so the "
+                "H3 dual-clock sampler cannot be enabled. Update ComfyUI or "
+                "choose a compatible H3 build."
+            )
 
         shifted = model.clone()
 
@@ -2687,6 +2774,7 @@ class H3TurboSampler:
         sampler_name: str,
         steps: int = 20,
         synchronize_mode: str = "full",
+        sage_attention: bool = False,
     ):
         import comfy.sample  # type: ignore
         import comfy.samplers  # type: ignore
@@ -2739,9 +2827,13 @@ class H3TurboSampler:
                 str(schedule.get("scheduler", "simple")),
                 int(expected_steps),
             ).cpu()
+            sampler_backend_name = (
+                "euler" if sampler_name == "euler_dualclock" else sampler_name
+            )
             sampler = _h3_prepare_sampler(
-                sampler_name,
-                comfy.samplers.sampler_object(sampler_name),
+                sampler_backend_name,
+                comfy.samplers.sampler_object(sampler_backend_name),
+                dual_clock=bool(schedule.get("dual_clock", False)),
             )
             guider = Guider_Basic(sampling_model)
             guider.set_conds(conditioning)
@@ -2771,24 +2863,36 @@ class H3TurboSampler:
                 diffusion_telemetry
             )
             rmsnorm_report: dict[str, Any] = {}
+            sage_attention_report: dict[str, Any] = {}
             try:
-                with h3_rmsnorm_dtype_alignment() as rmsnorm_report:
-                    samples = guider.sample(
-                        Noise_RandomNoise(int(noise_seed)).generate_noise(latent),
-                        latent_image_tensor,
-                        sampler,
-                        sigmas,
-                        denoise_mask=noise_mask,
-                        callback=callback,
-                        disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
-                        seed=int(noise_seed),
-                    )
+                with h3_sage_attention(bool(sage_attention)) as sage_attention_report:
+                    with h3_rmsnorm_dtype_alignment() as rmsnorm_report:
+                        samples = guider.sample(
+                            Noise_RandomNoise(int(noise_seed)).generate_noise(latent),
+                            latent_image_tensor,
+                            sampler,
+                            sigmas,
+                            denoise_mask=noise_mask,
+                            callback=callback,
+                            disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
+                            seed=int(noise_seed),
+                        )
             finally:
                 _H3_DIFFUSION_TELEMETRY.reset(diffusion_telemetry_token)
                 _H3_SAMPLER_SYNCHRONIZATION_MODE.reset(synchronization_token)
             if isinstance(runtime_config, dict):
                 execution = dict(runtime_config.get("execution") or {})
                 execution["rmsnorm_dtype_alignment"] = dict(rmsnorm_report)
+                execution["sage_attention"] = dict(sage_attention_report)
+                execution["dual_clock_sampling"] = {
+                    "requested": bool(schedule.get("dual_clock", False)),
+                    "sampler_mode": sampler_name,
+                    "backend": "native_model_sampling_av"
+                    if schedule.get("dual_clock", False)
+                    else "not_requested",
+                    "video_shift": schedule.get("shift_video"),
+                    "audio_shift": schedule.get("shift_audio"),
+                }
                 if diffusion_telemetry is not None and diffusion_telemetry.enabled:
                     execution["diffusion_telemetry"] = diffusion_telemetry.summary()
                 runtime_config["execution"] = execution
@@ -2915,7 +3019,8 @@ class H3TurboSampler:
             f"[Kaggle H3] {resolved_mode} sampler consumed H3 runtime config: "
             f"turbo={bool(turbo.get('enabled'))}, steps={expected_steps}, "
             f"shift={schedule.get('shift_video')}/{schedule.get('shift_audio')}, "
-            f"synchronize={synchronize_mode}",
+            f"sampler={sampler_name}, dual_clock={bool(schedule.get('dual_clock', False))}, "
+            f"sage_attention={bool(sage_attention)}, synchronize={synchronize_mode}",
             flush=True,
         )
         return (video_output, audio_output, denoised)

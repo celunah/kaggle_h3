@@ -737,7 +737,9 @@ def build_runtime_config(
         schedule = {
             "steps": steps,
             "nfe": steps,
-            "sampler_name": "euler",
+            "sampler_name": "euler_dualclock",
+            "base_sampler_name": "euler",
+            "dual_clock": True,
             "scheduler": "simple",
             "shift_video": 6.0,
             "shift_audio": 3.0,
@@ -753,6 +755,16 @@ def build_runtime_config(
             "shift_audio": NORMAL_SHIFT_AUDIO,
             "source": "base_h3_schedule",
         }
+
+    # Turbo's fast schedule must be explicit in the graph.  The native H3
+    # ModelSamplingAV object carries the separate video/audio clocks, while
+    # the sampler name tells ComfyUI to select the dual-clock Euler path
+    # instead of merely changing a display label.
+    if turbo_mode:
+        schedule = dict(schedule)
+        schedule["base_sampler_name"] = schedule.get("base_sampler_name", "euler")
+        schedule["sampler_name"] = "euler_dualclock"
+        schedule["dual_clock"] = True
 
     applied_or_existing: list[dict[str, Any]] = []
     for metadata, strength, slot in selected:

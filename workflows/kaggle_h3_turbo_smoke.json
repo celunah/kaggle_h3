@@ -3,12 +3,13 @@
     "class_type": "KaggleH3ShardedDiffusionLoader",
     "inputs": {
       "model_variant": "Ref2VA",
+      "model_profile": "auto",
       "precision": "int8_convrot",
       "weight_dtype": "default",
       "gpu_0": 0,
       "gpu_1": 1
     },
-    "_meta": {"title": "Kaggle H3 | Diffusion Auto Loader (Ref2VA; replaces inactive checkpoint)"}
+    "_meta": {"title": "Kaggle H3 | Diffusion Auto Loader (Ref2VA; auto Singularity INT8)"}
   },
   "clip": {
     "class_type": "KaggleH3TextEncoderLoader",
@@ -91,8 +92,9 @@
       "conditioning": ["phase", 1],
       "latent_image": ["phase", 2],
       "noise_seed": 7,
-      "sampler_name": "euler",
-      "synchronize_mode": "full"
+      "sampler_name": "euler_dualclock",
+      "synchronize_mode": "full",
+      "sage_attention": false
     },
     "_meta": {"title": "Kaggle H3 | Turbo Sampler (4 steps)"}
   },

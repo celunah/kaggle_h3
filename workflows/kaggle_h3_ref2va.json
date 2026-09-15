@@ -3,12 +3,13 @@
     "class_type": "KaggleH3ShardedDiffusionLoader",
     "inputs": {
       "model_variant": "Ref2VA",
+      "model_profile": "auto",
       "precision": "int8_convrot",
       "weight_dtype": "default",
       "gpu_0": 0,
       "gpu_1": 1
     },
-    "_meta": {"title": "Kaggle H3 | Diffusion Auto Loader (Ref2VA; replaces inactive checkpoint)"}
+    "_meta": {"title": "Kaggle H3 | Diffusion Auto Loader (Ref2VA; auto Singularity INT8)"}
   },
   "clip": {
     "class_type": "KaggleH3TextEncoderLoader",
@@ -37,7 +38,7 @@
     "_meta": {"title": "Kaggle H3 | Global Conditioning (Ref2VA)"}
   },
   "phase": {"class_type": "KaggleH3PhaseDispatch", "inputs": {"model": ["unet", 0], "conditioning": ["h3", 0], "latent_image": ["h3", 1]}, "_meta": {"title": "Kaggle H3 | Transformer Dispatch Barrier"}},
-  "sample": {"class_type": "KaggleH3TurboSampler", "inputs": {"model": ["phase", 0], "conditioning": ["phase", 1], "latent_image": ["phase", 2], "noise_seed": 42, "sampler_name": "res_multistep", "steps": 4, "synchronize_mode": "full"}, "_meta": {"title": "Kaggle H3 | H3 Sampler"}},
+  "sample": {"class_type": "KaggleH3TurboSampler", "inputs": {"model": ["phase", 0], "conditioning": ["phase", 1], "latent_image": ["phase", 2], "noise_seed": 42, "sampler_name": "res_multistep", "steps": 4, "synchronize_mode": "full", "sage_attention": false}, "_meta": {"title": "Kaggle H3 | H3 Sampler"}},
   "decode": {"class_type": "KaggleH3VAEDecode", "inputs": {"samples": ["sample", 0], "vae": ["vae_video", 0], "device_id": 1}, "_meta": {"title": "Kaggle H3 | Video Decode (GPU1)"}},
   "decode_audio": {"class_type": "KaggleH3AudioVAEDecode", "inputs": {"samples": ["sample", 1], "vae": ["vae_audio", 0], "device_id": 0}, "_meta": {"title": "Kaggle H3 | Audio Decode (GPU0)"}},
   "video": {"class_type": "CreateVideo", "inputs": {"images": ["decode", 0], "fps": 24.0, "audio": ["decode_audio", 0], "bit_depth": 8, "color_space": "sRGB"}, "_meta": {"title": "Output | Video + Audio"}},

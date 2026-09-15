@@ -286,6 +286,34 @@ packed AV NestedTensor and avoids retaining the unused stream in each decoder.
 The audio decoder also reports and replaces non-finite VAE samples before the
 AAC mux boundary, preventing PyAV's opaque `avcodec_send_frame()` failure.
 
+### Singularity, dual-clock Euler, and SageAttention
+
+The native diffusion loader has a `model_profile` selector with an `auto`
+default. In `auto` mode, Ref2VA selects the pinned pruned INT8 MiniMax H3
+Singularity checkpoint from
+[`WarmBloodAban/Minimax-h3_Singularity`](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity)
+and FL2VA/T2VA selects the official Comfy-Org INT8 checkpoint. The currently
+published Singularity repository contains a Ref2VA checkpoint only, so an
+explicit Singularity + FL2VA selection is rejected before the loader removes
+or downloads anything. The model manager keeps the existing one-diffusion-file
+policy and downloads the selected file only when the loader executes.
+
+Turbo schedules use the explicit `euler_dualclock` sampler mode. It resolves to
+ComfyUI's Euler implementation while retaining H3's native `ModelSamplingAV`
+video/audio clock handling (`shift_video` and `shift_audio`); the runtime
+configuration records the selected mode and both shifts. Older graphs that say
+`euler` remain accepted as a compatibility alias, but new generated workflows
+use `euler_dualclock`.
+
+The sampler also exposes an opt-in `sage_attention` toggle. When enabled, the
+node requires ComfyUI's SageAttention integration and temporarily patches only
+the H3 transformer attention symbol. It restores the original function in the
+sampler cleanup path, does not patch VAE attention, and does not silently
+replace a missing backend. SageAttention is intentionally not a mandatory
+notebook dependency because its compiled Triton/CUDA build must match the
+running PyTorch and GPU environment. The upstream API and installation notes
+are in the [SageAttention repository](https://github.com/thu-ml/SageAttention).
+
 This remains experimental because ComfyUI's ordinary `ModelPatcher` also
 manages model loading. If Accelerate cannot coexist with the installed
 ComfyUI build, the barrier/sampler raises a clear dispatch error rather than

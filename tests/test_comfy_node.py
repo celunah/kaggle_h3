@@ -39,6 +39,7 @@ class ComfyNodeTests(unittest.TestCase):
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "fp_diagnostics.py", node_dir / "kaggle_h3_fp_diagnostics.py")
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "model_manager.py", node_dir / "kaggle_h3_model_manager.py")
             shutil.copy2(ROOT / "src" / "kaggle_h3" / "diffusion_telemetry.py", node_dir / "kaggle_h3_diffusion_telemetry.py")
+            shutil.copy2(ROOT / "src" / "kaggle_h3" / "sage_attention.py", node_dir / "kaggle_h3_sage_attention.py")
             shutil.copy2(ROOT / "custom_nodes" / "kaggle_h3_adapter_catalog.json", node_dir / "kaggle_h3_adapter_catalog.json")
             script = """
 import importlib.util
@@ -93,6 +94,11 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertEqual(module.H3AdapterStack.RETURN_TYPES, ("MODEL", "H3_RUNTIME_CONFIG"))
         self.assertEqual(module.H3TurboSampler.RETURN_TYPES, ("LATENT", "LATENT", "LATENT"))
         sampler_inputs = module.H3TurboSampler.INPUT_TYPES()["required"]
+        self.assertEqual(
+            sampler_inputs["sampler_name"][0],
+            ["res_multistep", "euler_dualclock", "euler"],
+        )
+        self.assertFalse(sampler_inputs["sage_attention"][1]["default"])
         self.assertEqual(sampler_inputs["synchronize_mode"][0], ["full", "safe", "fast"])
         self.assertEqual(sampler_inputs["synchronize_mode"][1]["default"], "full")
         self.assertEqual(
@@ -766,7 +772,8 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertEqual(workflow["phase"]["class_type"], "KaggleH3PhaseDispatch")
         self.assertEqual(workflow["sample"]["class_type"], "KaggleH3TurboSampler")
         self.assertEqual(workflow["sample"]["inputs"]["runtime_config"], ["phase", 3])
-        self.assertEqual(workflow["sample"]["inputs"]["sampler_name"], "euler")
+        self.assertEqual(workflow["sample"]["inputs"]["sampler_name"], "euler_dualclock")
+        self.assertFalse(workflow["sample"]["inputs"]["sage_attention"])
         self.assertNotIn("SamplerCustomAdvanced", {node["class_type"] for node in workflow.values()})
 
     def test_dedicated_sampler_consumes_selected_turbo_steps(self):
@@ -774,9 +781,9 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         config = {
             "schema_version": "kaggle_h3.runtime.v1",
             "turbo": {"enabled": True, "steps": 8},
-            "sampler": {"steps": 8, "sampler_name": "euler", "scheduler": "simple"},
+            "sampler": {"steps": 8, "sampler_name": "euler_dualclock", "scheduler": "simple", "dual_clock": True},
         }
-        _, steps = module.H3TurboSampler._resolve_sampling_parameters(config, "euler")
+        _, steps = module.H3TurboSampler._resolve_sampling_parameters(config, "euler_dualclock")
         self.assertEqual(steps, 8)
         with self.assertRaisesRegex(RuntimeError, "requires sampler"):
             module.H3TurboSampler._resolve_sampling_parameters(config, "res_multistep")
@@ -814,6 +821,11 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         module = load_node_module()
         with self.assertRaisesRegex(RuntimeError, "reserved for Turbo"):
             module.H3TurboSampler._resolve_sampling_parameters(None, "euler")
+
+    def test_dual_clock_sampler_uses_euler_backend_wrapper(self):
+        module = load_node_module()
+        sampler = types.SimpleNamespace(sampler_function=lambda *args, **kwargs: object())
+        self.assertIs(module._h3_prepare_sampler("euler", sampler, dual_clock=True), sampler)
 
     def test_res_multistep_history_isolated_from_reused_model_output_buffer(self):
         module = load_node_module()
