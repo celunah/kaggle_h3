@@ -12,6 +12,7 @@ from kaggle_h3.bootstrap import (
     download_selected_models,
     ensure_github_checkout,
     install_h3_adapter_node,
+    install_context_loop_node,
     model_file_status,
     required_model_files,
     stage_smoke_assets,
@@ -24,7 +25,11 @@ class BootstrapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             comfy_root = root / "ComfyUI"
-            result = install_h3_adapter_node(comfy_root, Path(__file__).parents[1])
+            result = install_h3_adapter_node(
+                comfy_root,
+                Path(__file__).parents[1],
+                install_context_loop=False,
+            )
 
             custom_nodes = comfy_root / "custom_nodes"
             self.assertEqual(
@@ -33,6 +38,7 @@ class BootstrapTests(unittest.TestCase):
                     "kaggle_h3_adapter_catalog.json",
                     "kaggle_h3_adapters.py",
                     "kaggle_h3_conditioning.py",
+                    "kaggle_h3_context_loop.py",
                 ],
             )
             support_dir = comfy_root / "kaggle_h3_support"
@@ -132,6 +138,28 @@ assert len(module.NODE_CLASS_MAPPINGS) == 10
             )
         self.assertEqual(result["status"], "would_clone")
         self.assertEqual(result["requested_ref"], "main")
+
+    def test_context_loop_install_is_separate_and_pinned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result = install_context_loop_node(
+                Path(temporary) / "ComfyUI",
+                dry_run=True,
+            )
+        self.assertEqual(result["status"], "would_clone")
+        self.assertEqual(len(result["requested_ref"]), 40)
+        self.assertIn("MiniMaxH3ChainContext", result["required_node_ids"])
+        self.assertEqual(result["generation_route"], "KaggleH3ContextLoopSampler")
+        required = set(result["required_node_ids"])
+        for role in (
+            "scene_chaining",
+            "context_propagation",
+            "checkpointing",
+            "review_reroll",
+            "recovery",
+            "final_assembly",
+        ):
+            self.assertTrue(result["node_roles"][role])
+            self.assertTrue(set(result["node_roles"][role]) <= required)
 
     def test_github_checkout_refuses_non_git_existing_directory(self):
         with tempfile.TemporaryDirectory() as temporary:

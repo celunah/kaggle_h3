@@ -9,5 +9,11 @@
     "ref": "main",
     "resolved_commit": "bce083929c135bdabd41679da3ddf6f409336ed3",
     "purpose": "Optional H3 sequence/head sharding in ComfyUI; not installed by default because the replicated DiT exceeds the T4 safety profile."
+  },
+  "context_loop": {
+    "repository": "https://github.com/ethanfel/ComfyUI-MiniMaxH3-Context-Loop.git",
+    "ref": "a8bb6c7b886312cc2821cd9959897d0088efdfe2",
+    "resolved_commit": "a8bb6c7b886312cc2821cd9959897d0088efdfe2",
+    "purpose": "Separate scene chaining, context propagation, checkpoint/review/recovery, and final assembly dependency; actual generation routes through KaggleH3ContextLoopSampler."
   }
 }

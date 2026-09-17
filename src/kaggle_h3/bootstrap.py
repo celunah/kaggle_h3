@@ -24,6 +24,13 @@ from .model_manager import H3_DIFFUSION_MODEL_SPECS
 
 COMFYUI_REPOSITORY = "https://github.com/Comfy-Org/ComfyUI.git"
 COMFYUI_REF = os.environ.get("KAGGLE_H3_COMFYUI_REF", "v0.34.0")
+CONTEXT_LOOP_REPOSITORY = (
+    "https://github.com/ethanfel/ComfyUI-MiniMaxH3-Context-Loop.git"
+)
+CONTEXT_LOOP_REF = os.environ.get(
+    "KAGGLE_H3_CONTEXT_LOOP_REF",
+    "a8bb6c7b886312cc2821cd9959897d0088efdfe2",
+)
 H3_MODEL_REPOSITORY = "Comfy-Org/MiniMax-H3"
 H3_MODEL_REVISION = os.environ.get(
     "KAGGLE_H3_MODEL_REVISION",
@@ -338,17 +345,27 @@ def install_comfyui_dependencies(
 
 
 def install_h3_adapter_node(
-    comfy_root: Path, project_root: Path, *, dry_run: bool = False
+    comfy_root: Path,
+    project_root: Path,
+    *,
+    dry_run: bool = False,
+    install_context_loop: bool | None = None,
 ) -> dict[str, Any]:
     """Install the H3 node and private support package.
 
-    Only the actual node module is copied into ``custom_nodes``. ComfyUI scans
+    Only the actual Kaggle node modules are copied into ``custom_nodes``. ComfyUI scans
     every top-level ``.py`` file there as a node module, so dependency-light
     helpers live in a private package beside the ComfyUI application instead.
     No model weights are copied and the operation never edits a checkpoint.
     """
 
+    if install_context_loop is None:
+        install_context_loop = os.environ.get(
+            "KAGGLE_H3_INSTALL_CONTEXT_LOOP", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+
     source_node = project_root / "custom_nodes" / "kaggle_h3_adapters.py"
+    source_context_loop_bridge = project_root / "custom_nodes" / "kaggle_h3_context_loop.py"
     source_conditioning = project_root / "custom_nodes" / "kaggle_h3_conditioning.py"
     source_core = project_root / "src" / "kaggle_h3" / "adapters.py"
     source_catalog = project_root / "custom_nodes" / "kaggle_h3_adapter_catalog.json"
@@ -361,6 +378,7 @@ def install_h3_adapter_node(
     source_sage_attention = project_root / "src" / "kaggle_h3" / "sage_attention.py"
     sources = (
         source_node,
+        source_context_loop_bridge,
         source_conditioning,
         source_core,
         source_catalog,
@@ -378,6 +396,7 @@ def install_h3_adapter_node(
     target_dir = comfy_root / "custom_nodes"
     target_files = (
         target_dir / "kaggle_h3_adapters.py",
+        target_dir / "kaggle_h3_context_loop.py",
         target_dir / "kaggle_h3_conditioning.py",
         target_dir / "kaggle_h3_adapter_catalog.json",
     )
@@ -431,9 +450,16 @@ def install_h3_adapter_node(
             "KaggleH3TurboSampler",
             "KaggleH3VAEDecode",
             "KaggleH3AudioVAEDecode",
+            "KaggleH3ContextLoopSampler",
         ],
+        "context_loop": None,
     }
     if dry_run:
+        if install_context_loop:
+            result["context_loop"] = install_context_loop_node(
+                comfy_root,
+                dry_run=True,
+            )
         return result
     target_dir.mkdir(parents=True, exist_ok=True)
     support_dir.mkdir(parents=True, exist_ok=True)
@@ -441,7 +467,8 @@ def install_h3_adapter_node(
         if legacy_target.is_file() or legacy_target.is_symlink():
             legacy_target.unlink()
     for source, target in zip(
-        (source_node, source_conditioning, source_catalog), target_files
+        (source_node, source_context_loop_bridge, source_conditioning, source_catalog),
+        target_files,
     ):
         shutil.copy2(source, target)
     support_init.write_text(
@@ -450,6 +477,86 @@ def install_h3_adapter_node(
     )
     for source, target in zip(support_sources, support_targets):
         shutil.copy2(source, target)
+    if install_context_loop:
+        result["context_loop"] = install_context_loop_node(
+            comfy_root,
+            dry_run=dry_run,
+        )
+    return result
+
+
+def install_context_loop_node(
+    comfy_root: Path,
+    *,
+    dry_run: bool = False,
+    repository: str = CONTEXT_LOOP_REPOSITORY,
+    ref: str = CONTEXT_LOOP_REF,
+) -> dict[str, Any]:
+    """Install Context Loop as an independent ComfyUI custom-node checkout.
+
+    The checkout is deliberately not copied into ``kaggle_h3`` and no source
+    files are vendored.  Context Loop owns scene state, checkpoint, review,
+    recovery, and assembly nodes; the Kaggle bridge owns the only generation
+    call and receives standard MODEL/CONDITIONING/LATENT contracts.
+    """
+
+    destination = Path(comfy_root) / "custom_nodes" / "ComfyUI-MiniMaxH3-Context-Loop"
+    result = ensure_github_checkout(
+        repository,
+        destination,
+        ref=ref,
+        dry_run=dry_run,
+    )
+    result["required_files"] = [
+        "__init__.py",
+        "chain_nodes.py",
+        "checkpoint_manager.py",
+    ]
+    result["required_node_ids"] = [
+        "MiniMaxH3ChainPlanModern",
+        "MiniMaxH3ChainLoopStart",
+        "MiniMaxH3ChainCurrent",
+        "MiniMaxH3ChainContext",
+        "MiniMaxH3ChainSegmentSave",
+        "MiniMaxH3ChainReview",
+        "MiniMaxH3ChainLoopEnd",
+        "MiniMaxH3ChainManifestLoad",
+        "MiniMaxH3ChainCheckpointManager",
+        "MiniMaxH3ChainAssemble",
+    ]
+    result["node_roles"] = {
+        "scene_chaining": [
+            "MiniMaxH3ChainPlanModern",
+            "MiniMaxH3ChainLoopStart",
+            "MiniMaxH3ChainCurrent",
+            "MiniMaxH3ChainLoopEnd",
+        ],
+        "context_propagation": ["MiniMaxH3ChainContext"],
+        "checkpointing": [
+            "MiniMaxH3ChainSegmentSave",
+            "MiniMaxH3ChainCheckpointManager",
+            "MiniMaxH3ChainManifestLoad",
+        ],
+        "review_reroll": ["MiniMaxH3ChainReview"],
+        "recovery": [
+            "MiniMaxH3ChainCheckpointManager",
+            "MiniMaxH3ChainManifestLoad",
+        ],
+        "final_assembly": ["MiniMaxH3ChainAssemble"],
+    }
+    result["generation_route"] = "KaggleH3ContextLoopSampler"
+    result["model_route"] = "KaggleH3ShardedDiffusionLoader"
+    if not dry_run:
+        missing = [
+            str(destination / relative)
+            for relative in result["required_files"]
+            if not (destination / relative).is_file()
+        ]
+        if missing:
+            raise RuntimeError(
+                "Context Loop checkout is missing required files: "
+                + ", ".join(missing)
+            )
     return result
 
 

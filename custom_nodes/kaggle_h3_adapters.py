@@ -3180,6 +3180,148 @@ class H3TurboSampler:
         return (video_output, audio_output, denoised)
 
 
+def _h3_context_loop_validate_runtime_config(
+    runtime_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Require the Context Loop bridge to use the production H3 profile."""
+
+    if not isinstance(runtime_config, dict):
+        raise RuntimeError(
+            "Kaggle H3 Context Loop generation requires H3_RUNTIME_CONFIG "
+            "from H3 Adapter Stack; it cannot fall back to a native sampler."
+        )
+    model = runtime_config.get("model") or {}
+    variant = str(model.get("variant") or "").strip().lower()
+    mode = str(model.get("conditioning_mode") or "").strip().lower()
+    turbo = runtime_config.get("turbo") or {}
+    if variant != "ref2va" or mode != "ref2va":
+        raise RuntimeError(
+            "Kaggle H3 Context Loop requires Singularity Ref2VA runtime "
+            f"configuration; got variant={variant!r}, conditioning_mode={mode!r}."
+        )
+    if not bool(turbo.get("enabled")):
+        raise RuntimeError(
+            "Kaggle H3 Context Loop requires the Singularity Turbo LoRA "
+            "runtime configuration."
+        )
+    execution = dict(runtime_config.get("execution") or {})
+    execution["context_loop"] = {
+        "dependency": "ComfyUI-MiniMaxH3-Context-Loop",
+        "conditioning_mode": "Ref2VA",
+        "model_profile": "singularity",
+        "generation_backend": "KaggleH3TurboSampler",
+        "scene_handoff": "external_chain_context_to_kaggle_h3_av_latent",
+        "fl2va_required": False,
+    }
+    runtime_config["execution"] = execution
+    return runtime_config
+
+
+def _h3_context_loop_pack_latent(
+    video_latent: dict[str, Any], audio_latent: dict[str, Any]
+) -> dict[str, Any]:
+    """Pack Kaggle's consumer-owned streams for Context Loop checkpoints."""
+
+    if not isinstance(video_latent, dict) or not isinstance(audio_latent, dict):
+        raise TypeError("Context Loop requires Kaggle H3 video and audio LATENT outputs.")
+    if "samples" not in video_latent or "samples" not in audio_latent:
+        raise ValueError("Context Loop latent streams must contain 'samples'.")
+    packed: dict[str, Any] = {
+        "samples": [video_latent["samples"], audio_latent["samples"]],
+        "type": "h3_av",
+        "_kaggle_h3_context_loop_backend": "singularity_ref2va",
+        "_kaggle_h3_streams": ("video", "audio"),
+    }
+    for key in ("downscale_ratio_spacial", "downscale_ratio_temporal"):
+        if key in video_latent:
+            packed[key] = video_latent[key]
+    return packed
+
+
+class KaggleH3ContextLoopSampler:
+    """Compatibility sampler for the separate Context Loop custom node.
+
+    Context Loop owns scene state, review, checkpoint, recovery, and assembly.
+    This node is the only generation edge in the integration: it delegates to
+    the existing Kaggle H3 sampler, preserving its phase-aware dual-T4
+    dispatcher, activation transfers, synchronization modes, VAE routing, and
+    CPU offload behavior.  Its packed first output is the AV latent contract
+    consumed by Context Loop's Segment Save and next-scene Context nodes.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "conditioning": ("CONDITIONING",),
+                "latent_image": ("LATENT",),
+                "noise_seed": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF},
+                ),
+                "sampler_name": (
+                    list(H3_EULER_SAMPLER_NAMES),
+                    {"default": "euler"},
+                ),
+                "steps": ("INT", {"default": 4, "min": 1, "max": 200}),
+                "synchronize_mode": (
+                    ["full", "safe", "fast"],
+                    {"default": "full"},
+                ),
+            },
+            "optional": {"runtime_config": ("H3_RUNTIME_CONFIG",)},
+        }
+
+    RETURN_TYPES = ("LATENT", "LATENT", "LATENT", "LATENT")
+    RETURN_NAMES = (
+        "sampled_latent",
+        "video_latent",
+        "audio_latent",
+        "denoised_output",
+    )
+    FUNCTION = "sample"
+    CATEGORY = "sampling/MiniMax H3/Context Loop"
+    DESCRIPTION = (
+        "Route Context Loop scene generation through Kaggle H3 Singularity "
+        "Ref2VA. Connect sampled_latent to Context Loop Segment Save, and "
+        "video_latent/audio_latent to the Kaggle VAE decode nodes."
+    )
+
+    def sample(
+        self,
+        model: Any,
+        conditioning: Any,
+        latent_image: dict[str, Any],
+        noise_seed: int,
+        sampler_name: str,
+        steps: int,
+        synchronize_mode: str,
+        runtime_config: dict[str, Any] | None = None,
+    ):
+        runtime_config = _h3_context_loop_validate_runtime_config(runtime_config)
+        video_latent, audio_latent, denoised = H3TurboSampler().sample(
+            model=model,
+            runtime_config=runtime_config,
+            conditioning=conditioning,
+            latent_image=latent_image,
+            noise_seed=noise_seed,
+            sampler_name=sampler_name,
+            steps=steps,
+            synchronize_mode=synchronize_mode,
+        )
+        sampled_latent = _h3_context_loop_pack_latent(video_latent, audio_latent)
+        if not isinstance(denoised, dict) or "samples" not in denoised:
+            denoised = sampled_latent
+        print(
+            "[Kaggle H3] Context Loop scene routed through Singularity Ref2VA "
+            f"backend; sampler={sampler_name}, steps={int(steps)}, "
+            "video/audio streams packed for checkpoint handoff.",
+            flush=True,
+        )
+        return sampled_latent, video_latent, audio_latent, denoised
+
+
 NODE_CLASS_MAPPINGS = {
     "KaggleH3SmokeReference": KaggleH3SmokeReference,
     "KaggleH3Ref2VAConditioning": KaggleH3Ref2VAConditioning,

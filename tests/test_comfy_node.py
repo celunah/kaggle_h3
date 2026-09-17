@@ -87,6 +87,7 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertIn("KaggleH3TurboSampler", module.NODE_CLASS_MAPPINGS)
         self.assertIn("KaggleH3VAEDecode", module.NODE_CLASS_MAPPINGS)
         self.assertIn("KaggleH3AudioVAEDecode", module.NODE_CLASS_MAPPINGS)
+        self.assertTrue(hasattr(module, "KaggleH3ContextLoopSampler"))
         inputs = module.H3AdapterStack.INPUT_TYPES()
         for name in ("adapter_1", "strength_1", "adapter_2", "strength_2", "adapter_3", "strength_3"):
             self.assertIn(name, inputs["required"])
@@ -109,6 +110,12 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertEqual(module.H3VAEDecode.INPUT_TYPES()["required"]["device_id"][1]["default"], 1)
         self.assertEqual(module.H3AudioVAEDecode.INPUT_TYPES()["required"]["device_id"][1]["default"], 0)
         self.assertFalse(module.H3AudioVAEDecode.INPUT_TYPES()["required"]["mute_generated_audio"][1]["default"])
+        context_sampler = module.KaggleH3ContextLoopSampler
+        self.assertEqual(
+            context_sampler.RETURN_NAMES,
+            ("sampled_latent", "video_latent", "audio_latent", "denoised_output"),
+        )
+        self.assertNotIn("sage_attention", context_sampler.INPUT_TYPES()["required"])
         ref2va_inputs = module.KaggleH3Ref2VAConditioning.INPUT_TYPES()
         self.assertEqual(ref2va_inputs["required"]["size_preset"][0], ["240p", "360p", "480p"])
         self.assertEqual(ref2va_inputs["required"]["aspect_ratio"][0], ["16:9", "4:3"])
@@ -162,6 +169,59 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
                 aspect_ratio="16:9",
                 ref_image_0="image-one",
                 ref_video_audio_1="orphan-audio",
+            )
+
+    def test_context_loop_bridge_routes_ref2va_and_preserves_av_handoff(self):
+        module = load_node_module()
+        runtime_config = {
+            "model": {
+                "variant": "ref2va",
+                "conditioning_mode": "Ref2VA",
+            },
+            "turbo": {"enabled": True, "steps": 4},
+        }
+        video = {"samples": "video-scene-2"}
+        audio = {"samples": "audio-scene-2"}
+        denoised = {"samples": "denoised-av"}
+        with patch.object(
+            module.H3TurboSampler,
+            "sample",
+            return_value=(video, audio, denoised),
+        ) as sample:
+            packed, output_video, output_audio, output_denoised = (
+                module.KaggleH3ContextLoopSampler().sample(
+                    model="singularity-model",
+                    conditioning="scene-2-conditioning",
+                    latent_image={"samples": ["previous-video", "previous-audio"]},
+                    noise_seed=7,
+                    sampler_name="euler",
+                    steps=4,
+                    synchronize_mode="safe",
+                    runtime_config=runtime_config,
+                )
+            )
+        self.assertEqual(sample.call_args.kwargs["model"], "singularity-model")
+        self.assertEqual(packed["samples"], ["video-scene-2", "audio-scene-2"])
+        self.assertEqual(output_video, video)
+        self.assertEqual(output_audio, audio)
+        self.assertEqual(output_denoised, denoised)
+        self.assertEqual(
+            runtime_config["execution"]["context_loop"]["conditioning_mode"],
+            "Ref2VA",
+        )
+        self.assertFalse(runtime_config["execution"]["context_loop"]["fl2va_required"])
+
+    def test_context_loop_bridge_rejects_non_ref2va_runtime(self):
+        module = load_node_module()
+        with self.assertRaisesRegex(RuntimeError, "requires Singularity Ref2VA"):
+            module._h3_context_loop_validate_runtime_config(
+                {
+                    "model": {
+                        "variant": "fl2va",
+                        "conditioning_mode": "FL2VA",
+                    },
+                    "turbo": {"enabled": True},
+                }
             )
 
     def test_global_conditioning_routes_ref2va_autogrow_inputs_to_native(self):
