@@ -312,10 +312,13 @@ or upscale branches; do not use those branches for this Kaggle profile.
 
 ### Optional SageAttention and latent upscale
 
-SageAttention is disabled by default. To install the T4-targeted optional
-backend, run `pip install -r requirements-sageattention-t4.txt` in the Kaggle
-environment, restart ComfyUI, and enable `Use SageAttention` on the Kaggle H3
-sampler. The integration accepts only SageAttention v1 with Triton 3.1 or 3.2
+SageAttention is disabled by default. The Kaggle notebook's existing
+dependency-install cell now installs `requirements-kaggle.txt`, which includes
+the pinned `requirements-sageattention-t4.txt` file and therefore installs
+SageAttention v1 (`1.0.6`) plus Triton `3.1` or `3.2` before ComfyUI starts.
+After restarting ComfyUI, enable `Use SageAttention` on the Kaggle H3 sampler.
+For a manual installation, run `pip install -r requirements-sageattention-t4.txt`
+in the Kaggle environment. The integration accepts only SageAttention v1 with Triton 3.1 or 3.2
 for the T4 path. It logs the backend, Triton version, GPU architecture, input
 dtype, owning CUDA device, and any fallback reason. Q/K/V are never moved or
 cast across devices by the attention wrapper; if the current block is not a

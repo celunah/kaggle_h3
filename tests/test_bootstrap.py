@@ -22,6 +22,17 @@ from kaggle_h3.bootstrap import (
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_kaggle_requirements_install_t4_attention_backend(self):
+        requirements = (Path(__file__).parents[1] / "requirements-kaggle.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("-r requirements-sageattention-t4.txt", requirements)
+        t4_requirements = (Path(__file__).parents[1] / "requirements-sageattention-t4.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("sageattention==1.0.6", t4_requirements)
+        self.assertIn("triton>=3.1,<3.3", t4_requirements)
+
     def test_h3_support_modules_are_not_installed_as_custom_nodes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -3,3 +3,9 @@ psutil>=5.9,<7
 huggingface_hub>=0.24,<1
 # Native phase-aware ComfyUI H3 dispatch uses Accelerate at generation time.
 accelerate>=1.8,<2
+
+# The Kaggle notebook installs this file before ComfyUI starts.  Include the
+# optional T4 attention backend there so the sampler toggle can actually find
+# SageAttention v1 and a supported Triton runtime.  The sampler still falls
+# back to normal attention if the optional installation or runtime probe fails.
+-r requirements-sageattention-t4.txt

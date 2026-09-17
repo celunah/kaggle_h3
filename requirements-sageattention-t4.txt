@@ -1,5 +1,5 @@
-# Optional T4-only attention backend. Keep this out of the default Kaggle
-# requirements because it compiles/installs Triton kernels and is not needed
-# for normal H3 execution.
+# Optional T4-only attention backend. The Kaggle notebook includes this file
+# through requirements-kaggle.txt so the runtime is present before ComfyUI
+# starts; the sampler toggle remains disabled unless explicitly enabled.
 sageattention==1.0.6
 triton>=3.1,<3.3
