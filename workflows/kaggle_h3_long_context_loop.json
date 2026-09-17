@@ -134,32 +134,13 @@
     },
     "_meta": {"title": "Long Video Workflow | Carry Visual + Audio Context Forward"}
   },
-  "core_bundle": {
-    "class_type": "Bundle (obvpm)",
-    "inputs": {
-      "names": "model\nruntime_config\nconditioning\nlatent_image",
-      "in_1": ["h3_adapter", 0],
-      "in_2": ["h3_adapter", 1],
-      "in_3": ["context", 0],
-      "in_4": ["context", 3]
-    },
-    "_meta": {"title": "Long Video Workflow | Bundle Scene Generation Wires"}
-  },
-  "core_unbundle": {
-    "class_type": "Unbundle (obvpm)",
-    "inputs": {
-      "in": ["core_bundle", 0],
-      "names": "model\nruntime_config\nconditioning\nlatent_image"
-    },
-    "_meta": {"title": "Long Video Workflow | Unbundle Scene Generation Wires"}
-  },
   "phase": {
     "class_type": "KaggleH3PhaseDispatch",
     "inputs": {
-      "model": ["core_unbundle", 0],
-      "runtime_config": ["core_unbundle", 1],
-      "conditioning": ["core_unbundle", 2],
-      "latent_image": ["core_unbundle", 3]
+      "model": ["h3_adapter", 0],
+      "runtime_config": ["h3_adapter", 1],
+      "conditioning": ["context", 0],
+      "latent_image": ["context", 3]
     },
     "_meta": {"title": "Long Video Workflow | Dual-T4 Scene Transformer Dispatch"}
   },

@@ -186,8 +186,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["upscale"]["class_type"], "KaggleH3LatentUpscale2x")
         self.assertFalse(workflow["upscale"]["inputs"]["enabled"])
         self.assertFalse(workflow["decode_audio"]["inputs"]["mute_generated_audio"])
-        self.assertEqual(workflow["core_bundle"]["class_type"], "Bundle (obvpm)")
-        self.assertEqual(workflow["core_unbundle"]["class_type"], "Unbundle (obvpm)")
+        self.assertNotIn("core_bundle", workflow)
+        self.assertNotIn("core_unbundle", workflow)
+        self.assertEqual(workflow["phase"]["inputs"]["model"], ["h3_adapter", 0])
+        self.assertEqual(workflow["phase"]["inputs"]["runtime_config"], ["h3_adapter", 1])
+        self.assertEqual(workflow["phase"]["inputs"]["conditioning"], ["h3", 0])
+        self.assertEqual(workflow["phase"]["inputs"]["latent_image"], ["h3", 1])
 
     def test_long_template_routes_context_loop_and_obvpm_bundle(self):
         root = Path(__file__).parents[1]
@@ -206,7 +210,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["loop_end"]["inputs"]["between_scene_cleanup"], "unload_models")
         self.assertEqual(workflow["decode"]["inputs"]["runtime_config"], ["phase", 3])
         self.assertEqual(workflow["decode_audio"]["inputs"]["runtime_config"], ["phase", 3])
-        self.assertEqual(workflow["core_bundle"]["class_type"], "Bundle (obvpm)")
+        self.assertNotIn("core_bundle", workflow)
+        self.assertNotIn("core_unbundle", workflow)
+        self.assertEqual(workflow["phase"]["inputs"]["model"], ["h3_adapter", 0])
+        self.assertEqual(workflow["phase"]["inputs"]["runtime_config"], ["h3_adapter", 1])
+        self.assertEqual(workflow["phase"]["inputs"]["conditioning"], ["context", 0])
+        self.assertEqual(workflow["phase"]["inputs"]["latent_image"], ["context", 3])
         plan = json.loads(workflow["plan"]["inputs"]["plan_json"])
         self.assertEqual(len(plan["shots"]), 4)
 
