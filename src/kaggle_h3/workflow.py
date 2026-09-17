@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from .bootstrap import COMMON_MODEL_FILES, MODE_MODEL_FILES
-from .ref2va import quality_mode_to_ref2va_preset
+from .adapters import AUTO_SINGULARITY_ADAPTER, MAX_TURBO_STEPS, MIN_TURBO_STEPS
+from .ref2va import quality_mode_to_ref2va_preset, resolve_ref2va_dimensions
 
 
 ASPECT_RATIOS: dict[str, tuple[int, int]] = {
@@ -28,22 +29,10 @@ WORKFLOW_REGISTRY: dict[str, dict[str, str]] = {
         "model_role": "ref2va",
         "label": "Kaggle H3 | Ref2VA reference-to-video",
     },
-    "FL2VA": {
-        "class_type": "KaggleH3Conditioning",
-        "template": "workflows/kaggle_h3_fl2va.json",
-        "model_role": "fl2va",
-        "label": "Kaggle H3 | FL2VA first/last-frame video",
-    },
-    "T2VA": {
-        "class_type": "KaggleH3Conditioning",
-        "template": "workflows/kaggle_h3_t2va.json",
-        "model_role": "fl2va",
-        "label": "Kaggle H3 | T2VA text-to-video",
-    },
 }
 
 WORKFLOW_NODE_LABELS: dict[str, str] = {
-    "unet": "Kaggle H3 | Diffusion Auto Loader (select FL2VA or Ref2VA)",
+    "unet": "Kaggle H3 | Singularity Ref2VA Diffusion Auto Loader",
     "clip": "Kaggle H3 | Text Encoder (GPU0)",
     "vae_video": "Kaggle H3 | Video VAE (GPU1)",
     "vae_audio": "Kaggle H3 | Audio VAE (GPU0)",
@@ -94,18 +83,19 @@ class H3Request:
     quality_mode: str = "medium"
     steps: int | None = None
     ref_image_size: str = "match"
-    turbo_mode: bool = False
+    turbo_mode: bool = True
     turbo_steps: int = 4
-    adapter_1: str = "None"
+    adapter_1: str = AUTO_SINGULARITY_ADAPTER
     adapter_1_strength: float = 1.0
     adapter_2: str = "None"
     adapter_2_strength: float = 1.0
     adapter_3: str = "None"
     adapter_3_strength: float = 1.0
-    conditioning_mode: str = "auto"
-    model_profile: str = "auto"
+    conditioning_mode: str = "Ref2VA"
+    model_profile: str = "singularity"
     sage_attention: bool = False
     synchronize_mode: str = "full"
+    mute_generated_audio: bool = False
 
     def assets(self) -> list[ReferenceAsset]:
         assets: list[ReferenceAsset] = []
@@ -165,6 +155,39 @@ def select_mode(request: H3Request) -> str:
     return "T2VA"
 
 
+def select_production_mode(request: H3Request) -> str:
+    """Validate the supported production contract and return Ref2VA."""
+
+    mode = select_mode(request)
+    if mode != "Ref2VA":
+        raise ValueError(
+            "The production Kaggle H3 workflow supports Ref2VA references only; "
+            "FL2VA/T2VA and first/last-frame endpoints are not available."
+        )
+    if not request.assets():
+        raise ValueError("The production Ref2VA workflow requires at least one image or video reference.")
+    if not request.turbo_mode:
+        raise ValueError("The production Kaggle H3 workflow requires Turbo mode.")
+    if request.conditioning_mode != "Ref2VA":
+        raise ValueError("The production Kaggle H3 workflow requires Ref2VA conditioning.")
+    if request.model_profile != "singularity":
+        raise ValueError("The production Kaggle H3 workflow requires the Singularity model profile.")
+    if request.sage_attention:
+        raise ValueError("SageAttention is not part of the production H3 profile yet.")
+    if request.width is not None or request.height is not None:
+        raise ValueError("Production H3 uses the 240p, 360p, and 480p presets; explicit dimensions are disabled.")
+    steps = int(request.steps if request.steps is not None else request.turbo_steps)
+    if not MIN_TURBO_STEPS <= steps <= MAX_TURBO_STEPS:
+        raise ValueError(
+            f"Production H3 steps must be between {MIN_TURBO_STEPS} and {MAX_TURBO_STEPS}; got {steps}."
+        )
+    if request.quality_mode.lower() not in {"quick", "medium", "full"}:
+        raise ValueError("quality_mode must be quick, medium, or full")
+    if request.aspect_ratio not in {"16:9", "4:3"}:
+        raise ValueError("Production Ref2VA supports only 16:9 and 4:3 aspect ratios.")
+    return mode
+
+
 def _ratio(request: H3Request) -> tuple[int, int]:
     value = request.aspect_ratio.strip().lower()
     if value == "auto":
@@ -178,13 +201,8 @@ def dimensions(request: H3Request) -> tuple[int, int]:
     if request.width and request.height:
         width, height = request.width, request.height
     else:
-        quality = request.quality_mode.lower()
-        area = {"quick": 608 * 352, "medium": 864 * 480, "full": 1344 * 768}.get(quality)
-        if area is None:
-            raise ValueError("quality_mode must be quick, medium, or full")
-        ratio_w, ratio_h = _ratio(request)
-        width = int((area * ratio_w / ratio_h) ** 0.5)
-        height = int(width * ratio_h / ratio_w)
+        preset = quality_mode_to_ref2va_preset(request.quality_mode)
+        width, height = resolve_ref2va_dimensions(preset, request.aspect_ratio)
     if width < 256 or height < 256:
         raise ValueError("H3 canvas dimensions must each be at least 256 pixels")
     return (_round_multiple(width, 32), _round_multiple(height, 32))
@@ -211,9 +229,12 @@ def frame_length(request: H3Request) -> dict[str, Any]:
 
 
 def quality_steps(request: H3Request) -> int:
-    if request.steps is not None:
-        return max(1, int(request.steps))
-    return {"quick": 4, "medium": 12, "full": 20}[request.quality_mode.lower()]
+    steps = int(request.steps if request.steps is not None else request.turbo_steps)
+    if not MIN_TURBO_STEPS <= steps <= MAX_TURBO_STEPS:
+        raise ValueError(
+            f"H3 steps must be between {MIN_TURBO_STEPS} and {MAX_TURBO_STEPS}; got {steps}."
+        )
+    return steps
 
 
 def build_prompt(request: H3Request, mode: str) -> str:
@@ -331,13 +352,14 @@ def build_workflow(
 ) -> dict[str, Any]:
     """Build ComfyUI's flat API-format graph for one H3 mode."""
 
-    mode = mode or select_mode(request)
-    normalized = mode.strip().upper()
-    if normalized not in {"REF2VA", "FL2VA", "T2VA"}:
-        raise ValueError(f"Unsupported H3 mode: {mode}")
-    canonical_mode = "Ref2VA" if normalized == "REF2VA" else "FL2VA" if normalized == "FL2VA" else "T2VA"
-    width, height = dimensions(request)
-    length = frame_length(request)
+    mode = mode or select_production_mode(request)
+    canonical_mode = str(mode).strip()
+    if canonical_mode != "Ref2VA":
+        raise ValueError(
+            "Production workflow construction is Ref2VA-only; FL2VA/T2VA are not supported."
+        )
+    select_production_mode(request)
+    dimensions(request)
     nodes: dict[str, Any] = {}
     use_explicit_h3_loaders = loader == "native"
     unet_inputs: dict[str, Any] = {
@@ -350,9 +372,9 @@ def build_workflow(
     elif use_explicit_h3_loaders:
         # The custom loader owns the mutually exclusive diffusion checkpoint:
         # it downloads the selected variant only when this graph executes.
-        unet_inputs["model_variant"] = "Ref2VA" if canonical_mode == "Ref2VA" else "FL2VA"
+        unet_inputs["model_variant"] = "Ref2VA"
         unet_inputs["precision"] = "int8_convrot"
-        unet_inputs["model_profile"] = request.model_profile
+        unet_inputs["model_profile"] = "singularity"
         unet_inputs.update({"gpu_0": int(device_ids[0]), "gpu_1": int(device_ids[1])})
         unet_class = "KaggleH3ShardedDiffusionLoader"
     else:
@@ -388,7 +410,7 @@ def build_workflow(
         "clip": ["clip", 0],
         "vae": ["vae_video", 0],
         "prompt": build_prompt(request, canonical_mode),
-        "mode": "Ref2VA" if canonical_mode == "Ref2VA" else "FL2VA",
+        "mode": "Ref2VA",
         "seconds": float(request.duration_seconds),
         "size_preset": quality_mode_to_ref2va_preset(request.quality_mode),
         "aspect_ratio": (
@@ -398,71 +420,50 @@ def build_workflow(
         ),
         "ref_image_size": request.ref_image_size,
     }
-    if canonical_mode == "FL2VA":
-        h3_inputs.update(
-            {"width": width, "height": height, "length": length["actual_frames"]}
+    if request.aspect_ratio not in {"16:9", "4:3"}:
+        raise ValueError(
+            "The production Ref2VA node supports only 16:9 and 4:3; "
+            f"got aspect_ratio={request.aspect_ratio!r}."
         )
-        if request.first_frame is not None:
-            h3_inputs["start_frame_file"] = _input_path(input_files, request.first_frame)
-        if request.last_frame is not None:
-            h3_inputs["end_frame_file"] = _input_path(input_files, request.last_frame)
-        h3_class = "KaggleH3Conditioning"
-    elif canonical_mode == "Ref2VA":
-        if request.aspect_ratio not in {"16:9", "4:3"}:
-            raise ValueError(
-                "The Ref2VA seconds/preset node supports only 16:9 and 4:3; "
-                f"got aspect_ratio={request.aspect_ratio!r}."
-            )
-        h3_inputs.update(
-            {
-                "audio_vae": ["vae_audio", 0],
-                "size_preset": quality_mode_to_ref2va_preset(request.quality_mode),
-                "aspect_ratio": request.aspect_ratio,
-                "ref_image_size": request.ref_image_size,
-            }
-        )
-        assets = request.assets()
-        if len(assets) > 15:
-            raise ValueError(
-                "Kaggle H3 Conditioning supports at most 15 inline reference rows "
-                "(the native H3 limits are 9 images, 3 videos, and 3 audio refs)."
-            )
-        for reference_index, asset in enumerate(assets):
-            if asset.media_type not in {"image", "video", "audio"}:
-                raise ValueError(f"Unsupported inline H3 reference type: {asset.media_type}")
-            h3_inputs[f"reference_{reference_index}"] = asset.media_type
-            h3_inputs[f"reference_{reference_index}.file"] = _input_path(
-                input_files, asset.path
-            )
-        h3_class = "KaggleH3Conditioning"
-    else:
-        h3_inputs.update(
-            {"width": width, "height": height, "length": length["actual_frames"]}
-        )
-        h3_class = "KaggleH3Conditioning"
-    nodes["h3"] = {"class_type": h3_class, "inputs": h3_inputs}
-    uses_adapter_stack = bool(
-        request.turbo_mode
-        or any(
-            adapter != "None"
-            for adapter in (request.adapter_1, request.adapter_2, request.adapter_3)
-        )
+    h3_inputs.update(
+        {
+            "audio_vae": ["vae_audio", 0],
+            "size_preset": quality_mode_to_ref2va_preset(request.quality_mode),
+            "aspect_ratio": request.aspect_ratio,
+            "ref_image_size": request.ref_image_size,
+        }
     )
+    assets = request.assets()
+    if len(assets) > 15:
+        raise ValueError(
+            "Kaggle H3 Conditioning supports at most 15 inline reference rows "
+            "(the native H3 limits are 9 images, 3 videos, and 3 audio refs)."
+        )
+    for reference_index, asset in enumerate(assets):
+        if asset.media_type not in {"image", "video", "audio"}:
+            raise ValueError(f"Unsupported inline H3 reference type: {asset.media_type}")
+        h3_inputs[f"reference_{reference_index}"] = asset.media_type
+        h3_inputs[f"reference_{reference_index}.file"] = _input_path(
+            input_files, asset.path
+        )
+    h3_class = "KaggleH3Conditioning"
+    nodes["h3"] = {"class_type": h3_class, "inputs": h3_inputs}
+    uses_adapter_stack = True
     if uses_adapter_stack:
         nodes["h3_adapter"] = {
             "class_type": "KaggleH3AdapterStack",
             "inputs": {
                 "model": ["unet", 0],
-                "model_variant": "ref2va" if canonical_mode == "Ref2VA" else "fl2va",
-                "turbo_mode": bool(request.turbo_mode),
-                "turbo_steps": str(request.turbo_steps),
+                "model_variant": "ref2va",
+                "turbo_mode": True,
+                "turbo_steps": int(quality_steps(request)),
                 "adapter_1": request.adapter_1,
                 "strength_1": float(request.adapter_1_strength),
                 "adapter_2": request.adapter_2,
                 "strength_2": float(request.adapter_2_strength),
                 "adapter_3": request.adapter_3,
                 "strength_3": float(request.adapter_3_strength),
-                "conditioning_mode": request.conditioning_mode,
+                "conditioning_mode": "Ref2VA",
             },
         }
         sample_model = ["h3_adapter", 0]
@@ -485,38 +486,19 @@ def build_workflow(
         }
         sample_model = ["phase", 0]
 
-    if uses_adapter_stack:
-        nodes["sample"] = {
-            "class_type": "KaggleH3TurboSampler",
-            "inputs": {
-                "model": sample_model,
-                "runtime_config": ["phase", 3] if use_explicit_h3_loaders else sample_runtime,
-                "conditioning": ["phase", 1] if use_explicit_h3_loaders else ["h3", 0],
-                "latent_image": ["phase", 2] if use_explicit_h3_loaders else ["h3", 1],
-                "noise_seed": int(request.seed),
-                "sampler_name": "euler_dualclock" if request.turbo_mode else "res_multistep",
-                "steps": quality_steps(request),
-                "synchronize_mode": request.synchronize_mode,
-                "sage_attention": bool(request.sage_attention),
-            },
-        }
-    else:
-        # Keep the same phase-aware sampler for base H3. With no runtime
-        # config it uses the normal 20-step H3 schedule, but it still owns
-        # transformer dispatch and release.
-        nodes["sample"] = {
-            "class_type": "KaggleH3TurboSampler",
-            "inputs": {
-                "model": sample_model,
-                "conditioning": ["phase", 1] if use_explicit_h3_loaders else ["h3", 0],
-                "latent_image": ["phase", 2] if use_explicit_h3_loaders else ["h3", 1],
-                "noise_seed": int(request.seed),
-                "sampler_name": "res_multistep",
-                "steps": quality_steps(request),
-                "synchronize_mode": request.synchronize_mode,
-                "sage_attention": bool(request.sage_attention),
-            },
-        }
+    nodes["sample"] = {
+        "class_type": "KaggleH3TurboSampler",
+        "inputs": {
+            "model": sample_model,
+            "runtime_config": ["phase", 3] if use_explicit_h3_loaders else sample_runtime,
+            "conditioning": ["phase", 1] if use_explicit_h3_loaders else ["h3", 0],
+            "latent_image": ["phase", 2] if use_explicit_h3_loaders else ["h3", 1],
+            "noise_seed": int(request.seed),
+            "sampler_name": "euler",
+            "steps": quality_steps(request),
+            "synchronize_mode": request.synchronize_mode,
+        },
+    }
     # The stock H3 video VAE is an FP16 checkpoint.  Use the local decoder
     # shim for native ComfyUI graphs so CPU-VAE offload can reconcile the
     # float32 sampler latent with the actual loaded VAE dtype.  The optional
@@ -535,29 +517,33 @@ def build_workflow(
             else int(device_ids[0]) if device_ids
             else 0
         )
-    nodes["decode_audio"] = {
-        "class_type": "KaggleH3AudioVAEDecode" if loader != "comfyui_sp" else "VAEDecodeAudio",
-        # The dedicated sampler output is the audio stream on GPU0. Keeping
-        # this separate from the video latent enables a direct GPU0 -> GPU1
-        # video handoff without retaining a packed AV NestedTensor.
-        "inputs": {"samples": ["sample", 1], "vae": ["vae_audio", 0]},
-    }
-    if loader != "comfyui_sp":
-        nodes["decode_audio"]["inputs"]["device_id"] = int(device_ids[0]) if device_ids else 0
+    if not request.mute_generated_audio:
+        nodes["decode_audio"] = {
+            "class_type": "KaggleH3AudioVAEDecode" if loader != "comfyui_sp" else "VAEDecodeAudio",
+            # The dedicated sampler output is the audio stream on GPU0. Keeping
+            # this separate from the video latent enables a direct GPU0 -> GPU1
+            # video handoff without retaining a packed AV NestedTensor.
+            "inputs": {"samples": ["sample", 1], "vae": ["vae_audio", 0]},
+        }
+        if loader != "comfyui_sp":
+            nodes["decode_audio"]["inputs"]["device_id"] = int(device_ids[0]) if device_ids else 0
     if uses_adapter_stack and loader != "comfyui_sp":
         nodes["decode"]["inputs"]["runtime_config"] = ["h3_adapter", 1]
-        nodes["decode_audio"]["inputs"]["runtime_config"] = ["h3_adapter", 1]
+        if "decode_audio" in nodes:
+            nodes["decode_audio"]["inputs"]["runtime_config"] = ["h3_adapter", 1]
+    video_inputs: dict[str, Any] = {
+        "images": ["decode", 0],
+        "fps": 24.0,
+        "bit_depth": 8,
+        # ComfyUI 0.34.0 exposes sRGB here; "auto" is not a valid choice
+        # in the CreateVideo node shipped by the Kaggle image.
+        "color_space": "sRGB",
+    }
+    if not request.mute_generated_audio:
+        video_inputs["audio"] = ["decode_audio", 0]
     nodes["video"] = {
         "class_type": "CreateVideo",
-        "inputs": {
-            "images": ["decode", 0],
-            "fps": 24.0,
-            "audio": ["decode_audio", 0],
-            "bit_depth": 8,
-            # ComfyUI 0.34.0 exposes sRGB here; "auto" is not a valid choice
-            # in the CreateVideo node shipped by the Kaggle image.
-            "color_space": "sRGB",
-        },
+        "inputs": video_inputs,
     }
     nodes["save"] = {
         "class_type": "SaveVideo",
@@ -573,28 +559,16 @@ def build_workflow(
             node_id, f"Kaggle H3 | {node_id}"
         )
         if node_id == "h3":
-            label = (
-                "Kaggle H3 | Global Conditioning (Ref2VA)"
-                if canonical_mode == "Ref2VA"
-                else f"Kaggle H3 | Global Conditioning ({canonical_mode})"
-            )
+            label = "Kaggle H3 | Global Conditioning (Singularity Ref2VA)"
         elif node_id == "unet" and use_explicit_h3_loaders:
-            selected_variant = "Ref2VA" if canonical_mode == "Ref2VA" else "FL2VA"
-            profile_label = (
-                "auto Singularity INT8"
-                if request.model_profile == "auto" and selected_variant == "Ref2VA"
-                else "auto official INT8"
-                if request.model_profile == "auto"
-                else request.model_profile
-            )
             label = (
-                "Kaggle H3 | Diffusion Auto Loader "
-                f"({selected_variant}; {profile_label}; replaces inactive checkpoint)"
+                "Kaggle H3 | Singularity Ref2VA INT8 Auto Loader "
+                "(replaces inactive checkpoint)"
             )
         elif node_id == "sample":
-            sampler_label = "euler_dualclock" if request.turbo_mode else "res_multistep"
-            sage_label = "; SageAttention" if request.sage_attention else ""
-            label = f"Kaggle H3 | H3 Sampler ({sampler_label}{sage_label})"
+            label = f"Kaggle H3 | Singularity Turbo Sampler (Euler; {quality_steps(request)} steps)"
+        elif node_id == "video" and request.mute_generated_audio:
+            label = "Kaggle H3 | Assemble Video (generated audio muted)"
         node["_meta"] = {"title": label}
     return nodes
 
@@ -610,6 +584,27 @@ def validate_workflow_shape(workflow: dict[str, Any]) -> dict[str, Any]:
     if "--gpu-only" in serialized:
         errors.append("workflow contains forbidden --gpu-only execution")
     return {"valid": not errors, "errors": errors, "node_count": len(workflow)}
+
+
+def validate_production_workflow_shape(workflow: dict[str, Any]) -> dict[str, Any]:
+    """Validate the deliberately narrow, user-facing production graph."""
+
+    result = validate_workflow_shape(workflow)
+    errors = list(result["errors"])
+    serialized = json.dumps(workflow, sort_keys=True).lower()
+    forbidden = {
+        "fl2va": "FL2VA",
+        "t2va": "T2VA",
+        "fp8": "FP8",
+        "720p": "720p",
+        "euler_dualclock": "dual-clock sampling",
+        "res_multistep": "non-Turbo res_multistep",
+        "sage_attention": "SageAttention",
+    }
+    for token, label in forbidden.items():
+        if token in serialized:
+            errors.append(f"production workflow contains forbidden {label} surface")
+    return {**result, "valid": not errors, "errors": errors}
 
 
 def workflow_sha256(workflow: dict[str, Any]) -> str:

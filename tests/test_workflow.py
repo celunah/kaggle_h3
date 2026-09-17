@@ -8,7 +8,8 @@ from kaggle_h3.workflow import (
     build_workflow,
     frame_length,
     select_mode,
-    validate_workflow_shape,
+    select_production_mode,
+    validate_production_workflow_shape,
 )
 from kaggle_h3.ref2va import resolve_ref2va_dimensions, resolve_ref2va_length
 
@@ -20,6 +21,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(select_mode(H3Request("refs", character_references=["a.png"])), "Ref2VA")
         with self.assertRaises(ValueError):
             select_mode(H3Request("mixed", first_frame="a.png", character_references=["b.png"]))
+        self.assertEqual(
+            select_production_mode(H3Request("refs", character_references=["a.png"])),
+            "Ref2VA",
+        )
+        with self.assertRaisesRegex(ValueError, "Ref2VA references only"):
+            select_production_mode(H3Request("text only"))
 
     def test_h3_frame_alignment(self):
         result = frame_length(H3Request("x", duration_seconds=5.0))
@@ -29,8 +36,11 @@ class WorkflowTests(unittest.TestCase):
     def test_ref2va_seconds_and_canvas_presets_are_h3_aligned(self):
         length = resolve_ref2va_length(5.0)
         self.assertEqual(length["actual_frames"], 124)
-        self.assertEqual(resolve_ref2va_dimensions("720p", "16:9"), (1280, 704))
+        self.assertEqual(resolve_ref2va_dimensions("240p", "16:9"), (448, 256))
+        self.assertEqual(resolve_ref2va_dimensions("360p", "16:9"), (640, 352))
         self.assertEqual(resolve_ref2va_dimensions("480p", "4:3"), (640, 480))
+        with self.assertRaises(ValueError):
+            resolve_ref2va_dimensions("720p", "16:9")
         with self.assertRaises(ValueError):
             resolve_ref2va_length(1.0)
 
@@ -45,7 +55,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["h3"]["class_type"], "KaggleH3Conditioning")
         self.assertIn("audio_vae", workflow["h3"]["inputs"])
         self.assertEqual(workflow["h3"]["inputs"]["seconds"], 5.0)
-        self.assertEqual(workflow["h3"]["inputs"]["size_preset"], "360p")
+        self.assertEqual(workflow["h3"]["inputs"]["size_preset"], "240p")
         self.assertEqual(workflow["h3"]["inputs"]["aspect_ratio"], "16:9")
         self.assertEqual(workflow["h3"]["inputs"]["reference_0"], "image")
         self.assertEqual(workflow["h3"]["inputs"]["reference_0.file"], "character.png")
@@ -56,38 +66,57 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("ref_01", workflow)
         self.assertEqual(workflow["phase"]["inputs"]["conditioning"], ["h3", 0])
         self.assertEqual(workflow["phase"]["inputs"]["latent_image"], ["h3", 1])
-        self.assertTrue(validate_workflow_shape(workflow)["valid"])
+        self.assertTrue(validate_production_workflow_shape(workflow)["valid"])
 
     def test_keyframe_workflow_uses_current_native_inputs(self):
-        workflow = build_workflow(H3Request("start to end", first_frame="first.png", last_frame="last.png"))
-        self.assertEqual(workflow["h3"]["class_type"], "KaggleH3Conditioning")
-        self.assertNotIn("audio_vae", workflow["h3"]["inputs"])
-        self.assertEqual(workflow["h3"]["inputs"]["mode"], "FL2VA")
-        self.assertEqual(workflow["h3"]["inputs"]["start_frame_file"], "first.png")
-        self.assertEqual(workflow["h3"]["inputs"]["end_frame_file"], "last.png")
-        self.assertEqual(workflow["phase"]["inputs"]["conditioning"], ["h3", 0])
-        self.assertEqual(workflow["phase"]["inputs"]["latent_image"], ["h3", 1])
-        self.assertEqual(workflow["sample"]["class_type"], "KaggleH3TurboSampler")
-        self.assertEqual(workflow["sample"]["inputs"]["sampler_name"], "res_multistep")
-        self.assertEqual(workflow["sample"]["inputs"]["synchronize_mode"], "full")
+        with self.assertRaisesRegex(ValueError, "Ref2VA references only"):
+            build_workflow(H3Request("start to end", first_frame="first.png", last_frame="last.png"))
+
+    def test_production_workflow_can_mute_generated_audio(self):
+        workflow = build_workflow(
+            H3Request(
+                "video only",
+                character_references=["character.png"],
+                mute_generated_audio=True,
+            )
+        )
+        self.assertNotIn("decode_audio", workflow)
+        self.assertNotIn("audio", workflow["video"]["inputs"])
+        self.assertTrue(validate_production_workflow_shape(workflow)["valid"])
+
+    def test_production_guard_rejects_legacy_runtime_options(self):
+        with self.assertRaisesRegex(ValueError, "requires Turbo mode"):
+            select_production_mode(
+                H3Request("base", character_references=["character.png"], turbo_mode=False)
+            )
+        with self.assertRaisesRegex(ValueError, "SageAttention"):
+            select_production_mode(
+                H3Request("sage", character_references=["character.png"], sage_attention=True)
+            )
+        with self.assertRaisesRegex(ValueError, "explicit dimensions"):
+            select_production_mode(
+                H3Request("geometry", character_references=["character.png"], width=640)
+            )
 
     def test_model_mode_names_are_case_insensitive(self):
         self.assertIn("ref2va", required_model_files("ref2va")["diffusion_model"][1].lower())
-        self.assertIn("fl2va", required_model_files("T2VA")["diffusion_model"][1].lower())
 
     def test_templates_are_valid_json(self):
         root = Path(__file__).parents[1]
         for path in (root / "workflows").glob("*.json"):
             payload = json.loads(path.read_text(encoding="utf-8"))
-            self.assertTrue(validate_workflow_shape(payload)["valid"], path)
+            self.assertTrue(validate_production_workflow_shape(payload)["valid"], path)
 
     def test_native_h3_workflow_uses_dtype_safe_video_decode_node(self):
-        workflow = build_workflow(H3Request("decode smoke"))
+        workflow = build_workflow(
+            H3Request("decode smoke", character_references=["character.png"])
+        )
         self.assertTrue(all(node.get("_meta", {}).get("title") for node in workflow.values()))
-        self.assertIn("Diffusion Auto Loader", workflow["unet"]["_meta"]["title"])
+        self.assertIn("Auto Loader", workflow["unet"]["_meta"]["title"])
         self.assertEqual(workflow["phase"]["_meta"]["title"], "Kaggle H3 | Transformer Dispatch Barrier")
         self.assertEqual(workflow["unet"]["class_type"], "KaggleH3ShardedDiffusionLoader")
-        self.assertEqual(workflow["unet"]["inputs"]["model_variant"], "FL2VA")
+        self.assertEqual(workflow["unet"]["inputs"]["model_variant"], "Ref2VA")
+        self.assertEqual(workflow["unet"]["inputs"]["model_profile"], "singularity")
         self.assertEqual(workflow["unet"]["inputs"]["precision"], "int8_convrot")
         self.assertNotIn("unet_name", workflow["unet"]["inputs"])
         self.assertEqual(workflow["unet"]["inputs"]["gpu_0"], 0)
@@ -108,13 +137,17 @@ class WorkflowTests(unittest.TestCase):
         root = Path(__file__).parents[1]
         workflow = json.loads((root / "workflows" / "kaggle_h3_turbo_smoke.json").read_text(encoding="utf-8"))
         self.assertTrue(all(node.get("_meta", {}).get("title") for node in workflow.values()))
-        self.assertEqual(workflow["sample"]["_meta"]["title"], "Kaggle H3 | Turbo Sampler (4 steps)")
+        self.assertEqual(workflow["sample"]["inputs"]["sampler_name"], "euler")
+        self.assertNotIn("sage_attention", workflow["sample"]["inputs"])
         self.assertEqual(workflow["unet"]["inputs"]["model_variant"], "Ref2VA")
         self.assertNotIn("character_reference", workflow)
         self.assertNotIn("scene_reference", workflow)
         self.assertEqual(workflow["h3"]["class_type"], "KaggleH3Conditioning")
         self.assertEqual(workflow["h3_adapter"]["inputs"]["model_variant"], "ref2va")
-        self.assertEqual(workflow["h3_adapter"]["inputs"]["adapter_1"], "h3_ref2va_turbo_4step_v0_1")
+        self.assertEqual(
+            workflow["h3_adapter"]["inputs"]["adapter_1"],
+            "auto_singularity_ref2va_turbo",
+        )
         self.assertEqual(workflow["sample"]["inputs"]["synchronize_mode"], "full")
         self.assertEqual(workflow["h3"]["inputs"]["reference_0"], "image")
         self.assertEqual(

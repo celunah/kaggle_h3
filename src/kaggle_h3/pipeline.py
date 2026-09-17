@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import shutil
 import time
 import traceback
@@ -40,8 +39,8 @@ from .workflow import (
     H3Request,
     build_workflow,
     request_as_dict,
-    select_mode,
-    validate_workflow_shape,
+    select_production_mode,
+    validate_production_workflow_shape,
     workflow_sha256,
 )
 
@@ -145,6 +144,7 @@ def _adapter_request_summary(request: H3Request) -> dict[str, Any]:
     return {
         "turbo_mode": bool(request.turbo_mode),
         "turbo_steps": int(request.turbo_steps),
+        "mute_generated_audio": bool(request.mute_generated_audio),
         "conditioning_mode": request.conditioning_mode,
         "slots": [
             {"slot": 1, "adapter_id": request.adapter_1, "strength": request.adapter_1_strength},
@@ -195,7 +195,7 @@ def _initial_manifest(
         "references": references,
         "h3": {
             "repository": "MiniMaxAI/MiniMax-H3",
-            "comfy_model_repository": "Comfy-Org/MiniMax-H3",
+            "comfy_model_repository": "WarmBloodAban/Minimax-h3_Singularity",
             "selection_revision": H3_MODEL_REVISION,
         },
         "backend_selection": {
@@ -208,7 +208,7 @@ def _initial_manifest(
         "planned_device_map": selected.get("actual_device_map"),
         "device_map": selected.get("observed_device_map"),
         "quantization_profile": {
-            "diffusion": "Comfy-Org pruned INT8 ConvRot selected by default",
+            "diffusion": "WarmBloodAban MiniMax H3 Singularity Ref2VA pruned INT8",
             "text_encoder": "Comfy-Org Qwen3-VL NVFP4-AWQ selected by default",
             "video_vae": "FP16",
             "audio_vae": "FP32",
@@ -223,7 +223,7 @@ def _initial_manifest(
         "workflow": {
             "path": str(workflow_path),
             "sha256": workflow_sha256(workflow),
-            "shape": validate_workflow_shape(workflow),
+            "shape": validate_production_workflow_shape(workflow),
             "api": workflow,
         },
         "timing": {},
@@ -258,7 +258,7 @@ def run_generation(
 
     project_root = project_root.resolve()
     comfy_root = (comfy_root or project_root / "ComfyUI").resolve()
-    mode = select_mode(request)
+    mode = select_production_mode(request)
     run_id = _utc_id(request.seed)
     manifest_path, run_dir = _result_paths(project_root, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -284,7 +284,9 @@ def run_generation(
         request,
         mode=mode,
         run_id=run_id,
-        loader="comfyui_sp" if selected_backend == "comfyui_sp" else "native",
+        # Production always uses the phase-aware native loader so the pinned
+        # Singularity checkpoint and matching adapter contract are enforced.
+        loader="native",
         device_ids=tuple(evaluation.get("device_ids", [0, 1])[:2] or [0, 1]),
     )
     workflow_path = run_dir / "workflow_api.json"
@@ -354,7 +356,12 @@ def run_generation(
     if download_models and selected_backend in {"comfyui_native_fallback", "comfyui_sp"}:
         manifest["model_files"] = download_selected_models(comfy_root, mode)
     elif selected_backend in {"comfyui_native_fallback", "comfyui_sp"}:
-        manifest["model_files"] = model_file_status(comfy_root, mode)
+        # The production loader owns the mutually exclusive Singularity
+        # diffusion checkpoint and downloads it just in time. Only the shared
+        # text/VAE assets are required before ComfyUI starts.
+        manifest["model_files"] = model_file_status(
+            comfy_root, mode, include_diffusion=False
+        )
     else:
         manifest["model_files"] = {
             "status": "managed_by_selected_backend",
@@ -372,13 +379,13 @@ def run_generation(
                 request,
                 mode=mode,
                 run_id=run_id,
-                loader="comfyui_sp" if selected_backend == "comfyui_sp" else "native",
+                loader="native",
             )
             write_json(workflow_path, workflow)
             manifest["workflow"] = {
                 "path": str(workflow_path),
                 "sha256": workflow_sha256(workflow),
-                "shape": validate_workflow_shape(workflow),
+                "shape": validate_production_workflow_shape(workflow),
                 "api": workflow,
             }
         attempt: dict[str, Any] = {
@@ -458,7 +465,7 @@ def run_generation(
                     mode=mode,
                     input_files=staged,
                     run_id=run_id,
-                    loader="comfyui_sp" if selected_backend == "comfyui_sp" else "native",
+                    loader="native",
                     device_ids=tuple(
                         execution_plan.get("model_device_ids")
                         or execution_plan.get("visible_device_ids")
@@ -626,6 +633,8 @@ def run_quick_validation(
 
     request = H3Request(
         prompt="A simple H3 test shot: a calm close-up with stable subject identity and gentle ambient audio.",
+        character_references=[project_root / "smoke_assets" / "CHARACTER_REFERENCE.png"],
+        scene_references=[project_root / "smoke_assets" / "SCENE_REFERENCE.png"],
         duration_seconds=5.0,
         quality_mode="quick",
         seed=7,

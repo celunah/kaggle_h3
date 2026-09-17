@@ -15,9 +15,8 @@ H3_CANVAS_MULTIPLE = 32
 H3_MIN_FRAMES = 39
 H3_MAX_SECONDS = 15.0
 
-# These are nominal quality tiers.  The actual canvas is the nearest safe
-# H3-aligned canvas, so the 720p 16:9 tier is 1280x704 rather than 1280x720.
-# 720 is not divisible by H3's required 32-pixel canvas multiple.
+# These are the production canvas tiers.  The actual canvas is the nearest
+# safe H3-aligned canvas, with 240p/360p/480p retained for the two-T4 budget.
 REF2VA_SIZE_PRESETS: dict[str, dict[str, tuple[int, int]]] = {
     "240p": {
         "16:9": (448, 256),
@@ -31,16 +30,12 @@ REF2VA_SIZE_PRESETS: dict[str, dict[str, tuple[int, int]]] = {
         "16:9": (864, 480),
         "4:3": (640, 480),
     },
-    "720p": {
-        "16:9": (1280, 704),
-        "4:3": (960, 704),
-    },
 }
 
 QUALITY_MODE_TO_REF2VA_PRESET = {
-    "quick": "360p",
-    "medium": "480p",
-    "full": "720p",
+    "quick": "240p",
+    "medium": "360p",
+    "full": "480p",
 }
 
 
@@ -53,7 +48,7 @@ def resolve_ref2va_dimensions(size_preset: str, aspect_ratio: str) -> tuple[int,
         return REF2VA_SIZE_PRESETS[preset][ratio]
     except KeyError as exc:
         raise ValueError(
-            "Ref2VA size_preset must be one of 240p, 360p, 480p, or 720p "
+            "Ref2VA size_preset must be one of 240p, 360p, or 480p "
             "and aspect_ratio must be 16:9 or 4:3. "
             f"Got size_preset={size_preset!r}, aspect_ratio={aspect_ratio!r}."
         ) from exc
@@ -96,6 +91,6 @@ def quality_mode_to_ref2va_preset(quality_mode: str) -> str:
         return QUALITY_MODE_TO_REF2VA_PRESET[str(quality_mode).strip().lower()]
     except KeyError as exc:
         raise ValueError(
-            "Ref2VA quality_mode must be quick, medium, or full; "
+            "Ref2VA quality_mode must be quick, medium, or full, mapping to 240p/360p/480p; "
             f"got {quality_mode!r}."
         ) from exc

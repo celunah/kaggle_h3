@@ -7,7 +7,7 @@ from .layer_sharding import (
     find_dispatchable_layers,
     plan_layer_device_map,
 )
-from .workflow import WORKFLOW_REGISTRY, build_workflow, select_mode
+from .workflow import WORKFLOW_REGISTRY, build_workflow, select_mode, select_production_mode
 
 __all__ = [
     "H3Request",
@@ -16,6 +16,7 @@ __all__ = [
     "run_generation",
     "run_quick_validation",
     "select_mode",
+    "select_production_mode",
     "AdapterCache",
     "H3AdapterMetadata",
     "load_catalog",

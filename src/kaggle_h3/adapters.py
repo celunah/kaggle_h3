@@ -18,7 +18,10 @@ from typing import Any, Callable, Iterable, Mapping
 
 
 NONE_ADAPTER = "None"
-SUPPORTED_TURBO_STEPS = (4, 8)
+AUTO_SINGULARITY_ADAPTER = "auto_singularity_ref2va_turbo"
+RECOMMENDED_TURBO_STEPS = (4, 8)
+MIN_TURBO_STEPS = 1
+MAX_TURBO_STEPS = 200
 NORMAL_SHIFT_VIDEO = 12.0
 NORMAL_SHIFT_AUDIO = 3.0
 
@@ -93,6 +96,8 @@ class H3AdapterMetadata:
     conditioning_modes: tuple[str, ...]
     recommended_strength: float
     supported_steps: tuple[int, ...]
+    supports_arbitrary_steps: bool = False
+    recommended_steps: tuple[int, ...] = ()
     fused: bool = False
     license: str = "Unknown; inspect the upstream repository before redistribution."
     attribution: str = ""
@@ -148,6 +153,13 @@ class H3AdapterMetadata:
         sha256 = value.get("sha256")
         if sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", str(sha256)):
             raise ValueError(f"Adapter {adapter_id!r} sha256 must be 64 hexadecimal characters")
+        recommended_steps = tuple(
+            sorted({int(item) for item in (value.get("recommended_steps") or steps)})
+        )
+        if not recommended_steps or any(step < 1 or step > 10000 for step in recommended_steps):
+            raise ValueError(
+                f"Adapter {adapter_id!r} recommended_steps must contain positive step counts"
+            )
         return cls(
             adapter_id=adapter_id,
             name=name,
@@ -158,6 +170,8 @@ class H3AdapterMetadata:
             conditioning_modes=modes,
             recommended_strength=strength,
             supported_steps=steps,
+            supports_arbitrary_steps=bool(value.get("supports_arbitrary_steps", False)),
+            recommended_steps=recommended_steps,
             fused=bool(value.get("fused", False)),
             license=str(value.get("license") or value.get("license_and_attribution") or "Unknown"),
             attribution=str(value.get("attribution") or ""),
@@ -177,6 +191,8 @@ class H3AdapterMetadata:
             "conditioning_modes": list(self.conditioning_modes),
             "recommended_strength": self.recommended_strength,
             "supported_steps": list(self.supported_steps),
+            "supports_arbitrary_steps": self.supports_arbitrary_steps,
+            "recommended_steps": list(self.recommended_steps),
             "fused": self.fused,
             "license": self.license,
             "attribution": self.attribution,
@@ -186,14 +202,20 @@ class H3AdapterMetadata:
         }
 
     def schedule_for(self, steps: int) -> dict[str, Any]:
-        if steps not in self.supported_steps:
+        if steps not in self.supported_steps and not self.supports_arbitrary_steps:
             raise H3AdapterCompatibilityError(
                 f"Adapter {self.name!r} does not support {steps}-step inference; "
                 f"supported steps: {list(self.supported_steps)}"
             )
         schedule = dict(self.schedules.get(steps, {}))
-        schedule.setdefault("steps", steps)
-        schedule.setdefault("nfe", steps)
+        if not schedule and self.supports_arbitrary_steps:
+            # The 8-step Singularity-compatible adapter is the recommended
+            # general-purpose fast adapter. Reuse its validated H3 shifts for
+            # custom NFE counts while replacing only the count itself.
+            fallback_step = self.recommended_steps[-1]
+            schedule = dict(self.schedules.get(fallback_step, {}))
+        schedule["steps"] = steps
+        schedule["nfe"] = steps
         schedule.setdefault("sampler_name", "euler")
         schedule.setdefault("scheduler", "simple")
         schedule.setdefault("shift_video", NORMAL_SHIFT_VIDEO)
@@ -510,48 +532,12 @@ class AdapterCache:
 
 
 def builtin_catalog() -> dict[str, H3AdapterMetadata]:
-    """Official 768p LightX2V ComfyUI Turbo entries, pinned to HF commits."""
+    """Pinned Ref2VA Turbo adapters compatible with the Singularity profile."""
 
     raw = [
         {
-            "adapter_id": "h3_fl2va_turbo_4step_v1_0_768p",
-            "name": "FL2VA Turbo 4-step v1.0 768p",
-            "repository": "lightx2v/Minimax-h3-Turbo",
-            "filename": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
-            "revision": "3ec17a324ced54151364f24f8b5fb6bf7e26414f",
-            "model_variants": ["fl2va"],
-            "conditioning_modes": ["T2VA", "FL2VA"],
-            "recommended_strength": 1.0,
-            "supported_steps": [4],
-            "fused": False,
-            "license": "See lightx2v/Minimax-h3-Turbo repository and model card.",
-            "attribution": "LightX2V / ModelTC MiniMax-H3-Turbo",
-            "kind": "turbo",
-            "schedules": {
-                "4": {"steps": 4, "nfe": 4, "sampler_name": "euler", "shift_video": 6.0, "shift_audio": 3.0, "resolution": "768p"}
-            },
-        },
-        {
-            "adapter_id": "h3_fl2va_turbo_8step_v1_0_768p",
-            "name": "FL2VA Turbo 8-step v1.0 768p",
-            "repository": "lightx2v/Minimax-h3-Turbo",
-            "filename": "minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
-            "revision": "3ec17a324ced54151364f24f8b5fb6bf7e26414f",
-            "model_variants": ["fl2va"],
-            "conditioning_modes": ["T2VA", "FL2VA"],
-            "recommended_strength": 1.0,
-            "supported_steps": [8],
-            "fused": False,
-            "license": "See lightx2v/Minimax-h3-Turbo repository and model card.",
-            "attribution": "LightX2V / ModelTC MiniMax-H3-Turbo",
-            "kind": "turbo",
-            "schedules": {
-                "8": {"steps": 8, "nfe": 8, "sampler_name": "euler", "shift_video": 6.0, "shift_audio": 3.0, "resolution": "768p"}
-            },
-        },
-        {
-            "adapter_id": "h3_ref2va_turbo_4step_v0_1",
-            "name": "Ref2VA Turbo 4-step v0.1",
+            "adapter_id": "h3_singularity_ref2va_turbo_4step_v0_1",
+            "name": "Singularity Ref2VA Turbo 4-step v0.1",
             "repository": "lightx2v/Minimax-h3-Turbo",
             "filename": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
             "revision": "3ec17a324ced54151364f24f8b5fb6bf7e26414f",
@@ -559,6 +545,7 @@ def builtin_catalog() -> dict[str, H3AdapterMetadata]:
             "conditioning_modes": ["Ref2VA"],
             "recommended_strength": 1.0,
             "supported_steps": [4],
+            "recommended_steps": [4],
             "fused": False,
             "license": "See lightx2v/Minimax-h3-Turbo repository and model card.",
             "attribution": "LightX2V / ModelTC MiniMax-H3-Turbo",
@@ -568,8 +555,8 @@ def builtin_catalog() -> dict[str, H3AdapterMetadata]:
             },
         },
         {
-            "adapter_id": "h3_ref2va_turbo_8step_v1_0_768p",
-            "name": "Ref2VA Turbo 8-step v1.0 768p",
+            "adapter_id": "h3_singularity_ref2va_turbo_8step_v1_0",
+            "name": "Singularity Ref2VA Turbo 8-step v1.0",
             "repository": "lightx2v/Minimax-h3-Turbo",
             "filename": "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
             "revision": "3ec17a324ced54151364f24f8b5fb6bf7e26414f",
@@ -577,6 +564,8 @@ def builtin_catalog() -> dict[str, H3AdapterMetadata]:
             "conditioning_modes": ["Ref2VA"],
             "recommended_strength": 1.0,
             "supported_steps": [8],
+            "supports_arbitrary_steps": True,
+            "recommended_steps": [8],
             "fused": False,
             "license": "Apache-2.0; see lightx2v/Minimax-h3-Turbo repository and model card.",
             "attribution": "LightX2V / ModelTC MiniMax-H3-Turbo",
@@ -588,6 +577,19 @@ def builtin_catalog() -> dict[str, H3AdapterMetadata]:
         },
     ]
     return {item.adapter_id: item for item in map(H3AdapterMetadata.from_mapping, raw)}
+
+
+def resolve_singularity_turbo_adapter(steps: int | str) -> str:
+    """Select the pinned Ref2VA Turbo adapter for a valid production NFE count."""
+
+    count = int(steps)
+    if not MIN_TURBO_STEPS <= count <= MAX_TURBO_STEPS:
+        raise H3AdapterCompatibilityError(
+            f"H3 Turbo steps must be between {MIN_TURBO_STEPS} and {MAX_TURBO_STEPS}; got {count}."
+        )
+    if count == 4:
+        return "h3_singularity_ref2va_turbo_4step_v0_1"
+    return "h3_singularity_ref2va_turbo_8step_v1_0"
 
 
 def load_catalog(path: str | Path | None = None) -> dict[str, H3AdapterMetadata]:
@@ -656,7 +658,7 @@ def validate_adapter_compatibility(
         raise H3AdapterCompatibilityError(
             f"Adapter {metadata.name!r} is marked fused in metadata and cannot be injected as an incremental LoRA."
         )
-    if turbo_enabled and turbo_steps not in metadata.supported_steps:
+    if turbo_enabled and turbo_steps not in metadata.supported_steps and not metadata.supports_arbitrary_steps:
         raise H3AdapterCompatibilityError(
             f"Adapter {metadata.name!r} does not support Turbo {turbo_steps}-step inference; "
             f"supported steps: {list(metadata.supported_steps)}"
@@ -676,9 +678,13 @@ def build_runtime_config(
     """Validate all slots and produce the serializable H3 sampler contract."""
 
     steps = int(turbo_steps)
-    if steps not in SUPPORTED_TURBO_STEPS:
+    if not MIN_TURBO_STEPS <= steps <= MAX_TURBO_STEPS:
         raise H3AdapterCompatibilityError(
-            f"Unsupported H3 Turbo step count {steps}; select exactly 4 or 8."
+            f"Unsupported H3 Turbo step count {steps}; valid range is {MIN_TURBO_STEPS}-{MAX_TURBO_STEPS}."
+        )
+    if not turbo_mode:
+        raise H3AdapterCompatibilityError(
+            "The production MiniMax H3 profile requires Turbo mode; disablement is not supported."
         )
     context = detect_h3_model_context(model, conditioning_mode, model_variant)
     normalized_mode = _normalise_mode(conditioning_mode) if conditioning_mode != "auto" else "auto"
@@ -686,6 +692,8 @@ def build_runtime_config(
     seen: set[str] = set()
     for index, (adapter_id, raw_strength) in enumerate(adapter_slots, start=1):
         adapter_id = str(adapter_id or NONE_ADAPTER)
+        if adapter_id == AUTO_SINGULARITY_ADAPTER:
+            adapter_id = resolve_singularity_turbo_adapter(steps)
         strength = float(raw_strength)
         if not 0.0 <= strength <= 2.0:
             raise H3AdapterCompatibilityError(
@@ -737,9 +745,7 @@ def build_runtime_config(
         schedule = {
             "steps": steps,
             "nfe": steps,
-            "sampler_name": "euler_dualclock",
-            "base_sampler_name": "euler",
-            "dual_clock": True,
+            "sampler_name": "euler",
             "scheduler": "simple",
             "shift_video": 6.0,
             "shift_audio": 3.0,
@@ -749,22 +755,18 @@ def build_runtime_config(
         schedule = {
             "steps": None,
             "nfe": None,
-            "sampler_name": "res_multistep",
+            "sampler_name": "euler",
             "scheduler": "simple",
             "shift_video": NORMAL_SHIFT_VIDEO,
             "shift_audio": NORMAL_SHIFT_AUDIO,
             "source": "base_h3_schedule",
         }
 
-    # Turbo's fast schedule must be explicit in the graph.  The native H3
-    # ModelSamplingAV object carries the separate video/audio clocks, while
-    # the sampler name tells ComfyUI to select the dual-clock Euler path
-    # instead of merely changing a display label.
-    if turbo_mode:
-        schedule = dict(schedule)
-        schedule["base_sampler_name"] = schedule.get("base_sampler_name", "euler")
-        schedule["sampler_name"] = "euler_dualclock"
-        schedule["dual_clock"] = True
+    # Production deliberately uses the standard H3 Euler path.  The existing
+    # CUDA synchronization and phase dispatch remain responsible for numerical
+    # stability; experimental dual-clock sampling is not part of this profile.
+    schedule = dict(schedule)
+    schedule["sampler_name"] = "euler"
 
     applied_or_existing: list[dict[str, Any]] = []
     for metadata, strength, slot in selected:

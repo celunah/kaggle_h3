@@ -3,13 +3,13 @@
     "class_type": "KaggleH3ShardedDiffusionLoader",
     "inputs": {
       "model_variant": "Ref2VA",
-      "model_profile": "auto",
+      "model_profile": "singularity",
       "precision": "int8_convrot",
       "weight_dtype": "default",
       "gpu_0": 0,
       "gpu_1": 1
     },
-    "_meta": {"title": "Kaggle H3 | Diffusion Auto Loader (Ref2VA; auto Singularity INT8)"}
+    "_meta": {"title": "Kaggle H3 | Singularity Ref2VA INT8 Auto Loader"}
   },
   "clip": {
     "class_type": "KaggleH3TextEncoderLoader",
@@ -63,14 +63,14 @@
       "model": ["unet", 0],
       "model_variant": "ref2va",
       "turbo_mode": true,
-      "turbo_steps": "4",
-      "adapter_1": "h3_ref2va_turbo_4step_v0_1",
+      "turbo_steps": 4,
+      "adapter_1": "auto_singularity_ref2va_turbo",
       "strength_1": 1.0,
       "adapter_2": "None",
       "strength_2": 1.0,
       "adapter_3": "None",
       "strength_3": 1.0,
-      "conditioning_mode": "auto"
+      "conditioning_mode": "Ref2VA"
     },
     "_meta": {"title": "Kaggle H3 | Turbo + Adapter Stack"}
   },
@@ -92,11 +92,11 @@
       "conditioning": ["phase", 1],
       "latent_image": ["phase", 2],
       "noise_seed": 7,
-      "sampler_name": "euler_dualclock",
-      "synchronize_mode": "full",
-      "sage_attention": false
+      "sampler_name": "euler",
+      "steps": 4,
+      "synchronize_mode": "full"
     },
-    "_meta": {"title": "Kaggle H3 | Turbo Sampler (4 steps)"}
+    "_meta": {"title": "Kaggle H3 | Singularity Turbo Sampler (Euler; 4 steps)"}
   },
   "decode": {
     "class_type": "KaggleH3VAEDecode",
@@ -114,6 +114,7 @@
       "samples": ["sample", 1],
       "vae": ["vae_audio", 0],
       "device_id": 0,
+      "mute_generated_audio": false,
       "runtime_config": ["h3_adapter", 1]
     },
     "_meta": {"title": "Kaggle H3 | Audio Decode (GPU0)"}
@@ -127,7 +128,7 @@
       "bit_depth": 8,
       "color_space": "sRGB"
     },
-    "_meta": {"title": "Output | Video + Audio"}
+    "_meta": {"title": "Output | Video + Audio (mute available on audio decode)"}
   },
   "save": {
     "class_type": "SaveVideo",

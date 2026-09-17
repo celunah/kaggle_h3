@@ -2,7 +2,7 @@
 
 This folder is a reusable Kaggle notebook package for a temporary, local ComfyUI-based MiniMax H3 video pipeline. The result files are deliberately kept under this folder's `results/` directory.
 
-The pipeline accepts a natural-language prompt, character/scene/outfit/motion/audio references, optional first/last frames, duration, aspect ratio, resolution, seed, and quality mode. It selects Ref2VA, FL2VA, or T2VA without silently dropping incompatible conditions. Generated MP4 files are accompanied by JSON manifests containing the prompt, reference roles, workflow hash, model revision, backend decision, device map, safety limits, transfer measurements, telemetry, timing, validation, and failed attempts.
+The production pipeline accepts a natural-language prompt, ordered character/scene/outfit/motion/audio references, duration, aspect ratio, 240p/360p/480p resolution, seed, and arbitrary valid Turbo step counts. It uses MiniMax H3 Singularity Ref2VA with its matching pinned Ref2VA Turbo adapter. Generated MP4 files are accompanied by JSON manifests containing the prompt, reference roles, workflow hash, model revision, backend decision, device map, safety limits, transfer measurements, telemetry, timing, validation, and failed attempts.
 
 ## Architecture decision
 
@@ -38,9 +38,7 @@ The final Kaggle report must be read from the run manifest. It must not claim bo
 
 - `../kaggle_h3.zip`: clean upload bundle containing this package and `kaggle_h3.ipynb` without generated results, model weights, or Python caches.
 - `../kaggle_h3.ipynb`: entrypoint notebook kept beside this package; upload/import it into Kaggle and run top to bottom.
-- `workflows/kaggle_h3_ref2va.json`: reference-conditioned API-format graph.
-- `workflows/kaggle_h3_fl2va.json`: first/last-frame API-format graph.
-- `workflows/kaggle_h3_t2va.json`: text-to-video/audio API-format graph.
+- `workflows/kaggle_h3_ref2va.json`: production Singularity Ref2VA API-format graph.
 - `workflows/kaggle_h3_turbo_smoke.json`: Ref2VA 360p/16:9, 5-second, 4-step adapter smoke graph using the checked-in character and scene reference images.
 - `custom_nodes/kaggle_h3_adapters.py`: the auto-resolved smoke reference loader, global conditioning implementation, legacy bounded Ref2VA wrapper, just-in-time diffusion auto-loader, explicit H3 text-encoder/VAE loaders, a conditioning-complete phase barrier, `H3 Adapter Stack`, phase-aware H3 sampler, and GPU0/GPU1 audio/video VAE decode nodes.
 - `custom_nodes/kaggle_h3_conditioning.py`: the separate V3 entrypoint that registers the autogrowing `Kaggle H3 Conditioning` node; it is separate because ComfyUI prioritizes legacy mappings over a same-module V3 entrypoint.
@@ -66,28 +64,25 @@ without relying on their internal node IDs.
 2. Enable Internet only if ComfyUI, Python packages, or public Hugging Face model files need to be downloaded. Public files do not require a token. If a gated mirror is used, create a Kaggle secret named `HF_TOKEN`; the notebook reads it without printing it. The dependency cell installs the optional layer-dispatch stack by default; set `INSTALL_LAYER_SHARDED_BACKEND = False` there for a ComfyUI-only session.
 3. Run the dependency and hardware cells. They print every detected CUDA device, model capacity, CPU RAM, and all backend decisions, including the explicit fallback.
 4. The notebook performs the hardware/backend preflight automatically. Its direct ComfyUI frontend exposes both visible T4s, sets `KAGGLE_H3_PHASE_SHARDING=auto`, and lets the custom H3 loader/barrier apply the phase-aware two-GPU path. The loader and sampler refuse to disguise a one-GPU map as sharded; set `KAGGLE_H3_PHASE_SHARDING=off` only for the explicit fallback.
-5. The startup cell starts ComfyUI, clones the pinned checkout when needed, installs its `requirements.txt`, downloads only the shared H3 text/audio/video assets into `/kaggle/tmp/minimax-h3-models`, configures ComfyUI to read that external model tree, installs the H3 adapter node, and stages the smoke references into ComfyUI's `input/` directory. The supplied workflows select those staged files directly inside `Kaggle H3 Conditioning`; no separate reference-loader nodes are required. It does not pre-download a diffusion checkpoint, construct a workflow, or queue a request. Choose `FL2VA` or `Ref2VA` in the `Kaggle H3 | Diffusion Auto Loader` node; that node removes only the other known H3 diffusion filename and streams the selected pinned checkpoint when the workflow executes. `/kaggle/tmp` is scratch storage and must be repopulated after a new session.
+5. The startup cell starts ComfyUI, clones the pinned checkout when needed, installs its `requirements.txt`, downloads only the shared H3 text/audio/video assets into `/kaggle/tmp/minimax-h3-models`, configures ComfyUI to read that external model tree, installs the H3 adapter node, and stages the smoke references into ComfyUI's `input/` directory. The supplied workflows select those staged files directly inside `Kaggle H3 Conditioning`; no separate reference-loader nodes are required. It does not pre-download a diffusion checkpoint, construct a workflow, or queue a request. The production `Kaggle H3 | Singularity Ref2VA INT8 Auto Loader` removes the inactive known diffusion file and streams the pinned Singularity checkpoint only when the workflow executes. `/kaggle/tmp` is scratch storage and must be repopulated after a new session.
 6. ComfyUI is started on internal port `8188` with `0.0.0.0` binding for the notebook environment. When two GPUs are in the preflight plan, the launcher explicitly sets `CUDA_VISIBLE_DEVICES=0,1` and passes `--cuda-device 0,1`; it then checks `/system_stats` and stops before loading a workflow if ComfyUI exposes fewer than two devices. The startup output must therefore show both devices and roughly 29 GiB total VRAM, rather than only `cuda:0`. If it reports one device, stop the old ComfyUI process and rerun the updated startup cell; changing environment variables cannot change an already-running process. The notebook reloads the bootstrap module when that cell is rerun, so a full kernel reset is not required unless an older ComfyUI child remains alive. The notebook then prints the local runtime address and leaves public exposure optional. To test remote access, run the optional public-tunnel cell in the entrypoint; it restarts ComfyUI with `--enable-cors-header *` for the dynamic tunnel hostname, downloads `cloudflared` into `/kaggle/tmp`, starts a temporary tunnel to `http://127.0.0.1:8188`, and prints the generated URL if Kaggle permits it. This public mode disables ComfyUI's origin protection, so anyone with the URL can access the unauthenticated instance. The phase sampler prints an observed map and per-device peak memory during each generation.
-7. Build or import an H3 graph in the web interface. For Turbo, use `H3 Adapter Stack` followed by `H3 Turbo Sampler`; select the matching 4-step or 8-step adapter and sampler configuration. The node downloads its selected LoRA into `ComfyUI/models/loras/` on first use.
+7. Build or import the production Ref2VA graph in the web interface. `H3 Adapter Stack` automatically selects the pinned 4-step adapter for 4 steps and the compatible 8-step adapter for 8 or other valid custom step counts. The node downloads its selected LoRA into `ComfyUI/models/loras/` on first use. Enable `Mute generated audio` on the audio decoder when a video-only MP4 is wanted; audio VAE processing is skipped.
 
 Use `Kaggle H3 Conditioning` between the loaders and `Kaggle H3 | Transformer
-Dispatch Barrier`. It contains the prompt, `Ref2VA`/`FL2VA` mode selector,
-start/end frame upload/select controls, seconds, resolution preset, aspect
-ratio, and 15 mixed-media reference rows. Each row can select/upload an image,
-video, audio, or `None`; an inline video's soundtrack is paired automatically.
+Dispatch Barrier`. It contains the prompt, Ref2VA references, seconds,
+240p/360p/480p resolution preset, aspect ratio, and 15 mixed-media reference
+rows. Each row can select/upload an image, video, audio, or `None`; an inline
+video's soundtrack is paired automatically.
 The typed image/video/audio sockets remain available for advanced graphs, but
-do not use the same slot through both a file selector and a socket. In FL2VA
-mode, use start/end frames and do not select Ref2VA references. In Ref2VA mode,
-references are passed to ComfyUI's native `MiniMaxH3ReferenceToVideo`; optional
-start/end images are applied through the native `MiniMaxH3AddGuide` contract.
+do not use the same slot through both a file selector and a socket. References
+are passed to ComfyUI's native `MiniMaxH3ReferenceToVideo` contract.
 The node converts seconds to H3's aligned frame count and prints the requested
 and actual duration. Its `positive` output connects to the dispatch barrier's
 `conditioning` input, and its `LATENT` output connects to
 `latent_image`; the supplied workflows already contain these links. The
 minimum is 39 frames (1.625 seconds), and the current project safety cap is 15
-seconds. A nominal 720p/16:9 request becomes 1280x704 because
-H3 requires a 32-pixel canvas grid; this is expected and matches native H3
-behavior.
+seconds. The production resolution ceiling is 480p for the two-T4 memory
+budget.
 
 The older `Kaggle H3 | Ref2VA Conditioning (Seconds + Presets)` node remains
 available for previously saved legacy graphs, but new workflows use the global
@@ -121,49 +116,49 @@ kaggle_h3/results/<run_id>/telemetry_attempt_01.jsonl
 
 ## Model and ComfyUI files
 
-The default ComfyUI profile pins the `v0.34.0` ComfyUI release and downloads the shared video/audio VAE and Qwen text encoder from `Comfy-Org/MiniMax-H3`. The files are stored under `/kaggle/tmp/minimax-h3-models/models` so the 20 GiB persistent `/kaggle/working` output limit is not consumed. The diffusion checkpoint is intentionally deferred to the ComfyUI loader. Only one H3 diffusion checkpoint is present at a time; switching the loader selection removes the other exact known variant and precision files before downloading the replacement.
+The default ComfyUI profile pins the `v0.34.0` ComfyUI release and downloads the shared video/audio VAE and Qwen text encoder from `Comfy-Org/MiniMax-H3`. The files are stored under `/kaggle/tmp/minimax-h3-models/models` so the 20 GiB persistent `/kaggle/working` output limit is not consumed. The Singularity Ref2VA INT8 diffusion checkpoint is intentionally deferred to the ComfyUI loader. Only one H3 diffusion checkpoint is present at a time; the loader removes inactive known checkpoint files before downloading the replacement.
 
-`Kaggle H3 | Diffusion Auto Loader` exposes `precision=auto`, `int8_convrot`, or `fp8_scaled`. INT8 ConvRot is the default performance selection, including the two-T4 Kaggle profile. FP8-scaled remains available as an explicit lower-VRAM option, and the environment variable `KAGGLE_H3_DIFFUSION_PRECISION=fp8_scaled` can override `auto`. The corresponding files are:
+`Kaggle H3 | Singularity Ref2VA INT8 Auto Loader` exposes only the pinned
+Singularity Ref2VA INT8 checkpoint. The corresponding shared files are:
 
-- `diffusion_models/minimax_h3_ref2va_pruned_fp8_scaled.safetensors` or `minimax_h3_ref2va_pruned_int8_convrot.safetensors` for Ref2VA;
-- `diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors` or `minimax_h3_fl2va_pruned_int8_convrot.safetensors` for FL2VA/T2VA;
+- `diffusion_models/Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors` (downloaded on first production execution);
 - `text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`;
 - `vae/minimax_h3_video_vae_fp16.safetensors`;
 - `vae/minimax_h3_audio_vae_fp32.safetensors`.
 
-The T4 compatibility of a particular quantized kernel build is an empirical Kaggle check, not something this package declares in advance. The official model README documents alternative BF16, INT8 ConvRot, FP8-scaled, and NVFP4 assets; do not switch assets without recording the change in the manifest. `custom_nodes.lock` records the ComfyUI tag and the observed optional multi-GPU node commit used by the evaluator.
+The T4 compatibility of the pinned quantized kernel build is an empirical
+Kaggle check and is recorded in the run manifest. The source model is the
+[MiniMax H3 Singularity Ref2VA checkpoint](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity/tree/main).
 
 ### H3 adapter stack and Turbo
 
 The custom node exposes three ordered adapter slots, each with an independent
 strength from `0.0` to `2.0`. Selectors come from the metadata catalog rather
-than a hardcoded three-name list. The built-in entries are the official
-LightX2V ComfyUI safetensors pinned to HF revision
+than a hardcoded three-name list. The production entries are the pinned
+Singularity-compatible Ref2VA Turbo safetensors at HF revision
 `3ec17a324ced54151364f24f8b5fb6bf7e26414f`:
 
-- FL2VA/T2VA Turbo 4-step v1.0 768p: 4 NFE, Euler, video/audio shifts `6/3`.
-- FL2VA/T2VA Turbo 8-step v1.0 768p: 8 NFE, Euler, video/audio shifts `6/3`.
-- Ref2VA Turbo 4-step v0.1: 4 NFE, Euler, video/audio shifts `12/3`.
-- Ref2VA Turbo 8-step v1.0 768p: 8 NFE, Euler, video/audio shifts `6/3`.
+- Singularity Ref2VA Turbo 4-step v0.1: recommended 4 NFE, Euler, video/audio shifts `12/3`.
+- Singularity Ref2VA Turbo 8-step v1.0: recommended 8 NFE, Euler, video/audio shifts `6/3`; this adapter also supports validated custom step counts from 1 through 200.
 
 `H3 Adapter Stack` detects the H3 variant from the incoming Comfy model,
-resolves T2VA/FL2VA/Ref2VA from H3 conditioning metadata when the optional
-mode input is `auto`, validates every selected adapter before applying any,
+automatically resolves the matching 4-step or 8-step Ref2VA adapter,
+validates every selected adapter before applying any,
 and applies them in slot order through ComfyUI's clone-based
 `load_lora_for_models` path. The source checkpoint is never rewritten, LoRA
 state is loaded on CPU and released after patching, and ComfyUI's model
 offloading remains responsible for GPU residency.
 
-Because ComfyUI `UNETLoader` can discard the source filename and FL2VA/Ref2VA
-share an architecture, the node also exposes an advanced `model_variant`
-override. Generated workflows set it from the selected H3 mode; manual graphs
-should leave it at `auto` only when their loader carries equivalent metadata.
-An ambiguous bare model fails with a compatibility error rather than guessing.
+The production loader pins the Singularity Ref2VA model and INT8 precision;
+manual attempts to select another variant, profile, or precision fail before
+any download or model patching.
 
 Turbo is not a label-only option. The stack outputs a typed
 `H3_RUNTIME_CONFIG`; `H3 Turbo Sampler` consumes that output, applies the
 matching H3 AV sigma shifts, creates the matching sigma count, and rejects a
-wrong sampler or step count. A checkpoint explicitly marked as fused Turbo,
+wrong sampler or incompatible step count. Four and eight are the recommended
+presets; custom valid counts are routed through the compatible 8-step adapter.
+A checkpoint explicitly marked as fused Turbo,
 or a model that already records the same adapter, skips duplicate injection
 and reports the reason. Unknown or incompatible adapters fail before download
 or patching.
@@ -178,10 +173,12 @@ To register another adapter, append an object to
   "repository": "owner/repository",
   "filename": "mystic_motion_v1.safetensors",
   "revision": "<40-character-HF-commit>",
-  "model_variants": ["fl2va"],
-  "conditioning_modes": ["T2VA", "FL2VA"],
+  "model_variants": ["ref2va"],
+  "conditioning_modes": ["Ref2VA"],
   "recommended_strength": 1.0,
-  "supported_steps": [4, 8],
+  "supported_steps": [8],
+  "supports_arbitrary_steps": true,
+  "recommended_steps": [8],
   "fused": false,
   "license": "upstream license",
   "attribution": "upstream author",
@@ -286,33 +283,15 @@ packed AV NestedTensor and avoids retaining the unused stream in each decoder.
 The audio decoder also reports and replaces non-finite VAE samples before the
 AAC mux boundary, preventing PyAV's opaque `avcodec_send_frame()` failure.
 
-### Singularity, dual-clock Euler, and SageAttention
+### Production scope
 
-The native diffusion loader has a `model_profile` selector with an `auto`
-default. In `auto` mode, Ref2VA selects the pinned pruned INT8 MiniMax H3
-Singularity checkpoint from
-[`WarmBloodAban/Minimax-h3_Singularity`](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity)
-and FL2VA/T2VA selects the official Comfy-Org INT8 checkpoint. The currently
-published Singularity repository contains a Ref2VA checkpoint only, so an
-explicit Singularity + FL2VA selection is rejected before the loader removes
-or downloads anything. The model manager keeps the existing one-diffusion-file
-policy and downloads the selected file only when the loader executes.
-
-Turbo schedules use the explicit `euler_dualclock` sampler mode. It resolves to
-ComfyUI's Euler implementation while retaining H3's native `ModelSamplingAV`
-video/audio clock handling (`shift_video` and `shift_audio`); the runtime
-configuration records the selected mode and both shifts. Older graphs that say
-`euler` remain accepted as a compatibility alias, but new generated workflows
-use `euler_dualclock`.
-
-The sampler also exposes an opt-in `sage_attention` toggle. When enabled, the
-node requires ComfyUI's SageAttention integration and temporarily patches only
-the H3 transformer attention symbol. It restores the original function in the
-sampler cleanup path, does not patch VAE attention, and does not silently
-replace a missing backend. SageAttention is intentionally not a mandatory
-notebook dependency because its compiled Triton/CUDA build must match the
-running PyTorch and GPU environment. The upstream API and installation notes
-are in the [SageAttention repository](https://github.com/thu-ml/SageAttention).
+The production surface intentionally does not expose FL2VA, T2VA, FP8,
+non-Turbo sampling, 720p, dual-clock sampling, Context Loop, SageAttention,
+or latent upscaling. Those experiments are not part of this cleanup and are
+not selected by the shipped workflows. The sampler remains Euler-only with
+the existing `full`/`safe`/`fast` synchronization policy, and the phase-aware
+dispatcher continues to preserve the dual-T4, activation-streaming, staged
+loading, VAE routing, CPU offload, and finite-diagnostic behavior.
 
 This remains experimental because ComfyUI's ordinary `ModelPatcher` also
 manages model loading. If Accelerate cannot coexist with the installed

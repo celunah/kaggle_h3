@@ -39,6 +39,10 @@ try:
         build_runtime_config,
         detect_conditioning_mode,
         load_catalog,
+        AUTO_SINGULARITY_ADAPTER,
+        MAX_TURBO_STEPS,
+        MIN_TURBO_STEPS,
+        resolve_singularity_turbo_adapter,
         selector_options,
     )
 except ImportError:
@@ -50,6 +54,10 @@ except ImportError:
             build_runtime_config,
             detect_conditioning_mode,
             load_catalog,
+            AUTO_SINGULARITY_ADAPTER,
+            MAX_TURBO_STEPS,
+            MIN_TURBO_STEPS,
+            resolve_singularity_turbo_adapter,
             selector_options,
         )
     except ImportError:
@@ -71,6 +79,10 @@ except ImportError:
                 build_runtime_config,
                 detect_conditioning_mode,
                 load_catalog,
+                AUTO_SINGULARITY_ADAPTER,
+                MAX_TURBO_STEPS,
+                MIN_TURBO_STEPS,
+                resolve_singularity_turbo_adapter,
                 selector_options,
             )
         except ImportError:  # installed standalone beside the ComfyUI custom node
@@ -91,6 +103,10 @@ except ImportError:
             build_runtime_config = core_module.build_runtime_config
             detect_conditioning_mode = core_module.detect_conditioning_mode
             load_catalog = core_module.load_catalog
+            AUTO_SINGULARITY_ADAPTER = core_module.AUTO_SINGULARITY_ADAPTER
+            MAX_TURBO_STEPS = core_module.MAX_TURBO_STEPS
+            MIN_TURBO_STEPS = core_module.MIN_TURBO_STEPS
+            resolve_singularity_turbo_adapter = core_module.resolve_singularity_turbo_adapter
             selector_options = core_module.selector_options
 
 
@@ -1419,8 +1435,8 @@ if _H3IO is not None:
                 display_name="Kaggle H3 Conditioning",
                 category="conditioning/MiniMax H3",
                 description=(
-                    "Global H3 conditioning: prompt, Ref2VA/FL2VA mode, "
-                    "inline upload/select controls, optional start/end frames, "
+                    "Global H3 conditioning: prompt, Ref2VA mode, "
+                    "inline upload/select controls, "
                     "and socket-based references."
                 ),
                 inputs=[
@@ -1476,7 +1492,7 @@ if _H3IO is not None:
                         "prompt", multiline=True, dynamic_prompts=True
                     ),
                     _H3IO.Combo.Input(
-                        "mode", options=["Ref2VA", "FL2VA"], default="Ref2VA"
+                        "mode", options=["Ref2VA"], default="Ref2VA"
                     ),
                     _H3IO.Float.Input(
                         "seconds",
@@ -1499,8 +1515,8 @@ if _H3IO is not None:
                         "ref_image_size", options=["match", "max"], default="match"
                     ),
                     # Advanced exact geometry overrides keep API-generated
-                    # graphs compatible with the older FL2VA fields; normal
-                    # interactive use should prefer seconds + presets.
+                    # graphs compatible with older clients; normal interactive
+                    # use should prefer seconds + presets.
                     # ComfyUI may submit an optional integer widget as 0 even
                     # when it is not configured. Zero is the unset sentinel;
                     # nonzero values are validated below.
@@ -1823,22 +1839,22 @@ class KaggleH3ShardedDiffusionLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_variant": (["FL2VA", "Ref2VA"], {"default": "Ref2VA"}),
+                "model_variant": (["Ref2VA"], {"default": "Ref2VA"}),
                 "model_profile": (
-                    ["auto", "singularity", "base_h3"],
+                    ["singularity"],
                     {
-                        "default": "auto",
-                        "tooltip": "Auto selects Singularity INT8 for Ref2VA and the official H3 checkpoint for FL2VA/T2VA.",
+                        "default": "singularity",
+                        "tooltip": "Pinned MiniMax H3 Singularity Ref2VA checkpoint.",
                     },
                 ),
                 "precision": (
-                    ["auto", "fp8_scaled", "int8_convrot"],
+                    ["int8_convrot"],
                     {
                         "default": "int8_convrot",
-                        "tooltip": "INT8 ConvRot is the default performance path. Select FP8-scaled for lower VRAM use.",
+                        "tooltip": "Pinned Singularity INT8 ConvRot checkpoint for the production T4 path.",
                     },
                 ),
-                "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e5m2"], {"default": "default"}),
+                "weight_dtype": (["default"], {"default": "default"}),
                 "gpu_0": ("INT", {"default": 0, "min": 0, "max": 7}),
                 "gpu_1": ("INT", {"default": 1, "min": 0, "max": 7}),
             }
@@ -1858,6 +1874,14 @@ class KaggleH3ShardedDiffusionLoader:
         gpu_0: int = 0,
         gpu_1: int = 1,
     ):
+        if str(model_variant) != "Ref2VA":
+            raise H3PhaseError("The production H3 loader supports Ref2VA only.")
+        if str(model_profile) != "singularity":
+            raise H3PhaseError("The production H3 loader requires the Singularity profile.")
+        if str(precision) != "int8_convrot":
+            raise H3PhaseError("The production H3 loader requires the pinned INT8 ConvRot checkpoint.")
+        if str(weight_dtype) != "default":
+            raise H3PhaseError("The production H3 loader exposes only the validated default weight dtype.")
         try:
             import torch  # type: ignore
             import nodes  # type: ignore
@@ -2403,6 +2427,13 @@ class H3AudioVAEDecode:
                 "samples": ("LATENT",),
                 "vae": ("VAE",),
                 "device_id": ("INT", {"default": 0, "min": 0, "max": 7}),
+                "mute_generated_audio": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Skip audio VAE decoding and produce a video-only MP4.",
+                    },
+                ),
             },
             "optional": {
                 "runtime_config": ("H3_RUNTIME_CONFIG",),
@@ -2419,8 +2450,15 @@ class H3AudioVAEDecode:
         vae: Any,
         samples: dict[str, Any],
         device_id: int = 0,
+        mute_generated_audio: bool = False,
         runtime_config: dict[str, Any] | None = None,
     ):
+        if bool(mute_generated_audio):
+            print(
+                "[Kaggle H3] Generated audio muted; skipping audio VAE decode.",
+                flush=True,
+            )
+            return (None,)
         telemetry = _h3_phase_telemetry(runtime_config)
         try:
             configure_vae_phase(
@@ -2563,14 +2601,19 @@ class H3AdapterStack:
 
     @classmethod
     def INPUT_TYPES(cls):
-        options = selector_options(_catalog())
+        catalog = _catalog()
+        options = [AUTO_SINGULARITY_ADAPTER] + [
+            item
+            for item in selector_options(catalog)
+            if item == "None" or item.startswith("h3_singularity_ref2va_")
+        ]
         return {
             "required": {
                 "model": ("MODEL",),
-                "model_variant": (["auto", "fl2va", "ref2va"], {"default": "auto", "advanced": True}),
-                "turbo_mode": ("BOOLEAN", {"default": False}),
-                "turbo_steps": (["4", "8"], {"default": "4"}),
-                "adapter_1": (options, {"default": "None"}),
+                "model_variant": (["ref2va"], {"default": "ref2va", "advanced": True}),
+                "turbo_mode": ("BOOLEAN", {"default": True}),
+                "turbo_steps": ("INT", {"default": 4, "min": MIN_TURBO_STEPS, "max": MAX_TURBO_STEPS}),
+                "adapter_1": (options, {"default": AUTO_SINGULARITY_ADAPTER}),
                 "strength_1": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "adapter_2": (options, {"default": "None"}),
                 "strength_2": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
@@ -2578,9 +2621,7 @@ class H3AdapterStack:
                 "strength_3": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
             },
             "optional": {
-                # FL2VA is shared by T2VA and FL2VA. Leave this at auto unless
-                # the graph carries explicit mode metadata from its loader.
-                "conditioning_mode": (["auto", "T2VA", "FL2VA", "Ref2VA"], {"default": "auto"}),
+                "conditioning_mode": (["Ref2VA"], {"default": "Ref2VA"}),
             },
         }
 
@@ -2600,9 +2641,13 @@ class H3AdapterStack:
         strength_2: float,
         adapter_3: str,
         strength_3: float,
-        conditioning_mode: str = "auto",
-        model_variant: str = "auto",
+        conditioning_mode: str = "Ref2VA",
+        model_variant: str = "ref2va",
     ):
+        if str(model_variant).lower() != "ref2va":
+            raise H3AdapterError("The production H3 Adapter Stack supports Ref2VA only.")
+        if str(conditioning_mode) != "Ref2VA":
+            raise H3AdapterError("The production H3 Adapter Stack requires Ref2VA conditioning.")
         catalog = _catalog()
         runtime_config = build_runtime_config(
             model,
@@ -2645,23 +2690,16 @@ class H3TurboSampler:
                 "latent_image": ("LATENT",),
                 "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
                 "sampler_name": (
-                    ["res_multistep", "euler_dualclock", "euler"],
+                    ["euler"],
                     {
-                        "default": "res_multistep",
-                        "tooltip": "euler_dualclock uses H3's separate video/audio clock shifts through ModelSamplingAV.",
+                        "default": "euler",
+                        "tooltip": "Production Singularity Turbo uses the standard H3 Euler sampler.",
                     },
                 ),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 200}),
                 "synchronize_mode": (
                     ["full", "safe", "fast"],
                     {"default": "full"},
-                ),
-                "sage_attention": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "tooltip": "Opt-in SageAttention for the H3 transformer only; VAE attention is unchanged.",
-                    },
                 ),
             },
             "optional": {
@@ -2683,20 +2721,17 @@ class H3TurboSampler:
         """Validate the sampler contract before touching the loaded model."""
 
         if runtime_config is None:
-            if sampler_name != "res_multistep":
-                raise RuntimeError(
-                    "Base H3 sampling requires sampler 'res_multistep'; "
-                    "samplers 'euler' and 'euler_dualclock' are reserved for Turbo."
-                )
+            if sampler_name != "euler":
+                raise RuntimeError("Production H3 sampling requires sampler 'euler'.")
             return (
                 {
-                    "steps": None,
-                    "nfe": None,
+                    "steps": int(steps),
+                    "nfe": int(steps),
                     "sampler_name": sampler_name,
                     "scheduler": "simple",
                     "shift_video": 12.0,
                     "shift_audio": 3.0,
-                    "source": "base_h3_schedule",
+                    "source": "production_singularity_fallback",
                 },
                 max(1, int(steps)),
             )
@@ -2706,23 +2741,13 @@ class H3TurboSampler:
         schedule = dict(runtime_config.get("sampler") or {})
         expected_steps = schedule.get("steps")
         if turbo.get("enabled"):
-            if expected_steps not in (4, 8):
+            if expected_steps is None or not MIN_TURBO_STEPS <= int(expected_steps) <= MAX_TURBO_STEPS:
                 raise RuntimeError(f"H3 runtime config contains unsupported Turbo steps: {expected_steps!r}")
             expected_sampler_name = schedule.get("sampler_name")
-            compatible_euler_alias = {
-                str(sampler_name),
-                str(expected_sampler_name),
-            } == {"euler", "euler_dualclock"}
-            if sampler_name != expected_sampler_name and not compatible_euler_alias:
+            if sampler_name != expected_sampler_name or expected_sampler_name != "euler":
                 raise RuntimeError(
                     f"H3 Turbo schedule requires sampler {expected_sampler_name!r}; got {sampler_name!r}"
                 )
-            if sampler_name == "euler_dualclock" or expected_sampler_name == "euler_dualclock":
-                schedule["sampler_name"] = "euler_dualclock"
-                schedule["base_sampler_name"] = "euler"
-                schedule["dual_clock"] = True
-        elif expected_steps is not None:
-            raise RuntimeError("Non-Turbo H3 runtime config must not contain a Turbo step count")
         elif sampler_name != schedule.get("sampler_name", sampler_name):
             raise RuntimeError(
                 f"H3 runtime config requires sampler {schedule.get('sampler_name')!r}; got {sampler_name!r}"
@@ -2776,6 +2801,8 @@ class H3TurboSampler:
         synchronize_mode: str = "full",
         sage_attention: bool = False,
     ):
+        if bool(sage_attention):
+            raise RuntimeError("SageAttention is not part of the production H3 profile yet.")
         import comfy.sample  # type: ignore
         import comfy.samplers  # type: ignore
         import comfy.sampler_helpers  # type: ignore
@@ -3042,7 +3069,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "KaggleH3SmokeReference": "Kaggle H3 | Smoke Reference (auto-resolved)",
     "KaggleH3Ref2VAConditioning": "Kaggle H3 | Ref2VA Conditioning (Seconds + Presets)",
-    "KaggleH3ShardedDiffusionLoader": "Kaggle H3 | Diffusion Auto Loader (select FL2VA or Ref2VA)",
+    "KaggleH3ShardedDiffusionLoader": "Kaggle H3 | Singularity Ref2VA INT8 Auto Loader",
     "KaggleH3TextEncoderLoader": "Kaggle H3 | Text Encoder (GPU0 + GPU1)",
     "KaggleH3VAELoader": "Kaggle H3 | VAE Loader",
     "KaggleH3PhaseDispatch": "Kaggle H3 | Transformer Dispatch Barrier",

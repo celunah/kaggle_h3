@@ -90,15 +90,16 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         inputs = module.H3AdapterStack.INPUT_TYPES()
         for name in ("adapter_1", "strength_1", "adapter_2", "strength_2", "adapter_3", "strength_3"):
             self.assertIn(name, inputs["required"])
-        self.assertEqual(inputs["required"]["turbo_steps"][0], ["4", "8"])
+        self.assertEqual(inputs["required"]["turbo_steps"][0], "INT")
+        self.assertTrue(inputs["required"]["turbo_mode"][1]["default"])
         self.assertEqual(module.H3AdapterStack.RETURN_TYPES, ("MODEL", "H3_RUNTIME_CONFIG"))
         self.assertEqual(module.H3TurboSampler.RETURN_TYPES, ("LATENT", "LATENT", "LATENT"))
         sampler_inputs = module.H3TurboSampler.INPUT_TYPES()["required"]
         self.assertEqual(
             sampler_inputs["sampler_name"][0],
-            ["res_multistep", "euler_dualclock", "euler"],
+            ["euler"],
         )
-        self.assertFalse(sampler_inputs["sage_attention"][1]["default"])
+        self.assertNotIn("sage_attention", sampler_inputs)
         self.assertEqual(sampler_inputs["synchronize_mode"][0], ["full", "safe", "fast"])
         self.assertEqual(sampler_inputs["synchronize_mode"][1]["default"], "full")
         self.assertEqual(
@@ -107,8 +108,9 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         )
         self.assertEqual(module.H3VAEDecode.INPUT_TYPES()["required"]["device_id"][1]["default"], 1)
         self.assertEqual(module.H3AudioVAEDecode.INPUT_TYPES()["required"]["device_id"][1]["default"], 0)
+        self.assertFalse(module.H3AudioVAEDecode.INPUT_TYPES()["required"]["mute_generated_audio"][1]["default"])
         ref2va_inputs = module.KaggleH3Ref2VAConditioning.INPUT_TYPES()
-        self.assertEqual(ref2va_inputs["required"]["size_preset"][0], ["240p", "360p", "480p", "720p"])
+        self.assertEqual(ref2va_inputs["required"]["size_preset"][0], ["240p", "360p", "480p"])
         self.assertEqual(ref2va_inputs["required"]["aspect_ratio"][0], ["16:9", "4:3"])
         self.assertAlmostEqual(ref2va_inputs["required"]["seconds"][1]["min"], 39 / 24)
         self.assertIn("ref_image_8", ref2va_inputs["optional"])
@@ -136,7 +138,7 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
                 audio_vae="audio_vae",
                 prompt="animate the reference",
                 seconds=5.0,
-                size_preset="720p",
+                size_preset="480p",
                 aspect_ratio="16:9",
                 ref_image_1="image-one",
                 ref_audio_0="audio-one",
@@ -145,7 +147,7 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
             module._native_ref2va_conditioning = original_loader
 
         self.assertEqual(result, ("positive", "latent"))
-        self.assertEqual((captured["width"], captured["height"]), (1280, 704))
+        self.assertEqual((captured["width"], captured["height"]), (864, 480))
         self.assertEqual(captured["length"], 124)
         self.assertEqual(captured["ref_images"], {"ref_image_1": "image-one"})
         self.assertEqual(captured["ref_audios"], {"ref_audio_0": "audio-one"})
@@ -369,10 +371,10 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
     def test_explicit_loader_interfaces_have_phase_targets(self):
         module = load_node_module()
         loader_inputs = module.KaggleH3ShardedDiffusionLoader.INPUT_TYPES()["required"]
-        self.assertEqual(loader_inputs["model_variant"][0], ["FL2VA", "Ref2VA"])
+        self.assertEqual(loader_inputs["model_variant"][0], ["Ref2VA"])
         self.assertEqual(loader_inputs["model_variant"][1]["default"], "Ref2VA")
         self.assertEqual(
-            loader_inputs["precision"][0], ["auto", "fp8_scaled", "int8_convrot"]
+            loader_inputs["precision"][0], ["int8_convrot"]
         )
         self.assertEqual(loader_inputs["precision"][1]["default"], "int8_convrot")
         self.assertEqual(
@@ -497,6 +499,18 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertEqual(audio["waveform"].device.type, "cpu")
         self.assertTrue(torch.isfinite(audio["waveform"]).all())
         self.assertLessEqual(float(audio["waveform"].abs().max()), 1.0)
+
+    def test_audio_decoder_mute_skips_phase_setup_and_returns_no_audio(self):
+        module = load_node_module()
+        with patch.object(module, "configure_vae_phase") as configure, patch.object(
+            module, "release_vae_phase"
+        ) as release:
+            result = module.H3AudioVAEDecode().decode(
+                object(), {"samples": object()}, device_id=0, mute_generated_audio=True
+            )
+        self.assertEqual(result, (None,))
+        configure.assert_not_called()
+        release.assert_not_called()
 
     def test_video_vae_validates_before_and_after_decode(self):
         module = load_node_module()
@@ -759,9 +773,10 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
     def test_turbo_workflow_routes_both_outputs_into_dedicated_sampler(self):
         request = H3Request(
             "Turbo smoke",
+            character_references=["character.png"],
             turbo_mode=True,
             turbo_steps=4,
-            adapter_1="h3_fl2va_turbo_4step_v1_0_768p",
+            adapter_1="auto_singularity_ref2va_turbo",
             adapter_1_strength=1.0,
             quality_mode="quick",
         )
@@ -772,8 +787,8 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertEqual(workflow["phase"]["class_type"], "KaggleH3PhaseDispatch")
         self.assertEqual(workflow["sample"]["class_type"], "KaggleH3TurboSampler")
         self.assertEqual(workflow["sample"]["inputs"]["runtime_config"], ["phase", 3])
-        self.assertEqual(workflow["sample"]["inputs"]["sampler_name"], "euler_dualclock")
-        self.assertFalse(workflow["sample"]["inputs"]["sage_attention"])
+        self.assertEqual(workflow["sample"]["inputs"]["sampler_name"], "euler")
+        self.assertNotIn("sage_attention", workflow["sample"]["inputs"])
         self.assertNotIn("SamplerCustomAdvanced", {node["class_type"] for node in workflow.values()})
 
     def test_dedicated_sampler_consumes_selected_turbo_steps(self):
@@ -781,9 +796,9 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         config = {
             "schema_version": "kaggle_h3.runtime.v1",
             "turbo": {"enabled": True, "steps": 8},
-            "sampler": {"steps": 8, "sampler_name": "euler_dualclock", "scheduler": "simple", "dual_clock": True},
+            "sampler": {"steps": 8, "sampler_name": "euler", "scheduler": "simple"},
         }
-        _, steps = module.H3TurboSampler._resolve_sampling_parameters(config, "euler_dualclock")
+        _, steps = module.H3TurboSampler._resolve_sampling_parameters(config, "euler")
         self.assertEqual(steps, 8)
         with self.assertRaisesRegex(RuntimeError, "requires sampler"):
             module.H3TurboSampler._resolve_sampling_parameters(config, "res_multistep")
@@ -817,10 +832,10 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         with self.assertRaisesRegex(RuntimeError, "could not access"):
             module._h3_prepare_sampler("res_multistep", types.SimpleNamespace())
 
-    def test_base_h3_rejects_euler(self):
+    def test_production_sampler_rejects_legacy_res_multistep(self):
         module = load_node_module()
-        with self.assertRaisesRegex(RuntimeError, "reserved for Turbo"):
-            module.H3TurboSampler._resolve_sampling_parameters(None, "euler")
+        with self.assertRaisesRegex(RuntimeError, "requires sampler 'euler'"):
+            module.H3TurboSampler._resolve_sampling_parameters(None, "res_multistep")
 
     def test_dual_clock_sampler_uses_euler_backend_wrapper(self):
         module = load_node_module()
@@ -1126,10 +1141,10 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
             module, "release_vae_phase"
         ):
             first = module.H3TurboSampler().sample(
-                object(), None, conditioning, latent, 1234, "res_multistep", 2
+                object(), None, conditioning, latent, 1234, "euler", 2
             )
             second = module.H3TurboSampler().sample(
-                object(), None, conditioning, latent, 1234, "res_multistep", 2
+                object(), None, conditioning, latent, 1234, "euler", 2
             )
             video_vae = types.SimpleNamespace(
                 decode=lambda _samples: torch.ones((1, 2, 2, 3))

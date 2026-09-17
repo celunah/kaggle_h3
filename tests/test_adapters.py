@@ -13,11 +13,13 @@ from kaggle_h3.adapters import (
     build_runtime_config,
     builtin_catalog,
     detect_h3_model_context,
+    AUTO_SINGULARITY_ADAPTER,
+    resolve_singularity_turbo_adapter,
 )
 
 
 class FakeH3Model:
-    def __init__(self, *, variant="fl2va", fused_turbo=False):
+    def __init__(self, *, variant="ref2va", fused_turbo=False):
         self.is_h3 = True
         self.model_variant = variant
         self.filename = f"minimax_h3_{variant}_pruned_int8_convrot.safetensors"
@@ -38,29 +40,32 @@ class FakeH3Model:
 class AdapterTests(unittest.TestCase):
     def test_official_catalog_has_pinned_turbo_metadata_and_schedules(self):
         catalog = builtin_catalog()
-        four = catalog["h3_fl2va_turbo_4step_v1_0_768p"]
-        eight = catalog["h3_fl2va_turbo_8step_v1_0_768p"]
+        self.assertEqual(set(catalog), {
+            "h3_singularity_ref2va_turbo_4step_v0_1",
+            "h3_singularity_ref2va_turbo_8step_v1_0",
+        })
+        four = catalog["h3_singularity_ref2va_turbo_4step_v0_1"]
+        eight = catalog["h3_singularity_ref2va_turbo_8step_v1_0"]
         self.assertEqual(len(four.revision), 40)
-        self.assertEqual(four.schedule_for(4)["shift_video"], 6.0)
+        self.assertEqual(four.schedule_for(4)["shift_video"], 12.0)
         self.assertEqual(eight.schedule_for(8)["steps"], 8)
         self.assertEqual(eight.schedule_for(8)["sampler_name"], "euler")
-        ref_eight = catalog["h3_ref2va_turbo_8step_v1_0_768p"]
-        self.assertEqual(ref_eight.conditioning_modes, ("Ref2VA",))
-        self.assertEqual(ref_eight.schedule_for(8)["shift_video"], 6.0)
-        self.assertEqual(ref_eight.schedule_for(8)["resolution"], "768p")
+        self.assertTrue(eight.supports_arbitrary_steps)
+        self.assertEqual(eight.schedule_for(12)["steps"], 12)
+        self.assertEqual(resolve_singularity_turbo_adapter(4), four.adapter_id)
+        self.assertEqual(resolve_singularity_turbo_adapter(12), eight.adapter_id)
 
-    def test_turbo_runtime_contract_selects_explicit_dual_clock_sampler(self):
+    def test_turbo_runtime_contract_selects_standard_euler_sampler(self):
         model = FakeH3Model()
         config = build_runtime_config(
             model,
             builtin_catalog(),
             turbo_mode=True,
             turbo_steps=4,
-            adapter_slots=(("h3_fl2va_turbo_4step_v1_0_768p", 1.0), ("None", 1.0)),
+            adapter_slots=((AUTO_SINGULARITY_ADAPTER, 1.0), ("None", 1.0)),
         )
-        self.assertEqual(config["sampler"]["sampler_name"], "euler_dualclock")
-        self.assertEqual(config["sampler"]["base_sampler_name"], "euler")
-        self.assertTrue(config["sampler"]["dual_clock"])
+        self.assertEqual(config["sampler"]["sampler_name"], "euler")
+        self.assertNotIn("dual_clock", config["sampler"])
 
     def test_invalid_metadata_rejects_unsafe_or_unsupported_files(self):
         base = {
@@ -96,7 +101,7 @@ class AdapterTests(unittest.TestCase):
             old = sys.modules.get("huggingface_hub")
             sys.modules["huggingface_hub"] = hub
             try:
-                metadata = builtin_catalog()["h3_fl2va_turbo_4step_v1_0_768p"]
+                metadata = builtin_catalog()["h3_singularity_ref2va_turbo_4step_v0_1"]
                 cache = AdapterCache(root)
                 first = cache.resolve(metadata)
                 second = cache.resolve(metadata)
@@ -121,7 +126,7 @@ class AdapterTests(unittest.TestCase):
             old = sys.modules.get("huggingface_hub")
             sys.modules["huggingface_hub"] = hub
             try:
-                metadata = builtin_catalog()["h3_fl2va_turbo_4step_v1_0_768p"]
+                metadata = builtin_catalog()["h3_singularity_ref2va_turbo_4step_v0_1"]
                 with self.assertRaisesRegex(H3AdapterError, "repository=.*lightx2v"):
                     AdapterCache(temp).resolve(metadata)
             finally:
@@ -131,8 +136,8 @@ class AdapterTests(unittest.TestCase):
                     sys.modules["huggingface_hub"] = old
 
     def test_wrong_variant_is_rejected_before_download_or_apply(self):
-        model = FakeH3Model(variant="ref2va")
-        metadata = builtin_catalog()["h3_fl2va_turbo_4step_v1_0_768p"]
+        model = FakeH3Model(variant="fl2va")
+        metadata = builtin_catalog()["h3_singularity_ref2va_turbo_4step_v0_1"]
         with self.assertRaises(H3AdapterCompatibilityError):
             build_runtime_config(
                 model,
@@ -145,7 +150,7 @@ class AdapterTests(unittest.TestCase):
 
     def test_fused_turbo_is_reported_and_not_selected_for_injection(self):
         model = FakeH3Model(fused_turbo=True)
-        metadata = builtin_catalog()["h3_fl2va_turbo_4step_v1_0_768p"]
+        metadata = builtin_catalog()["h3_singularity_ref2va_turbo_4step_v0_1"]
         config = build_runtime_config(
             model,
             {metadata.adapter_id: metadata},
@@ -159,7 +164,7 @@ class AdapterTests(unittest.TestCase):
 
     def test_turbo_step_count_is_rejected_by_metadata(self):
         model = FakeH3Model()
-        metadata = builtin_catalog()["h3_fl2va_turbo_4step_v1_0_768p"]
+        metadata = builtin_catalog()["h3_singularity_ref2va_turbo_4step_v0_1"]
         with self.assertRaisesRegex(H3AdapterCompatibilityError, "does not support Turbo 8-step"):
             build_runtime_config(
                 model,
@@ -178,8 +183,8 @@ class AdapterTests(unittest.TestCase):
                 "repository": "example/motion",
                 "filename": "motion.safetensors",
                 "revision": "0123456789abcdef0123456789abcdef01234567",
-                "model_variants": ["fl2va"],
-                "conditioning_modes": ["T2VA", "FL2VA"],
+                "model_variants": ["ref2va"],
+                "conditioning_modes": ["Ref2VA"],
                 "supported_steps": [4],
             }
         )
@@ -187,7 +192,7 @@ class AdapterTests(unittest.TestCase):
             build_runtime_config(
                 model,
                 {metadata.adapter_id: metadata},
-                turbo_mode=False,
+                turbo_mode=True,
                 turbo_steps=4,
                 adapter_slots=((metadata.adapter_id, 1.0), (metadata.adapter_id, 0.5), ("None", 1.0)),
             )
@@ -201,10 +206,10 @@ class AdapterTests(unittest.TestCase):
                 "repository": "example/first",
                 "filename": "first.safetensors",
                 "revision": "0123456789abcdef0123456789abcdef01234567",
-                "model_variants": ["fl2va"],
-                "conditioning_modes": ["T2VA", "FL2VA"],
+                "model_variants": ["ref2va"],
+                "conditioning_modes": ["Ref2VA"],
                 "supported_steps": [4, 8],
-                "kind": "motion",
+                "kind": "turbo",
             }
         )
         second = H3AdapterMetadata.from_mapping(
@@ -214,8 +219,8 @@ class AdapterTests(unittest.TestCase):
                 "repository": "example/second",
                 "filename": "second.safetensors",
                 "revision": "0123456789abcdef0123456789abcdef01234567",
-                "model_variants": ["fl2va"],
-                "conditioning_modes": ["T2VA", "FL2VA"],
+                "model_variants": ["ref2va"],
+                "conditioning_modes": ["Ref2VA"],
                 "supported_steps": [4, 8],
                 "kind": "motion",
             }
@@ -223,7 +228,7 @@ class AdapterTests(unittest.TestCase):
         config = build_runtime_config(
             model,
             {first.adapter_id: first, second.adapter_id: second},
-            turbo_mode=False,
+            turbo_mode=True,
             turbo_steps=4,
             adapter_slots=((first.adapter_id, 0.5), (second.adapter_id, 1.25), ("None", 1.0)),
         )
@@ -239,9 +244,10 @@ class AdapterTests(unittest.TestCase):
                 "repository": "example/first",
                 "filename": "first.safetensors",
                 "revision": "0123456789abcdef0123456789abcdef01234567",
-                "model_variants": ["fl2va"],
-                "conditioning_modes": ["T2VA", "FL2VA"],
+                "model_variants": ["ref2va"],
+                "conditioning_modes": ["Ref2VA"],
                 "supported_steps": [4],
+                "kind": "turbo",
             }
         )
         second = H3AdapterMetadata.from_mapping(
@@ -251,15 +257,16 @@ class AdapterTests(unittest.TestCase):
                 "repository": "example/second",
                 "filename": "second.safetensors",
                 "revision": "0123456789abcdef0123456789abcdef01234567",
-                "model_variants": ["fl2va"],
-                "conditioning_modes": ["T2VA", "FL2VA"],
+                "model_variants": ["ref2va"],
+                "conditioning_modes": ["Ref2VA"],
                 "supported_steps": [4],
+                "kind": "motion",
             }
         )
         config = build_runtime_config(
             model,
             {first.adapter_id: first, second.adapter_id: second},
-            turbo_mode=False,
+            turbo_mode=True,
             turbo_steps=4,
             adapter_slots=((first.adapter_id, 0.25), (second.adapter_id, 1.5), ("None", 1.0)),
         )
