@@ -330,9 +330,20 @@ def install_python_dependencies(project_root: Path, *, dry_run: bool = False) ->
 
 
 def install_comfyui_dependencies(
-    comfy_root: Path, *, dry_run: bool = False
+    comfy_root: Path,
+    *,
+    dry_run: bool = False,
+    install_t4_attention: bool | None = None,
 ) -> dict[str, Any]:
-    """Install the pinned checkout's Python requirements into this interpreter."""
+    """Install ComfyUI requirements and restore the T4 attention runtime last.
+
+    ComfyUI's unpinned ``torch`` requirement can bring a newer Triton into an
+    existing Kaggle environment after the package requirements have installed
+    the SageAttention-compatible version.  When this checkout has the pinned
+    T4 requirements beside ``ComfyUI/``, install them *after* ComfyUI so the
+    final interpreter state is deterministic.  The environment variable can
+    disable this extra step for non-Kaggle callers.
+    """
 
     requirements = comfy_root / "requirements.txt"
     if not requirements.is_file():
@@ -341,11 +352,63 @@ def install_comfyui_dependencies(
     result: dict[str, Any] = {"command": command, "requirements": str(requirements)}
     if dry_run:
         result["status"] = "skipped_dry_run"
+        t4_requirements = comfy_root.parent / "requirements-sageattention-t4.txt"
+        if install_t4_attention is None:
+            install_t4_attention = os.environ.get(
+                "KAGGLE_H3_INSTALL_T4_SAGEATTENTION", "1"
+            ).strip().lower() not in {"0", "false", "no", "off"}
+        if install_t4_attention and t4_requirements.is_file():
+            result["t4_attention"] = {
+                "status": "would_install",
+                "requirements": str(t4_requirements),
+                "command": [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "-q",
+                    "--upgrade",
+                    "-r",
+                    str(t4_requirements),
+                ],
+            }
         return result
     completed = subprocess.run(command, check=True, capture_output=True, text=True)
     result["status"] = "installed"
     result["stdout_tail"] = completed.stdout[-2000:]
     result["stderr_tail"] = completed.stderr[-2000:]
+
+    t4_requirements = comfy_root.parent / "requirements-sageattention-t4.txt"
+    if install_t4_attention is None:
+        install_t4_attention = os.environ.get(
+            "KAGGLE_H3_INSTALL_T4_SAGEATTENTION", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+    if install_t4_attention and t4_requirements.is_file():
+        t4_command = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "--upgrade",
+            "-r",
+            str(t4_requirements),
+        ]
+        t4_completed = subprocess.run(
+            t4_command, check=True, capture_output=True, text=True
+        )
+        result["t4_attention"] = {
+            "status": "installed_last",
+            "requirements": str(t4_requirements),
+            "command": t4_command,
+            "stdout_tail": t4_completed.stdout[-2000:],
+            "stderr_tail": t4_completed.stderr[-2000:],
+        }
+        print(
+            "[Kaggle H3] Restored the T4 SageAttention runtime after ComfyUI "
+            "dependencies: SageAttention v1, Triton 3.2.0.",
+            flush=True,
+        )
     return result
 
 

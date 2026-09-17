@@ -14,6 +14,7 @@ from kaggle_h3.bootstrap import (
     install_h3_adapter_node,
     install_context_loop_node,
     install_obvpm_node,
+    install_comfyui_dependencies,
     model_file_status,
     required_model_files,
     stage_smoke_assets,
@@ -31,7 +32,27 @@ class BootstrapTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("sageattention==1.0.6", t4_requirements)
-        self.assertIn("triton>=3.1,<3.3", t4_requirements)
+        self.assertIn("triton==3.2.0", t4_requirements)
+
+    def test_comfyui_dependency_install_repins_t4_runtime_last(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            comfy_root = root / "ComfyUI"
+            comfy_root.mkdir()
+            (comfy_root / "requirements.txt").write_text("torch\n", encoding="utf-8")
+            (root / "requirements-sageattention-t4.txt").write_text(
+                "sageattention==1.0.6\ntriton==3.2.0\n", encoding="utf-8"
+            )
+
+            result = install_comfyui_dependencies(comfy_root, dry_run=True)
+
+        self.assertEqual(result["status"], "skipped_dry_run")
+        self.assertEqual(result["t4_attention"]["status"], "would_install")
+        self.assertIn("--upgrade", result["t4_attention"]["command"])
+        self.assertIn(
+            "requirements-sageattention-t4.txt",
+            result["t4_attention"]["command"][-1],
+        )
 
     def test_h3_support_modules_are_not_installed_as_custom_nodes(self):
         with tempfile.TemporaryDirectory() as temporary:
