@@ -97,7 +97,7 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         sampler_inputs = module.H3TurboSampler.INPUT_TYPES()["required"]
         self.assertEqual(
             sampler_inputs["sampler_name"][0],
-            ["euler"],
+            ["euler", "euler_dualclock"],
         )
         self.assertNotIn("sage_attention", sampler_inputs)
         self.assertEqual(sampler_inputs["synchronize_mode"][0], ["full", "safe", "fast"])
@@ -800,6 +800,12 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         }
         _, steps = module.H3TurboSampler._resolve_sampling_parameters(config, "euler")
         self.assertEqual(steps, 8)
+        dual_schedule, dual_steps = module.H3TurboSampler._resolve_sampling_parameters(
+            config, "euler_dualclock"
+        )
+        self.assertEqual(dual_steps, 8)
+        self.assertTrue(dual_schedule["dual_clock"])
+        self.assertEqual(dual_schedule["base_sampler_name"], "euler")
         with self.assertRaisesRegex(RuntimeError, "requires sampler"):
             module.H3TurboSampler._resolve_sampling_parameters(config, "res_multistep")
 
@@ -841,6 +847,22 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         module = load_node_module()
         sampler = types.SimpleNamespace(sampler_function=lambda *args, **kwargs: object())
         self.assertIs(module._h3_prepare_sampler("euler", sampler, dual_clock=True), sampler)
+
+    def test_dual_clock_schedule_derives_audio_clock_without_manual_update(self):
+        module = load_node_module()
+        schedule = module._h3_actual_clock_schedule(
+            [1.0, 0.5, 0.0], shift_video=12.0, shift_audio=3.0
+        )
+        self.assertEqual(schedule["video"]["sigmas"], [1.0, 0.5, 0.0])
+        for actual, expected in zip(schedule["audio"]["sigmas"], [1.0, 0.2, 0.0]):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(schedule["video"]["model_timesteps"], [1000.0, 500.0, 0.0])
+        for actual, expected in zip(
+            schedule["audio"]["flow_timesteps"], [0.0, 0.8, 1.0]
+        ):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(schedule["latent_update"], "native_model_sampling_av")
+        self.assertFalse(schedule["manual_audio_update"])
 
     def test_res_multistep_history_isolated_from_reused_model_output_buffer(self):
         module = load_node_module()

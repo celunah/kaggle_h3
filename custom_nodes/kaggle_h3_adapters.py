@@ -9,6 +9,8 @@ ComfyUI does not mistake them for separate custom nodes.
 from __future__ import annotations
 
 from contextvars import ContextVar
+import json
+import math
 import os
 from pathlib import Path
 import importlib.util
@@ -29,6 +31,8 @@ _H3_SAMPLER_SYNCHRONIZATION_MODE: ContextVar[str] = ContextVar(
 _H3_DIFFUSION_TELEMETRY: ContextVar[Any] = ContextVar(
     "kaggle_h3_diffusion_telemetry", default=None
 )
+
+H3_EULER_SAMPLER_NAMES = ("euler", "euler_dualclock")
 
 
 try:
@@ -873,12 +877,17 @@ def _h3_prepare_sampler(
                 return original_sampler_function(*args, **kwargs)
             return _h3_euler_with_telemetry(*args, **kwargs)
 
+        euler_sampler_with_optional_telemetry.__name__ = (
+            "sample_h3_euler_dualclock"
+            if dual_clock
+            else "sample_h3_euler"
+        )
         sampler.sampler_function = euler_sampler_with_optional_telemetry
         if dual_clock:
             print(
                 "[Kaggle H3] euler_dualclock selected: using stock Euler with "
-                "native ModelSamplingAV video/audio clocks (12.0/3.0 or the "
-                "Turbo schedule's explicit shifts).",
+                "native ModelSamplingAV video/audio clocks; no second manual "
+                "audio update is applied.",
                 flush=True,
             )
         else:
@@ -902,6 +911,51 @@ def _h3_prepare_sampler(
         flush=True,
     )
     return sampler
+
+
+def _h3_time_shift_sigma(
+    sigma: float, from_shift: float, to_shift: float
+) -> float:
+    """Map one video sigma onto H3's independent audio flow schedule."""
+
+    sigma = float(sigma)
+    base_sigma = sigma / (from_shift + sigma * (1.0 - from_shift))
+    return to_shift * base_sigma / (1.0 + (to_shift - 1.0) * base_sigma)
+
+
+def _h3_actual_clock_schedule(
+    sigmas: Any, *, shift_video: float, shift_audio: float
+) -> dict[str, Any]:
+    """Describe the schedules actually used by native H3 ModelSamplingAV.
+
+    The returned audio values are telemetry only.  The sampler continues to
+    advance the packed latent on ComfyUI's video sigma grid; the H3 model and
+    ``ModelSamplingAV`` carry the audio stream onto its shifted clock exactly
+    once.  This function must never be used to update the latent directly.
+    """
+
+    video_sigmas = [float(value) for value in sigmas]
+    audio_sigmas = [
+        _h3_time_shift_sigma(value, float(shift_video), float(shift_audio))
+        for value in video_sigmas
+    ]
+    return {
+        "video": {
+            "sigmas": video_sigmas,
+            "model_timesteps": [value * 1000.0 for value in video_sigmas],
+            "flow_timesteps": [1.0 - value for value in video_sigmas],
+        },
+        "audio": {
+            "sigmas": audio_sigmas,
+            "model_timesteps": [value * 1000.0 for value in audio_sigmas],
+            "flow_timesteps": [1.0 - value for value in audio_sigmas],
+        },
+        "shift_video": float(shift_video),
+        "shift_audio": float(shift_audio),
+        "mapping": "time_shift_sigma(video_sigma, shift_video, shift_audio)",
+        "latent_update": "native_model_sampling_av",
+        "manual_audio_update": False,
+    }
 
 
 def _h3_finite_audio(audio: dict[str, Any]) -> dict[str, Any]:
@@ -2690,10 +2744,13 @@ class H3TurboSampler:
                 "latent_image": ("LATENT",),
                 "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
                 "sampler_name": (
-                    ["euler"],
+                    list(H3_EULER_SAMPLER_NAMES),
                     {
                         "default": "euler",
-                        "tooltip": "Production Singularity Turbo uses the standard H3 Euler sampler.",
+                        "tooltip": (
+                            "Euler is the default. Euler Dual-clock explicitly selects "
+                            "H3's native video/audio ModelSamplingAV protocol."
+                        ),
                     },
                 ),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 200}),
@@ -2720,14 +2777,20 @@ class H3TurboSampler:
     ):
         """Validate the sampler contract before touching the loaded model."""
 
+        sampler_name = str(sampler_name)
         if runtime_config is None:
-            if sampler_name != "euler":
-                raise RuntimeError("Production H3 sampling requires sampler 'euler'.")
+            if sampler_name not in H3_EULER_SAMPLER_NAMES:
+                raise RuntimeError(
+                    "Production H3 sampling requires sampler 'euler' or "
+                    "'euler_dualclock'."
+                )
             return (
                 {
                     "steps": int(steps),
                     "nfe": int(steps),
                     "sampler_name": sampler_name,
+                    "base_sampler_name": "euler",
+                    "dual_clock": sampler_name == "euler_dualclock",
                     "scheduler": "simple",
                     "shift_video": 12.0,
                     "shift_audio": 3.0,
@@ -2743,11 +2806,21 @@ class H3TurboSampler:
         if turbo.get("enabled"):
             if expected_steps is None or not MIN_TURBO_STEPS <= int(expected_steps) <= MAX_TURBO_STEPS:
                 raise RuntimeError(f"H3 runtime config contains unsupported Turbo steps: {expected_steps!r}")
-            expected_sampler_name = schedule.get("sampler_name")
-            if sampler_name != expected_sampler_name or expected_sampler_name != "euler":
+            expected_sampler_name = str(schedule.get("sampler_name") or "euler")
+            if (
+                sampler_name not in H3_EULER_SAMPLER_NAMES
+                or expected_sampler_name not in H3_EULER_SAMPLER_NAMES
+            ):
                 raise RuntimeError(
-                    f"H3 Turbo schedule requires sampler {expected_sampler_name!r}; got {sampler_name!r}"
+                    f"H3 Turbo schedule requires sampler Euler or Euler Dual-clock; "
+                    f"got expected={expected_sampler_name!r}, selected={sampler_name!r}"
                 )
+            # Both modes use stock ComfyUI Euler.  The explicit mode changes
+            # the protocol selection and telemetry only; audio is not updated
+            # a second time outside native ModelSamplingAV.
+            schedule["base_sampler_name"] = "euler"
+            schedule["sampler_name"] = sampler_name
+            schedule["dual_clock"] = sampler_name == "euler_dualclock"
         elif sampler_name != schedule.get("sampler_name", sampler_name):
             raise RuntimeError(
                 f"H3 runtime config requires sampler {schedule.get('sampler_name')!r}; got {sampler_name!r}"
@@ -2756,7 +2829,15 @@ class H3TurboSampler:
 
     @staticmethod
     def _shift_model(model: Any, schedule: dict[str, Any]):
-        """Apply H3's official clone-based AV sigma-shift operation."""
+        """Apply H3's clone-based AV sigma-shift operation exactly once.
+
+        Recent ComfyUI H3 builds may already carry a ``ModelSamplingAV``
+        object from a native sigma-shift node.  Replacing an equivalent object
+        is harmless mathematically but can duplicate the apparent sampling
+        protocol in diagnostics and custom wrappers.  Reuse an equivalent
+        native object and only install a replacement when the requested shifts
+        differ.
+        """
 
         import comfy.model_sampling  # type: ignore
 
@@ -2769,24 +2850,43 @@ class H3TurboSampler:
 
         shifted = model.clone()
 
+        shift_video = float(schedule["shift_video"])
+        shift_audio = float(schedule["shift_audio"])
+        original = shifted.get_model_object("model_sampling")
+        same_native_av = False
+        try:
+            same_native_av = (
+                hasattr(original, "audio_scale")
+                and math.isclose(float(getattr(original, "shift")), shift_video)
+                and math.isclose(float(getattr(original, "audio_shift")), shift_audio)
+            )
+        except (AttributeError, TypeError, ValueError):
+            same_native_av = False
+
         class ModelSamplingAdvanced(comfy.model_sampling.ModelSamplingAV, comfy.model_sampling.CONST):
             pass
 
-        original = shifted.get_model_object("model_sampling")
-        model_sampling = ModelSamplingAdvanced(model.model.model_config)
-        model_sampling.set_parameters(
-            shift=float(schedule["shift_video"]),
-            audio_shift=float(schedule["shift_audio"]),
-        )
-        if hasattr(original, "noise_scale"):
-            model_sampling.set_noise_scale(original.noise_scale)
-        shifted.add_object_patch("model_sampling", model_sampling)
+        if not same_native_av:
+            model_sampling = ModelSamplingAdvanced(model.model.model_config)
+            model_sampling.set_parameters(
+                shift=shift_video,
+                audio_shift=shift_audio,
+            )
+            if hasattr(original, "noise_scale"):
+                model_sampling.set_noise_scale(original.noise_scale)
+            shifted.add_object_patch("model_sampling", model_sampling)
         copied_options = dict(getattr(shifted, "model_options", {}) or {})
         transformer_options = dict(copied_options.get("transformer_options") or {})
-        transformer_options["minimax_h3_sigma_shift_video"] = float(schedule["shift_video"])
-        transformer_options["minimax_h3_sigma_shift_audio"] = float(schedule["shift_audio"])
+        transformer_options["minimax_h3_sigma_shift_video"] = shift_video
+        transformer_options["minimax_h3_sigma_shift_audio"] = shift_audio
         copied_options["transformer_options"] = transformer_options
         shifted.model_options = copied_options
+        if same_native_av:
+            print(
+                "[Kaggle H3] Reusing existing native ModelSamplingAV object; "
+                "dual-clock shifts are not applied twice.",
+                flush=True,
+            )
         return shifted
 
     def sample(
@@ -2857,6 +2957,34 @@ class H3TurboSampler:
             sampler_backend_name = (
                 "euler" if sampler_name == "euler_dualclock" else sampler_name
             )
+            actual_clock_schedule = _h3_actual_clock_schedule(
+                sigmas,
+                shift_video=float(schedule.get("shift_video", 12.0)),
+                shift_audio=float(schedule.get("shift_audio", 3.0)),
+            )
+            sampler_selection = {
+                "requested": sampler_name,
+                "backend": sampler_backend_name,
+                "dual_clock": sampler_name == "euler_dualclock",
+                "protocol": "native_model_sampling_av",
+                "manual_audio_update": False,
+            }
+            print(
+                "[Kaggle H3] sampler selection and actual video/audio schedules: "
+                + json.dumps(
+                    {
+                        "selection": sampler_selection,
+                        "schedule": actual_clock_schedule,
+                    },
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+            if isinstance(runtime_config, dict):
+                execution = dict(runtime_config.get("execution") or {})
+                execution["sampler_selection"] = sampler_selection
+                execution["video_audio_schedule"] = actual_clock_schedule
+                runtime_config["execution"] = execution
             sampler = _h3_prepare_sampler(
                 sampler_backend_name,
                 comfy.samplers.sampler_object(sampler_backend_name),
@@ -2914,11 +3042,10 @@ class H3TurboSampler:
                 execution["dual_clock_sampling"] = {
                     "requested": bool(schedule.get("dual_clock", False)),
                     "sampler_mode": sampler_name,
-                    "backend": "native_model_sampling_av"
-                    if schedule.get("dual_clock", False)
-                    else "not_requested",
+                    "backend": "native_model_sampling_av",
                     "video_shift": schedule.get("shift_video"),
                     "audio_shift": schedule.get("shift_audio"),
+                    "manual_audio_update": False,
                 }
                 if diffusion_telemetry is not None and diffusion_telemetry.enabled:
                     execution["diffusion_telemetry"] = diffusion_telemetry.summary()
@@ -3046,7 +3173,7 @@ class H3TurboSampler:
             f"[Kaggle H3] {resolved_mode} sampler consumed H3 runtime config: "
             f"turbo={bool(turbo.get('enabled'))}, steps={expected_steps}, "
             f"shift={schedule.get('shift_video')}/{schedule.get('shift_audio')}, "
-            f"sampler={sampler_name}, dual_clock={bool(schedule.get('dual_clock', False))}, "
+            f"sampler={sampler_name}, dual_clock={sampler_name == 'euler_dualclock'}, "
             f"sage_attention={bool(sage_attention)}, synchronize={synchronize_mode}",
             flush=True,
         )

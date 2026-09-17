@@ -762,9 +762,10 @@ def build_runtime_config(
             "source": "base_h3_schedule",
         }
 
-    # Production deliberately uses the standard H3 Euler path.  The existing
-    # CUDA synchronization and phase dispatch remain responsible for numerical
-    # stability; experimental dual-clock sampling is not part of this profile.
+    # Keep the runtime config's canonical sampler as Euler.  The dedicated
+    # sampler may explicitly select ``euler_dualclock`` as an alias while
+    # retaining the same H3 ModelSamplingAV shifts and CUDA/phase contracts.
+    # This avoids embedding a second audio update in the adapter stack.
     schedule = dict(schedule)
     schedule["sampler_name"] = "euler"
 

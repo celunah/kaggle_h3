@@ -239,7 +239,7 @@ synchronization, quantized-copy barriers, transfer barriers, or H3-safe
 
 Per-step diffusion telemetry is separately opt-in. Set
 `KAGGLE_H3_DIFFUSION_TELEMETRY=1` to emit structured JSON records for each
-`res_multistep` or Turbo `euler` step at `input`, `model_output`, `denoised`, `history`, and
+`res_multistep` or Turbo `euler`/`euler_dualclock` step at `input`, `model_output`, `denoised`, `history`, and
 `updated_latent`. Every record includes sigma/timestep, min, max, mean, std,
 finite count, dtype, device, and tensor path. The model API exposes the
 denoised prediction directly, so `denoised` is recorded as an explicit alias
@@ -263,7 +263,15 @@ ComfyUI patcher to return the model to CPU, and clears the cache before VAE
 decode. The text-encoder and VAE phases have matching cleanup paths, including
 failure cleanup, so a sampler or decode exception does not intentionally retain
 their GPU pages.
-The dedicated `Kaggle H3 | H3 Turbo Sampler` exposes `synchronize_mode`, which
+The dedicated `Kaggle H3 | H3 Turbo Sampler` exposes `sampler_name` with
+regular `euler` as the default and optional `euler_dualclock`. Both modes use
+ComfyUI's native H3 `ModelSamplingAV` protocol: the video sigma grid drives
+the sampler, while H3 derives the audio sigma/timestep schedule from the
+video schedule. The dual-clock mode does not perform a second manual audio
+latent update, avoiding double application of the native H3 behavior. The
+sampler logs the selected mode and actual video/audio sigma and timestep
+schedules into `H3_RUNTIME_CONFIG` and the ComfyUI console.
+It also exposes `synchronize_mode`, which
 defaults to `full` so existing workflows retain the proven behavior. `full`
 keeps every device-wide block and per-step barrier. `safe` keeps every block,
 transfer, quantized-copy, and cleanup barrier but limits the redundant
@@ -286,10 +294,10 @@ AAC mux boundary, preventing PyAV's opaque `avcodec_send_frame()` failure.
 ### Production scope
 
 The production surface intentionally does not expose FL2VA, T2VA, FP8,
-non-Turbo sampling, 720p, dual-clock sampling, Context Loop, SageAttention,
-or latent upscaling. Those experiments are not part of this cleanup and are
-not selected by the shipped workflows. The sampler remains Euler-only with
-the existing `full`/`safe`/`fast` synchronization policy, and the phase-aware
+non-Turbo sampling, 720p, Context Loop, SageAttention, or latent upscaling.
+Euler Dual-clock is available as an opt-in sampler mode, while regular Euler
+remains the default and the shipped workflows are unchanged. Both retain the
+existing `full`/`safe`/`fast` synchronization policy, and the phase-aware
 dispatcher continues to preserve the dual-T4, activation-streaming, staged
 loading, VAE routing, CPU offload, and finite-diagnostic behavior.
 

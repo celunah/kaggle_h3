@@ -12,6 +12,7 @@ from .bootstrap import COMMON_MODEL_FILES, MODE_MODEL_FILES
 from .adapters import AUTO_SINGULARITY_ADAPTER, MAX_TURBO_STEPS, MIN_TURBO_STEPS
 from .ref2va import quality_mode_to_ref2va_preset, resolve_ref2va_dimensions
 
+PRODUCTION_SAMPLER_NAMES = ("euler", "euler_dualclock")
 
 ASPECT_RATIOS: dict[str, tuple[int, int]] = {
     "16:9": (16, 9),
@@ -95,6 +96,7 @@ class H3Request:
     model_profile: str = "singularity"
     sage_attention: bool = False
     synchronize_mode: str = "full"
+    sampler_name: str = "euler"
     mute_generated_audio: bool = False
 
     def assets(self) -> list[ReferenceAsset]:
@@ -174,6 +176,11 @@ def select_production_mode(request: H3Request) -> str:
         raise ValueError("The production Kaggle H3 workflow requires the Singularity model profile.")
     if request.sage_attention:
         raise ValueError("SageAttention is not part of the production H3 profile yet.")
+    if request.sampler_name not in PRODUCTION_SAMPLER_NAMES:
+        raise ValueError(
+            "Production H3 supports sampler 'euler' or 'euler_dualclock'; "
+            f"got {request.sampler_name!r}."
+        )
     if request.width is not None or request.height is not None:
         raise ValueError("Production H3 uses the 240p, 360p, and 480p presets; explicit dimensions are disabled.")
     steps = int(request.steps if request.steps is not None else request.turbo_steps)
@@ -494,7 +501,7 @@ def build_workflow(
             "conditioning": ["phase", 1] if use_explicit_h3_loaders else ["h3", 0],
             "latent_image": ["phase", 2] if use_explicit_h3_loaders else ["h3", 1],
             "noise_seed": int(request.seed),
-            "sampler_name": "euler",
+            "sampler_name": request.sampler_name,
             "steps": quality_steps(request),
             "synchronize_mode": request.synchronize_mode,
         },
@@ -566,7 +573,15 @@ def build_workflow(
                 "(replaces inactive checkpoint)"
             )
         elif node_id == "sample":
-            label = f"Kaggle H3 | Singularity Turbo Sampler (Euler; {quality_steps(request)} steps)"
+            sampler_label = (
+                "Euler Dual-clock"
+                if request.sampler_name == "euler_dualclock"
+                else "Euler"
+            )
+            label = (
+                "Kaggle H3 | Singularity Turbo Sampler "
+                f"({sampler_label}; {quality_steps(request)} steps)"
+            )
         elif node_id == "video" and request.mute_generated_audio:
             label = "Kaggle H3 | Assemble Video (generated audio muted)"
         node["_meta"] = {"title": label}
@@ -597,7 +612,6 @@ def validate_production_workflow_shape(workflow: dict[str, Any]) -> dict[str, An
         "t2va": "T2VA",
         "fp8": "FP8",
         "720p": "720p",
-        "euler_dualclock": "dual-clock sampling",
         "res_multistep": "non-Turbo res_multistep",
         "sage_attention": "SageAttention",
     }

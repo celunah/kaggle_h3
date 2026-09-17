@@ -98,6 +98,19 @@ class WorkflowTests(unittest.TestCase):
                 H3Request("geometry", character_references=["character.png"], width=640)
             )
 
+    def test_production_workflow_can_select_optional_dual_clock_euler(self):
+        workflow = build_workflow(
+            H3Request(
+                "dual clock",
+                character_references=["character.png"],
+                sampler_name="euler_dualclock",
+                steps=12,
+            )
+        )
+        self.assertEqual(workflow["sample"]["inputs"]["sampler_name"], "euler_dualclock")
+        self.assertIn("Euler Dual-clock", workflow["sample"]["_meta"]["title"])
+        self.assertTrue(validate_production_workflow_shape(workflow)["valid"])
+
     def test_model_mode_names_are_case_insensitive(self):
         self.assertIn("ref2va", required_model_files("ref2va")["diffusion_model"][1].lower())
 
