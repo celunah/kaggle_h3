@@ -1,0 +1,267 @@
+{
+  "policy": {
+    "class_type": "MiniMaxH3GenerationProfile",
+    "inputs": {
+      "scene_continuity": "Visual continuity",
+      "audio_profile": "Generate audio"
+    },
+    "_meta": {"title": "Long Video Workflow | Visual + Generated Audio Continuity"}
+  },
+  "plan": {
+    "class_type": "MiniMaxH3ChainPlanModern",
+    "inputs": {
+      "plan_json": "{\"shots\":[{\"id\":\"scene_01\",\"prompt\":\"Establish the bright open field and the subject.\"},{\"id\":\"scene_02\",\"prompt\":\"Continue the same take with a small natural movement.\"},{\"id\":\"scene_03\",\"prompt\":\"Continue the same take while the camera makes a gentle lateral move.\"},{\"id\":\"scene_04\",\"prompt\":\"Finish the same take with the subject settling back into place.\"}]}",
+      "chain_policy": ["policy", 0],
+      "run_name": "h3_long_video",
+      "generation_fingerprint": "singularity_ref2va_turbo_4_euler_dualclock",
+      "width": 640,
+      "height": 352,
+      "encode_mode": "video",
+      "crop": "disabled",
+      "default_duration_seconds": 5.0,
+      "default_steps": ["step_count", 0],
+      "base_seed": 12345,
+      "segment_crf": 18,
+      "video_blend_frames": 0
+    },
+    "_meta": {"title": "Long Video Workflow | Plan 4 Sequential Ref2VA Scenes"}
+  },
+  "step_count": {
+    "class_type": "FirstInt",
+    "inputs": {"fallback": 4},
+    "_meta": {"title": "Long Video Workflow | Shared Scene Step Count"}
+  },
+  "unet": {
+    "class_type": "KaggleH3ShardedDiffusionLoader",
+    "inputs": {
+      "model_variant": "Ref2VA",
+      "model_profile": "singularity",
+      "precision": "int8_convrot",
+      "weight_dtype": "default",
+      "gpu_0": 0,
+      "gpu_1": 1
+    },
+    "_meta": {"title": "Long Video Workflow | Singularity Ref2VA Auto Loader"}
+  },
+  "clip": {
+    "class_type": "KaggleH3TextEncoderLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "type": "minimax",
+      "device_id": 0
+    },
+    "_meta": {"title": "Long Video Workflow | Text Encoder (GPU0)"}
+  },
+  "vae_video": {
+    "class_type": "KaggleH3VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors",
+      "role": "video",
+      "device_id": 1
+    },
+    "_meta": {"title": "Long Video Workflow | Video VAE (GPU1)"}
+  },
+  "vae_audio": {
+    "class_type": "KaggleH3VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors",
+      "role": "audio",
+      "device_id": 0
+    },
+    "_meta": {"title": "Long Video Workflow | Audio VAE (GPU0)"}
+  },
+  "h3_adapter": {
+    "class_type": "KaggleH3AdapterStack",
+    "inputs": {
+      "model": ["unet", 0],
+      "model_variant": "ref2va",
+      "turbo_mode": true,
+      "turbo_steps": ["step_count", 0],
+      "adapter_1": "auto_singularity_ref2va_turbo",
+      "strength_1": 1.0,
+      "adapter_2": "None",
+      "strength_2": 1.0,
+      "adapter_3": "None",
+      "strength_3": 1.0,
+      "conditioning_mode": "Ref2VA"
+    },
+    "_meta": {"title": "Long Video Workflow | Matching Singularity Ref2VA Turbo LoRA"}
+  },
+  "loop_start": {
+    "class_type": "MiniMaxH3ChainLoopStart",
+    "inputs": {
+      "plan": ["plan", 0],
+      "start_clip": 1,
+      "verify_resume_history": true
+    },
+    "_meta": {"title": "Long Video Workflow | Start or Resume Scene Chain"}
+  },
+  "current": {
+    "class_type": "MiniMaxH3ChainCurrent",
+    "inputs": {"state": ["loop_start", 1]},
+    "_meta": {"title": "Long Video Workflow | Current Scene Prompt, Seed, Size, Steps"}
+  },
+  "h3": {
+    "class_type": "KaggleH3Conditioning",
+    "inputs": {
+      "clip": ["clip", 0],
+      "vae": ["vae_video", 0],
+      "audio_vae": ["vae_audio", 0],
+      "mode": "Ref2VA",
+      "prompt": ["current", 4],
+      "seconds": 5.0,
+      "size_preset": "360p",
+      "aspect_ratio": "16:9",
+      "ref_image_size": "match",
+      "reference_0": "image",
+      "reference_0.file": "CHARACTER_REFERENCE.png",
+      "reference_1": "image",
+      "reference_1.file": "SCENE_REFERENCE.png",
+      "width": ["current", 8],
+      "height": ["current", 9],
+      "length": ["current", 6]
+    },
+    "_meta": {"title": "Long Video Workflow | Ref2VA Current-Scene Conditioning"}
+  },
+  "context": {
+    "class_type": "MiniMaxH3ChainContext",
+    "inputs": {
+      "state": ["current", 0],
+      "conditioning": ["h3", 0],
+      "vae": ["vae_video", 0],
+      "latent": ["h3", 1],
+      "audio_vae": ["vae_audio", 0]
+    },
+    "_meta": {"title": "Long Video Workflow | Carry Visual + Audio Context Forward"}
+  },
+  "core_bundle": {
+    "class_type": "Bundle (obvpm)",
+    "inputs": {
+      "names": "model\nruntime_config\nconditioning\nlatent_image",
+      "in_1": ["h3_adapter", 0],
+      "in_2": ["h3_adapter", 1],
+      "in_3": ["context", 0],
+      "in_4": ["context", 3]
+    },
+    "_meta": {"title": "Long Video Workflow | Bundle Scene Generation Wires"}
+  },
+  "core_unbundle": {
+    "class_type": "Unbundle (obvpm)",
+    "inputs": {
+      "in": ["core_bundle", 0],
+      "names": "model\nruntime_config\nconditioning\nlatent_image"
+    },
+    "_meta": {"title": "Long Video Workflow | Unbundle Scene Generation Wires"}
+  },
+  "phase": {
+    "class_type": "KaggleH3PhaseDispatch",
+    "inputs": {
+      "model": ["core_unbundle", 0],
+      "runtime_config": ["core_unbundle", 1],
+      "conditioning": ["core_unbundle", 2],
+      "latent_image": ["core_unbundle", 3]
+    },
+    "_meta": {"title": "Long Video Workflow | Dual-T4 Scene Transformer Dispatch"}
+  },
+  "sample": {
+    "class_type": "KaggleH3ContextLoopSampler",
+    "inputs": {
+      "model": ["phase", 0],
+      "runtime_config": ["phase", 3],
+      "conditioning": ["phase", 1],
+      "latent_image": ["phase", 2],
+      "noise_seed": ["current", 5],
+      "sampler_name": "euler_dualclock",
+      "steps": ["current", 7],
+      "synchronize_mode": "safe",
+      "use_sage_attention": false
+    },
+    "_meta": {"title": "Long Video Workflow | Context Loop Euler Dual-clock Scene Sampler"}
+  },
+  "decode": {
+    "class_type": "KaggleH3VAEDecode",
+    "inputs": {
+      "samples": ["sample", 1],
+      "vae": ["vae_video", 0],
+      "device_id": 1,
+      "runtime_config": ["phase", 3]
+    },
+    "_meta": {"title": "Long Video Workflow | Scene Video Decode (GPU1)"}
+  },
+  "decode_audio": {
+    "class_type": "KaggleH3AudioVAEDecode",
+    "inputs": {
+      "samples": ["sample", 2],
+      "vae": ["vae_audio", 0],
+      "device_id": 0,
+      "mute_generated_audio": false,
+      "runtime_config": ["phase", 3]
+    },
+    "_meta": {"title": "Long Video Workflow | Scene Audio Decode (GPU0)"}
+  },
+  "trim": {
+    "class_type": "MiniMaxH3LoopTrim",
+    "inputs": {
+      "images": ["decode", 0],
+      "trim_frames": ["context", 1],
+      "audio": ["decode_audio", 0],
+      "fps": 24.0,
+      "match_tail": true,
+      "state": ["current", 0]
+    },
+    "_meta": {"title": "Long Video Workflow | Trim Carried Scene Overlap"}
+  },
+  "segment_save": {
+    "class_type": "MiniMaxH3ChainSegmentSave",
+    "inputs": {
+      "state": ["current", 0],
+      "images": ["trim", 0],
+      "sampled_latent": ["sample", 0],
+      "audio": ["trim", 1],
+      "images_with_overlap": ["trim", 2],
+      "denoised_latent": ["sample", 3]
+    },
+    "_meta": {"title": "Long Video Workflow | Save Scene Checkpoint"}
+  },
+  "review": {
+    "class_type": "MiniMaxH3ChainReview",
+    "inputs": {
+      "state": ["current", 0],
+      "segment": ["segment_save", 0],
+      "enabled": true,
+      "play_notification_sound": false,
+      "auto_continue_timeout_minutes": 0.0,
+      "unload_models_while_waiting": true,
+      "assemble_partial_on_stop": true,
+      "partial_audio_source": "checkpointed",
+      "candidate_count": 1,
+      "review_each_candidate": false
+    },
+    "_meta": {"title": "Long Video Workflow | Review / Approve / Reroll Scene"}
+  },
+  "loop_end": {
+    "class_type": "MiniMaxH3ChainLoopEnd",
+    "inputs": {
+      "flow": ["loop_start", 0],
+      "state": ["current", 0],
+      "images": ["trim", 0],
+      "sampled_latent": ["sample", 0],
+      "segment": ["review", 0],
+      "between_scene_cleanup": "unload_models",
+      "execution_mode": "recursive_legacy"
+    },
+    "_meta": {"title": "Long Video Workflow | Continue or Finish Scene Chain"}
+  },
+  "assemble": {
+    "class_type": "MiniMaxH3ChainAssemble",
+    "inputs": {
+      "manifest": ["loop_end", 0],
+      "audio_source": "plan",
+      "filename": "h3_long_video",
+      "audio_bitrate": 256,
+      "copy_to_output": true,
+      "output_subfolder": "kaggle_h3"
+    },
+    "_meta": {"title": "Long Video Workflow | Assemble Approved Scenes into Final MP4"}
+  }
+}

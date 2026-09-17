@@ -38,17 +38,18 @@ The final Kaggle report must be read from the run manifest. It must not claim bo
 
 - `../kaggle_h3.zip`: clean upload bundle containing this package and `kaggle_h3.ipynb` without generated results, model weights, or Python caches.
 - `../kaggle_h3.ipynb`: entrypoint notebook kept beside this package; upload/import it into Kaggle and run top to bottom.
-- `workflows/kaggle_h3_ref2va.json`: production Singularity Ref2VA API-format graph.
-- `workflows/kaggle_h3_turbo_smoke.json`: Ref2VA 360p/16:9, 5-second, 4-step adapter smoke graph using the checked-in character and scene reference images.
+- `workflows/kaggle_h3_turbo_smoke.json`: H3 Test Workflow with fixed Singularity Ref2VA, matching Turbo LoRA, references, 360p/16:9, 5 seconds, seed 7, Euler, 4 steps, and full synchronization.
+- `workflows/kaggle_h3_ref2va.json`: Regular Video Workflow with editable references/prompt, resolution/duration, shared step count, Euler or Euler Dual-clock, SageAttention, optional 2x upscale, and optional generated-audio mute.
+- `workflows/kaggle_h3_long_context_loop.json`: Long Video Workflow using the separate Context Loop dependency for scene planning, sequential generation, context carry, checkpoints, review/rerolls, recovery, and final assembly.
 - `custom_nodes/kaggle_h3_adapters.py`: the auto-resolved smoke reference loader, global conditioning implementation, legacy bounded Ref2VA wrapper, just-in-time diffusion auto-loader, explicit H3 text-encoder/VAE loaders, a conditioning-complete phase barrier, `H3 Adapter Stack`, phase-aware H3 sampler, optional T4 SageAttention toggle, optional CPU 2x latent-upscale phase, and GPU0/GPU1 audio/video VAE decode nodes.
 - `custom_nodes/kaggle_h3_context_loop.py`: the thin Context Loop compatibility sampler; it does not contain or vendor the external Context Loop source.
 - `custom_nodes/kaggle_h3_conditioning.py`: the separate V3 entrypoint that registers the autogrowing `Kaggle H3 Conditioning` node; it is separate because ComfyUI prioritizes legacy mappings over a same-module V3 entrypoint.
-- At runtime, the bootstrap copies only the Kaggle node modules and adapter catalog into `ComfyUI/custom_nodes`; dependency-light helpers are installed under the private `ComfyUI/kaggle_h3_support/` package so ComfyUI does not scan them as separate custom nodes. It separately clones the pinned `ethanfel/ComfyUI-MiniMaxH3-Context-Loop` dependency into its own custom-node directory; that source is never copied or vendored into this repository.
+- At runtime, the bootstrap copies only the Kaggle node modules and adapter catalog into `ComfyUI/custom_nodes`; dependency-light helpers are installed under the private `ComfyUI/kaggle_h3_support/` package so ComfyUI does not scan them as separate custom nodes. It separately clones the pinned Context Loop and OBVPM dependencies into their own custom-node directories; those sources are never copied or vendored into this repository.
 - `src/kaggle_h3/model_manager.py`: pinned, one-variant-at-a-time H3 diffusion download and exact inactive-checkpoint removal used by the ComfyUI loader.
 - `src/kaggle_h3/ref2va.py`: shared Ref2VA seconds, 17*k+5 frame alignment, and 32-pixel canvas-preset rules.
 - `src/kaggle_h3/phase_runtime.py`: phase orchestration, automatic Qwen language-layer dispatch/release, Accelerate dispatch verification, GPU/RAM monitoring, transformer release, and per-VAE device placement.
 - `custom_nodes/kaggle_h3_adapter_catalog.json`: pinned built-in adapter metadata and registration surface.
-- `custom_nodes.lock`: resolved ComfyUI, Context Loop, and optional multi-GPU custom-node revisions.
+- `custom_nodes.lock`: resolved ComfyUI, Context Loop, OBVPM, and optional multi-GPU custom-node revisions.
 - `src/kaggle_h3/`: bootstrap, ComfyUI API, backend checks/workers, workflow builder, telemetry, pipeline, and media validation.
 - `requirements-h3-layer-sharded.txt`: optional Diffusers/Accelerate stack for the experimental automatic transformer-block dispatcher.
 - `tests/`: dependency-light local checks.
@@ -65,9 +66,9 @@ without relying on their internal node IDs.
 2. Enable Internet only if ComfyUI, Python packages, or public Hugging Face model files need to be downloaded. Public files do not require a token. If a gated mirror is used, create a Kaggle secret named `HF_TOKEN`; the notebook reads it without printing it. The dependency cell installs the optional layer-dispatch stack by default; set `INSTALL_LAYER_SHARDED_BACKEND = False` there for a ComfyUI-only session.
 3. Run the dependency and hardware cells. They print every detected CUDA device, model capacity, CPU RAM, and all backend decisions, including the explicit fallback.
 4. The notebook performs the hardware/backend preflight automatically. Its direct ComfyUI frontend exposes both visible T4s, sets `KAGGLE_H3_PHASE_SHARDING=auto`, and lets the custom H3 loader/barrier apply the phase-aware two-GPU path. The loader and sampler refuse to disguise a one-GPU map as sharded; set `KAGGLE_H3_PHASE_SHARDING=off` only for the explicit fallback.
-5. The startup cell starts ComfyUI, clones the pinned checkout when needed, installs its `requirements.txt`, downloads only the shared H3 text/audio/video assets into `/kaggle/tmp/minimax-h3-models`, configures ComfyUI to read that external model tree, installs the H3 adapter node and the separate pinned Context Loop dependency, and stages the smoke references into ComfyUI's `input/` directory. The supplied workflows select those staged files directly inside `Kaggle H3 Conditioning`; no separate reference-loader nodes are required. It does not pre-download a diffusion checkpoint, construct a workflow, or queue a request. The production `Kaggle H3 | Singularity Ref2VA INT8 Auto Loader` removes the inactive known diffusion file and streams the pinned Singularity checkpoint only when the workflow executes. `/kaggle/tmp` is scratch storage and must be repopulated after a new session.
+5. The startup cell starts ComfyUI, clones the pinned checkout when needed, installs its `requirements.txt`, downloads only the shared H3 text/audio/video assets into `/kaggle/tmp/minimax-h3-models`, configures ComfyUI to read that external model tree, installs the H3 adapter node plus the separate pinned Context Loop and OBVPM dependencies, and stages the smoke references into ComfyUI's `input/` directory. The supplied workflows select those staged files directly inside `Kaggle H3 Conditioning`; no separate reference-loader nodes are required. It does not pre-download a diffusion checkpoint, construct a workflow, or queue a request. The production `Kaggle H3 | Singularity Ref2VA INT8 Auto Loader` removes the inactive known diffusion file and streams the pinned Singularity checkpoint only when the workflow executes. `/kaggle/tmp` is scratch storage and must be repopulated after a new session.
 6. ComfyUI is started on internal port `8188` with `0.0.0.0` binding for the notebook environment. When two GPUs are in the preflight plan, the launcher explicitly sets `CUDA_VISIBLE_DEVICES=0,1` and passes `--cuda-device 0,1`; it then checks `/system_stats` and stops before loading a workflow if ComfyUI exposes fewer than two devices. The startup output must therefore show both devices and roughly 29 GiB total VRAM, rather than only `cuda:0`. If it reports one device, stop the old ComfyUI process and rerun the updated startup cell; changing environment variables cannot change an already-running process. The notebook reloads the bootstrap module when that cell is rerun, so a full kernel reset is not required unless an older ComfyUI child remains alive. The notebook then prints the local runtime address and leaves public exposure optional. To test remote access, run the optional public-tunnel cell in the entrypoint; it restarts ComfyUI with `--enable-cors-header *` for the dynamic tunnel hostname, downloads `cloudflared` into `/kaggle/tmp`, starts a temporary tunnel to `http://127.0.0.1:8188`, and prints the generated URL if Kaggle permits it. This public mode disables ComfyUI's origin protection, so anyone with the URL can access the unauthenticated instance. The phase sampler prints an observed map and per-device peak memory during each generation.
-7. Build or import the production Ref2VA graph in the web interface. `H3 Adapter Stack` automatically selects the pinned 4-step adapter for 4 steps and the compatible 8-step adapter for 8 or other valid custom step counts. The node downloads its selected LoRA into `ComfyUI/models/loras/` on first use. `Use SageAttention` is opt-in and falls back to normal attention if the pinned T4-compatible environment is unavailable. Insert `Kaggle H3 | Optional 2x Latent Upscale` between the sampler and video VAE only when desired; it keeps a CPU original-latent fallback. Enable `Mute generated audio` on the audio decoder when a video-only MP4 is wanted; audio VAE processing is skipped.
+7. Import the supplied workflow that matches the task: **H3 Test Workflow** for a fixed known-good smoke run, **Regular Video Workflow** for one editable clip, or **Long Video Workflow** for Context Loop scene chaining. In the regular graph, `H3 Adapter Stack` automatically selects the pinned matching Turbo adapter for the shared step count; `Use SageAttention`, the 2x latent upscale toggle, and `Mute generated audio` are explicit controls. OBVPM's Bundle/Unbundle nodes keep the model, runtime, conditioning, and latent wires grouped without changing the H3 execution path.
 
 Use `Kaggle H3 Conditioning` between the loaders and `Kaggle H3 | Transformer
 Dispatch Barrier`. It contains the prompt, Ref2VA references, seconds,
@@ -298,7 +299,12 @@ The bootstrap installs [ComfyUI-MiniMaxH3-Context-Loop](https://github.com/ethan
 
 Connect the external `ChainContext` outputs to `Kaggle H3 | Context Loop Sampler`. This compatibility node requires a Singularity Ref2VA Turbo `H3_RUNTIME_CONFIG`, delegates the scene to the existing `H3TurboSampler`, preserves the phase-aware dual-T4 dispatcher and synchronization/offload path, and repacks the separate video/audio outputs into the AV latent contract expected by Context Loop checkpointing. Connect its `sampled_latent` to `MiniMaxH3ChainSegmentSave`, and its `video_latent`/`audio_latent` outputs to the Kaggle GPU1/GPU0 VAE decode nodes before Context Loop trim and review. Later scenes consume the saved visual/audio AV latent through `MiniMaxH3ChainContext`; FL2VA is neither selected nor required.
 
-The optional Context Loop path does not install another H3 model, use `KSampler`/`SamplerCustomAdvanced` for generation, or bypass Kaggle's model loader. It is not part of the shipped single-scene production workflows. Context Loop's own example workflows may contain experimental FL2VA, SageAttention, or upscale branches; do not use those branches for this Kaggle profile.
+The supplied Long Video Workflow uses Context Loop's Plan, Loop Start, Current
+Shot, Chain Context, Loop Trim, Segment Save, Review, Loop End, and Assemble
+nodes. It keeps every actual scene generation on `KaggleH3ContextLoopSampler`,
+which delegates to the existing Singularity Ref2VA sampler and phase dispatcher.
+Context Loop's own example workflows may contain experimental FL2VA, SageAttention,
+or upscale branches; do not use those branches for this Kaggle profile.
 
 ### Optional SageAttention and latent upscale
 
@@ -324,14 +330,12 @@ budget.
 
 ### Production scope
 
-The production single-scene surface intentionally does not expose FL2VA, T2VA,
-FP8, non-Turbo sampling, or 720p. SageAttention and 2x latent upscaling are
-available only as explicit opt-in phases and are not selected by the shipped
-single-scene workflows. Context Loop is available only as the separate
-optional Ref2VA integration described above; it is not selected by the shipped
-single-scene workflows. Euler
-Dual-clock is available as an opt-in sampler mode, while regular Euler
-remains the default and the shipped workflows are unchanged. Both retain the
+The production surface intentionally does not expose FL2VA, T2VA, FP8, or
+non-Turbo sampling. SageAttention and 2x latent upscaling are explicit opt-in
+controls in the Regular Video Workflow. Context Loop is selected only by the
+separate Long Video Workflow described above. Euler Dual-clock is available as
+an opt-in sampler mode, while regular Euler remains the default in the Regular
+Video Workflow. Both retain the
 existing `full`/`safe`/`fast` synchronization policy, and the phase-aware
 dispatcher continues to preserve the dual-T4, activation-streaming, staged
 loading, VAE routing, CPU offload, and finite-diagnostic behavior.

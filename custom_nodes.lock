@@ -15,5 +15,11 @@
     "ref": "a8bb6c7b886312cc2821cd9959897d0088efdfe2",
     "resolved_commit": "a8bb6c7b886312cc2821cd9959897d0088efdfe2",
     "purpose": "Separate scene chaining, context propagation, checkpoint/review/recovery, and final assembly dependency; actual generation routes through KaggleH3ContextLoopSampler."
+  },
+  "obvpm": {
+    "repository": "https://github.com/chanon/comfyui-obvpm.git",
+    "ref": "cb03d4c6f7d4cc4496517b232db5654bebbc6f6c",
+    "resolved_commit": "cb03d4c6f7d4cc4496517b232db5654bebbc6f6c",
+    "purpose": "Separate workflow-layout dependency providing Bundle and Unbundle nodes used by the shipped H3 graphs."
   }
 }

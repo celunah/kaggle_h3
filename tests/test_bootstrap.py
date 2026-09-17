@@ -13,6 +13,7 @@ from kaggle_h3.bootstrap import (
     ensure_github_checkout,
     install_h3_adapter_node,
     install_context_loop_node,
+    install_obvpm_node,
     model_file_status,
     required_model_files,
     stage_smoke_assets,
@@ -29,6 +30,7 @@ class BootstrapTests(unittest.TestCase):
                 comfy_root,
                 Path(__file__).parents[1],
                 install_context_loop=False,
+                install_obvpm=False,
             )
 
             custom_nodes = comfy_root / "custom_nodes"
@@ -160,6 +162,17 @@ assert len(module.NODE_CLASS_MAPPINGS) == 11
         ):
             self.assertTrue(result["node_roles"][role])
             self.assertTrue(set(result["node_roles"][role]) <= required)
+
+    def test_obvpm_install_is_separate_and_pinned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result = install_obvpm_node(
+                Path(temporary) / "ComfyUI",
+                dry_run=True,
+            )
+        self.assertEqual(result["status"], "would_clone")
+        self.assertEqual(len(result["requested_ref"]), 40)
+        self.assertIn("Bundle (obvpm)", result["required_node_ids"])
+        self.assertIn("Unbundle (obvpm)", result["required_node_ids"])
 
     def test_github_checkout_refuses_non_git_existing_directory(self):
         with tempfile.TemporaryDirectory() as temporary:

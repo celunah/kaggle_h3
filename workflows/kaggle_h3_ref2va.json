@@ -9,15 +9,35 @@
       "gpu_0": 0,
       "gpu_1": 1
     },
-    "_meta": {"title": "Kaggle H3 | Singularity Ref2VA INT8 Auto Loader"}
+    "_meta": {"title": "Regular Video Workflow | Singularity Ref2VA Auto Loader"}
   },
   "clip": {
     "class_type": "KaggleH3TextEncoderLoader",
-    "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "type": "minimax", "device_id": 0},
-    "_meta": {"title": "Kaggle H3 | Text Encoder (GPU0)"}
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "type": "minimax",
+      "device_id": 0
+    },
+    "_meta": {"title": "Regular Video Workflow | Text Encoder (GPU0)"}
   },
-  "vae_video": {"class_type": "KaggleH3VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors", "role": "video", "device_id": 1}, "_meta": {"title": "Kaggle H3 | Video VAE (GPU1)"}},
-  "vae_audio": {"class_type": "KaggleH3VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors", "role": "audio", "device_id": 0}, "_meta": {"title": "Kaggle H3 | Audio VAE (GPU0)"}},
+  "vae_video": {
+    "class_type": "KaggleH3VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors",
+      "role": "video",
+      "device_id": 1
+    },
+    "_meta": {"title": "Regular Video Workflow | Video VAE (GPU1)"}
+  },
+  "vae_audio": {
+    "class_type": "KaggleH3VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors",
+      "role": "audio",
+      "device_id": 0
+    },
+    "_meta": {"title": "Regular Video Workflow | Audio VAE (GPU0)"}
+  },
   "h3": {
     "class_type": "KaggleH3Conditioning",
     "inputs": {
@@ -25,7 +45,7 @@
       "vae": ["vae_video", 0],
       "audio_vae": ["vae_audio", 0],
       "mode": "Ref2VA",
-      "prompt": "Preserve the subject identity from <Picture 1> and the scene composition from <Picture 2>; animate one continuous shot.",
+      "prompt": "Preserve the subject from <Picture 1> and the scene from <Picture 2>. Describe the motion and camera behavior here.",
       "seconds": 5.0,
       "size_preset": "360p",
       "aspect_ratio": "16:9",
@@ -35,7 +55,12 @@
       "reference_1": "image",
       "reference_1.file": "SCENE_REFERENCE.png"
     },
-    "_meta": {"title": "Kaggle H3 | Global Conditioning (Singularity Ref2VA)"}
+    "_meta": {"title": "Regular Video Workflow | Choose Prompt, References, Resolution, Duration"}
+  },
+  "step_count": {
+    "class_type": "FirstInt",
+    "inputs": {"fallback": 4},
+    "_meta": {"title": "Regular Video Workflow | Shared Turbo Step Count"}
   },
   "h3_adapter": {
     "class_type": "KaggleH3AdapterStack",
@@ -43,7 +68,7 @@
       "model": ["unet", 0],
       "model_variant": "ref2va",
       "turbo_mode": true,
-      "turbo_steps": 4,
+      "turbo_steps": ["step_count", 0],
       "adapter_1": "auto_singularity_ref2va_turbo",
       "strength_1": 1.0,
       "adapter_2": "None",
@@ -52,12 +77,105 @@
       "strength_3": 1.0,
       "conditioning_mode": "Ref2VA"
     },
-    "_meta": {"title": "Kaggle H3 | Singularity Turbo Adapter Stack"}
+    "_meta": {"title": "Regular Video Workflow | Matching Singularity Ref2VA Turbo LoRA"}
   },
-  "phase": {"class_type": "KaggleH3PhaseDispatch", "inputs": {"model": ["h3_adapter", 0], "runtime_config": ["h3_adapter", 1], "conditioning": ["h3", 0], "latent_image": ["h3", 1]}, "_meta": {"title": "Kaggle H3 | Transformer Dispatch Barrier"}},
-  "sample": {"class_type": "KaggleH3TurboSampler", "inputs": {"model": ["phase", 0], "runtime_config": ["phase", 3], "conditioning": ["phase", 1], "latent_image": ["phase", 2], "noise_seed": 42, "sampler_name": "euler", "steps": 4, "synchronize_mode": "full", "use_sage_attention": false}, "_meta": {"title": "Kaggle H3 | Singularity Turbo Sampler (Euler; 4 steps)"}},
-  "decode": {"class_type": "KaggleH3VAEDecode", "inputs": {"samples": ["sample", 0], "vae": ["vae_video", 0], "device_id": 1}, "_meta": {"title": "Kaggle H3 | Video Decode (GPU1)"}},
-  "decode_audio": {"class_type": "KaggleH3AudioVAEDecode", "inputs": {"samples": ["sample", 1], "vae": ["vae_audio", 0], "device_id": 0, "mute_generated_audio": false, "runtime_config": ["h3_adapter", 1]}, "_meta": {"title": "Kaggle H3 | Audio Decode (GPU0; optional mute)"}},
-  "video": {"class_type": "CreateVideo", "inputs": {"images": ["decode", 0], "fps": 24.0, "audio": ["decode_audio", 0], "bit_depth": 8, "color_space": "sRGB"}, "_meta": {"title": "Output | Video + Audio"}},
-  "save": {"class_type": "SaveVideo", "inputs": {"video": ["video", 0], "filename_prefix": "kaggle_h3/ref2va", "format": "mp4", "codec": "auto"}, "_meta": {"title": "Output | Save Ref2VA Video"}}
+  "core_bundle": {
+    "class_type": "Bundle (obvpm)",
+    "inputs": {
+      "names": "model\nruntime_config\nconditioning\nlatent_image",
+      "in_1": ["h3_adapter", 0],
+      "in_2": ["h3_adapter", 1],
+      "in_3": ["h3", 0],
+      "in_4": ["h3", 1]
+    },
+    "_meta": {"title": "Regular Video Workflow | Bundle H3 Core Wires"}
+  },
+  "core_unbundle": {
+    "class_type": "Unbundle (obvpm)",
+    "inputs": {
+      "in": ["core_bundle", 0],
+      "names": "model\nruntime_config\nconditioning\nlatent_image"
+    },
+    "_meta": {"title": "Regular Video Workflow | Unbundle H3 Core Wires"}
+  },
+  "phase": {
+    "class_type": "KaggleH3PhaseDispatch",
+    "inputs": {
+      "model": ["core_unbundle", 0],
+      "runtime_config": ["core_unbundle", 1],
+      "conditioning": ["core_unbundle", 2],
+      "latent_image": ["core_unbundle", 3]
+    },
+    "_meta": {"title": "Regular Video Workflow | Dual-T4 Transformer Dispatch"}
+  },
+  "sample": {
+    "class_type": "KaggleH3TurboSampler",
+    "inputs": {
+      "model": ["phase", 0],
+      "runtime_config": ["phase", 3],
+      "conditioning": ["phase", 1],
+      "latent_image": ["phase", 2],
+      "noise_seed": 42,
+      "sampler_name": "euler",
+      "steps": ["step_count", 0],
+      "synchronize_mode": "safe",
+      "use_sage_attention": false
+    },
+    "_meta": {"title": "Regular Video Workflow | Choose Euler or Euler Dual-clock + SageAttention"}
+  },
+  "upscale": {
+    "class_type": "KaggleH3LatentUpscale2x",
+    "inputs": {
+      "model": ["phase", 0],
+      "samples": ["sample", 0],
+      "enabled": false,
+      "source_size_preset": "360p",
+      "aspect_ratio": "16:9",
+      "method": "bicubic",
+      "runtime_config": ["phase", 3]
+    },
+    "_meta": {"title": "Regular Video Workflow | Optional 2x Latent Upscale (360p to 720p)"}
+  },
+  "decode": {
+    "class_type": "KaggleH3VAEDecode",
+    "inputs": {
+      "samples": ["upscale", 0],
+      "vae": ["vae_video", 0],
+      "device_id": 1,
+      "runtime_config": ["upscale", 2]
+    },
+    "_meta": {"title": "Regular Video Workflow | Video Decode (GPU1)"}
+  },
+  "decode_audio": {
+    "class_type": "KaggleH3AudioVAEDecode",
+    "inputs": {
+      "samples": ["sample", 1],
+      "vae": ["vae_audio", 0],
+      "device_id": 0,
+      "mute_generated_audio": false,
+      "runtime_config": ["upscale", 2]
+    },
+    "_meta": {"title": "Regular Video Workflow | Optional Mute Generated Audio"}
+  },
+  "video": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": ["decode", 0],
+      "fps": 24.0,
+      "audio": ["decode_audio", 0],
+      "bit_depth": 8,
+      "color_space": "sRGB"
+    },
+    "_meta": {"title": "Regular Video Workflow | Assemble Video + Optional Audio"}
+  },
+  "save": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": ["video", 0],
+      "filename_prefix": "kaggle_h3/regular_video",
+      "format": "mp4",
+      "codec": "auto"
+    },
+    "_meta": {"title": "Regular Video Workflow | Save MP4"}
+  }
 }

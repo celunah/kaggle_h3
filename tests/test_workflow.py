@@ -157,7 +157,7 @@ class WorkflowTests(unittest.TestCase):
         workflow = json.loads((root / "workflows" / "kaggle_h3_turbo_smoke.json").read_text(encoding="utf-8"))
         self.assertTrue(all(node.get("_meta", {}).get("title") for node in workflow.values()))
         self.assertEqual(workflow["sample"]["inputs"]["sampler_name"], "euler")
-        self.assertFalse(workflow["sample"]["inputs"]["use_sage_attention"])
+        self.assertNotIn("use_sage_attention", workflow["sample"]["inputs"])
         self.assertEqual(workflow["unet"]["inputs"]["model_variant"], "Ref2VA")
         self.assertNotIn("character_reference", workflow)
         self.assertNotIn("scene_reference", workflow)
@@ -174,6 +174,41 @@ class WorkflowTests(unittest.TestCase):
             "CHARACTER_REFERENCE.png",
         )
         self.assertEqual(workflow["h3"]["inputs"]["seconds"], 5.0)
+
+    def test_regular_template_exposes_optional_runtime_controls(self):
+        root = Path(__file__).parents[1]
+        workflow = json.loads((root / "workflows" / "kaggle_h3_ref2va.json").read_text(encoding="utf-8"))
+        self.assertEqual(workflow["step_count"]["class_type"], "FirstInt")
+        self.assertEqual(workflow["h3_adapter"]["inputs"]["turbo_steps"], ["step_count", 0])
+        self.assertEqual(workflow["sample"]["inputs"]["steps"], ["step_count", 0])
+        self.assertIn("Euler Dual-clock", workflow["sample"]["_meta"]["title"])
+        self.assertFalse(workflow["sample"]["inputs"]["use_sage_attention"])
+        self.assertEqual(workflow["upscale"]["class_type"], "KaggleH3LatentUpscale2x")
+        self.assertFalse(workflow["upscale"]["inputs"]["enabled"])
+        self.assertFalse(workflow["decode_audio"]["inputs"]["mute_generated_audio"])
+        self.assertEqual(workflow["core_bundle"]["class_type"], "Bundle (obvpm)")
+        self.assertEqual(workflow["core_unbundle"]["class_type"], "Unbundle (obvpm)")
+
+    def test_long_template_routes_context_loop_and_obvpm_bundle(self):
+        root = Path(__file__).parents[1]
+        workflow = json.loads((root / "workflows" / "kaggle_h3_long_context_loop.json").read_text(encoding="utf-8"))
+        self.assertEqual(workflow["policy"]["class_type"], "MiniMaxH3GenerationProfile")
+        self.assertEqual(workflow["plan"]["class_type"], "MiniMaxH3ChainPlanModern")
+        self.assertEqual(workflow["loop_start"]["class_type"], "MiniMaxH3ChainLoopStart")
+        self.assertEqual(workflow["context"]["class_type"], "MiniMaxH3ChainContext")
+        self.assertEqual(workflow["sample"]["class_type"], "KaggleH3ContextLoopSampler")
+        self.assertEqual(workflow["trim"]["class_type"], "MiniMaxH3LoopTrim")
+        self.assertEqual(workflow["segment_save"]["class_type"], "MiniMaxH3ChainSegmentSave")
+        self.assertEqual(workflow["review"]["class_type"], "MiniMaxH3ChainReview")
+        self.assertEqual(workflow["loop_end"]["class_type"], "MiniMaxH3ChainLoopEnd")
+        self.assertEqual(workflow["assemble"]["class_type"], "MiniMaxH3ChainAssemble")
+        self.assertEqual(workflow["sample"]["inputs"]["sampler_name"], "euler_dualclock")
+        self.assertEqual(workflow["loop_end"]["inputs"]["between_scene_cleanup"], "unload_models")
+        self.assertEqual(workflow["decode"]["inputs"]["runtime_config"], ["phase", 3])
+        self.assertEqual(workflow["decode_audio"]["inputs"]["runtime_config"], ["phase", 3])
+        self.assertEqual(workflow["core_bundle"]["class_type"], "Bundle (obvpm)")
+        plan = json.loads(workflow["plan"]["inputs"]["plan_json"])
+        self.assertEqual(len(plan["shots"]), 4)
 
 
 if __name__ == "__main__":

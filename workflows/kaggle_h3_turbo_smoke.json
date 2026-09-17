@@ -9,7 +9,7 @@
       "gpu_0": 0,
       "gpu_1": 1
     },
-    "_meta": {"title": "Kaggle H3 | Singularity Ref2VA INT8 Auto Loader"}
+    "_meta": {"title": "H3 Test Workflow | Singularity Ref2VA INT8 Auto Loader"}
   },
   "clip": {
     "class_type": "KaggleH3TextEncoderLoader",
@@ -18,7 +18,7 @@
       "type": "minimax",
       "device_id": 0
     },
-    "_meta": {"title": "Kaggle H3 | Text Encoder (GPU0)"}
+    "_meta": {"title": "H3 Test Workflow | Fixed Text Encoder (GPU0)"}
   },
   "vae_video": {
     "class_type": "KaggleH3VAELoader",
@@ -27,7 +27,7 @@
       "role": "video",
       "device_id": 1
     },
-    "_meta": {"title": "Kaggle H3 | Video VAE (GPU1)"}
+    "_meta": {"title": "H3 Test Workflow | Fixed Video VAE (GPU1)"}
   },
   "vae_audio": {
     "class_type": "KaggleH3VAELoader",
@@ -36,7 +36,7 @@
       "role": "audio",
       "device_id": 0
     },
-    "_meta": {"title": "Kaggle H3 | Audio VAE (GPU0)"}
+    "_meta": {"title": "H3 Test Workflow | Fixed Audio VAE (GPU0)"}
   },
   "h3": {
     "class_type": "KaggleH3Conditioning",
@@ -45,7 +45,7 @@
       "vae": ["vae_video", 0],
       "audio_vae": ["vae_audio", 0],
       "mode": "Ref2VA",
-      "prompt": "Mode: Ref2VA.\nPreserve the subject identity from <Picture 1> and the open-field composition from <Picture 2>.\nA short coherent video of the same woman in a plain blue shirt standing in a bright open grassy field during clear daytime. She makes only a small natural movement, gently turns her head, and shifts her weight while remaining in the same place. Keep the face, hair, shirt, bright daylight, blue sky, flat horizon, and simple field stable throughout. Use a mostly static camera and simple synchronized outdoor ambience.",
+      "prompt": "Mode: Ref2VA. Preserve the same plain blue-shirted woman from <Picture 1> in the bright open field from <Picture 2>. She stands still and gently turns her head once in clear daylight. Keep the camera, face, shirt, blue sky, horizon, and field stable.",
       "seconds": 5.0,
       "size_preset": "360p",
       "aspect_ratio": "16:9",
@@ -55,7 +55,7 @@
       "reference_1": "image",
       "reference_1.file": "SCENE_REFERENCE.png"
     },
-    "_meta": {"title": "Kaggle H3 | Global Conditioning (Ref2VA)"}
+    "_meta": {"title": "H3 Test Workflow | Fixed Ref2VA Prompt and References"}
   },
   "h3_adapter": {
     "class_type": "KaggleH3AdapterStack",
@@ -72,17 +72,36 @@
       "strength_3": 1.0,
       "conditioning_mode": "Ref2VA"
     },
-    "_meta": {"title": "Kaggle H3 | Turbo + Adapter Stack"}
+    "_meta": {"title": "H3 Test Workflow | Matching Singularity Ref2VA Turbo LoRA"}
+  },
+  "core_bundle": {
+    "class_type": "Bundle (obvpm)",
+    "inputs": {
+      "names": "model\nruntime_config\nconditioning\nlatent_image",
+      "in_1": ["h3_adapter", 0],
+      "in_2": ["h3_adapter", 1],
+      "in_3": ["h3", 0],
+      "in_4": ["h3", 1]
+    },
+    "_meta": {"title": "H3 Test Workflow | Bundle H3 Core Wires"}
+  },
+  "core_unbundle": {
+    "class_type": "Unbundle (obvpm)",
+    "inputs": {
+      "in": ["core_bundle", 0],
+      "names": "model\nruntime_config\nconditioning\nlatent_image"
+    },
+    "_meta": {"title": "H3 Test Workflow | Unbundle H3 Core Wires"}
   },
   "phase": {
     "class_type": "KaggleH3PhaseDispatch",
     "inputs": {
-      "model": ["h3_adapter", 0],
-      "runtime_config": ["h3_adapter", 1],
-      "conditioning": ["h3", 0],
-      "latent_image": ["h3", 1]
+      "model": ["core_unbundle", 0],
+      "runtime_config": ["core_unbundle", 1],
+      "conditioning": ["core_unbundle", 2],
+      "latent_image": ["core_unbundle", 3]
     },
-    "_meta": {"title": "Kaggle H3 | Transformer Dispatch Barrier"}
+    "_meta": {"title": "H3 Test Workflow | Dual-T4 Transformer Dispatch"}
   },
   "sample": {
     "class_type": "KaggleH3TurboSampler",
@@ -94,10 +113,9 @@
       "noise_seed": 7,
       "sampler_name": "euler",
       "steps": 4,
-      "synchronize_mode": "full",
-      "use_sage_attention": false
+      "synchronize_mode": "full"
     },
-    "_meta": {"title": "Kaggle H3 | Singularity Turbo Sampler (Euler; 4 steps)"}
+    "_meta": {"title": "H3 Test Workflow | Fixed Euler, 4 Steps, Full Sync"}
   },
   "decode": {
     "class_type": "KaggleH3VAEDecode",
@@ -107,7 +125,7 @@
       "device_id": 1,
       "runtime_config": ["h3_adapter", 1]
     },
-    "_meta": {"title": "Kaggle H3 | Video Decode (GPU1)"}
+    "_meta": {"title": "H3 Test Workflow | Video Decode (GPU1)"}
   },
   "decode_audio": {
     "class_type": "KaggleH3AudioVAEDecode",
@@ -118,7 +136,7 @@
       "mute_generated_audio": false,
       "runtime_config": ["h3_adapter", 1]
     },
-    "_meta": {"title": "Kaggle H3 | Audio Decode (GPU0)"}
+    "_meta": {"title": "H3 Test Workflow | Audio Decode (GPU0)"}
   },
   "video": {
     "class_type": "CreateVideo",
@@ -129,16 +147,16 @@
       "bit_depth": 8,
       "color_space": "sRGB"
     },
-    "_meta": {"title": "Output | Video + Audio (mute available on audio decode)"}
+    "_meta": {"title": "H3 Test Workflow | Fixed Video + Audio"}
   },
   "save": {
     "class_type": "SaveVideo",
     "inputs": {
       "video": ["video", 0],
-      "filename_prefix": "kaggle_h3/kaggle_h3_turbo_smoke",
+      "filename_prefix": "kaggle_h3/h3_test",
       "format": "mp4",
       "codec": "auto"
     },
-    "_meta": {"title": "Output | Save Turbo Smoke Video"}
+    "_meta": {"title": "H3 Test Workflow | Save Known-Good Smoke Video"}
   }
 }

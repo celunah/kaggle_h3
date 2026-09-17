@@ -610,7 +610,6 @@ def validate_production_workflow_shape(workflow: dict[str, Any]) -> dict[str, An
         "fl2va": "FL2VA",
         "t2va": "T2VA",
         "fp8": "FP8",
-        "720p": "720p",
         "res_multistep": "non-Turbo res_multistep",
     }
     for token, label in forbidden.items():

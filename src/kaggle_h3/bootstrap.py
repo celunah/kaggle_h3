@@ -31,6 +31,11 @@ CONTEXT_LOOP_REF = os.environ.get(
     "KAGGLE_H3_CONTEXT_LOOP_REF",
     "a8bb6c7b886312cc2821cd9959897d0088efdfe2",
 )
+OBVPM_REPOSITORY = "https://github.com/chanon/comfyui-obvpm.git"
+OBVPM_REF = os.environ.get(
+    "KAGGLE_H3_OBVPM_REF",
+    "cb03d4c6f7d4cc4496517b232db5654bebbc6f6c",
+)
 H3_MODEL_REPOSITORY = "Comfy-Org/MiniMax-H3"
 H3_MODEL_REVISION = os.environ.get(
     "KAGGLE_H3_MODEL_REVISION",
@@ -350,6 +355,7 @@ def install_h3_adapter_node(
     *,
     dry_run: bool = False,
     install_context_loop: bool | None = None,
+    install_obvpm: bool | None = None,
 ) -> dict[str, Any]:
     """Install the H3 node and private support package.
 
@@ -362,6 +368,10 @@ def install_h3_adapter_node(
     if install_context_loop is None:
         install_context_loop = os.environ.get(
             "KAGGLE_H3_INSTALL_CONTEXT_LOOP", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+    if install_obvpm is None:
+        install_obvpm = os.environ.get(
+            "KAGGLE_H3_INSTALL_OBVPM", "1"
         ).strip().lower() not in {"0", "false", "no", "off"}
 
     source_node = project_root / "custom_nodes" / "kaggle_h3_adapters.py"
@@ -454,10 +464,16 @@ def install_h3_adapter_node(
             "KaggleH3ContextLoopSampler",
         ],
         "context_loop": None,
+        "obvpm": None,
     }
     if dry_run:
         if install_context_loop:
             result["context_loop"] = install_context_loop_node(
+                comfy_root,
+                dry_run=True,
+            )
+        if install_obvpm:
+            result["obvpm"] = install_obvpm_node(
                 comfy_root,
                 dry_run=True,
             )
@@ -483,6 +499,56 @@ def install_h3_adapter_node(
             comfy_root,
             dry_run=dry_run,
         )
+    if install_obvpm:
+        result["obvpm"] = install_obvpm_node(
+            comfy_root,
+            dry_run=dry_run,
+        )
+    return result
+
+
+def install_obvpm_node(
+    comfy_root: Path,
+    *,
+    dry_run: bool = False,
+    repository: str = OBVPM_REPOSITORY,
+    ref: str = OBVPM_REF,
+) -> dict[str, Any]:
+    """Install the separate OBVPM workflow-layout dependency.
+
+    OBVPM is intentionally cloned as its own ComfyUI custom-node checkout.
+    Its Bundle/Unbundle nodes are used by the shipped graphs, but its source
+    is never copied into or vendored by ``kaggle_h3``.
+    """
+
+    destination = Path(comfy_root) / "custom_nodes" / "comfyui-obvpm"
+    result = ensure_github_checkout(
+        repository,
+        destination,
+        ref=ref,
+        dry_run=dry_run,
+    )
+    result["required_files"] = [
+        "__init__.py",
+        "bundle.py",
+        "common.py",
+    ]
+    result["required_node_ids"] = [
+        "Bundle (obvpm)",
+        "Unbundle (obvpm)",
+        "PeekBundle (obvpm)",
+    ]
+    result["purpose"] = "Bundle H3 model/runtime/conditioning wires in shipped workflows."
+    if not dry_run:
+        missing = [
+            str(destination / relative)
+            for relative in result["required_files"]
+            if not (destination / relative).is_file()
+        ]
+        if missing:
+            raise RuntimeError(
+                "OBVPM checkout is missing required files: " + ", ".join(missing)
+            )
     return result
 
 
@@ -510,14 +576,17 @@ def install_context_loop_node(
     )
     result["required_files"] = [
         "__init__.py",
+        "nodes.py",
         "chain_nodes.py",
         "checkpoint_manager.py",
     ]
     result["required_node_ids"] = [
+        "MiniMaxH3GenerationProfile",
         "MiniMaxH3ChainPlanModern",
         "MiniMaxH3ChainLoopStart",
         "MiniMaxH3ChainCurrent",
         "MiniMaxH3ChainContext",
+        "MiniMaxH3LoopTrim",
         "MiniMaxH3ChainSegmentSave",
         "MiniMaxH3ChainReview",
         "MiniMaxH3ChainLoopEnd",
