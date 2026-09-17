@@ -1,10 +1,13 @@
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
+from pathlib import Path
 
 from kaggle_h3.sage_attention import (
     H3SageAttentionError,
+    _patch_t4_kernel_sources,
     h3_sage_attention,
     install_h3_sage_attention,
     sage_attention_status,
@@ -68,6 +71,36 @@ class SageAttentionTests(unittest.TestCase):
             status = sage_attention_status()
         self.assertEqual(status["version"], "1.0.6")
         self.assertTrue(status["sage_v1_compatible"])
+
+    def test_t4_kernel_profile_reduces_stages_without_changing_block_geometry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            package_dir = Path(temporary)
+            for filename in (
+                "attn_qk_int8_block_varlen.py",
+                "attn_qk_int8_per_block.py",
+                "attn_qk_int8_per_block_causal.py",
+                "attn_qk_int8_per_block_causal_varlen.py",
+                "attn_qk_int8_per_block_h96.py",
+                "attn_qk_int8_per_block_h96_causal.py",
+            ):
+                (package_dir / filename).write_text(
+                    "BLOCK_M=128\nBLOCK_N=64\n"
+                    "num_stages=3 if head_dim == 64 else 4\n"
+                    "num_stages=4\n",
+                    encoding="utf-8",
+                )
+
+            profile = _patch_t4_kernel_sources(package_dir)
+
+            self.assertEqual(len(profile["modified_files"]), 6)
+            self.assertTrue(profile["block_geometry_unchanged"])
+            for path in package_dir.glob("*.py"):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn("BLOCK_M=128", source)
+                self.assertIn("BLOCK_N=64", source)
+                self.assertNotIn("num_stages=3 if head_dim == 64 else 4", source)
+                self.assertNotIn("num_stages=4", source)
+                self.assertIn("num_stages=1", source)
 
     def test_install_patches_only_h3_model_and_restores(self):
         modules, model, original, original_masked = self._fake_modules()

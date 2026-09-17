@@ -324,6 +324,14 @@ dtype, owning CUDA device, and any fallback reason. Q/K/V are never moved or
 cast across devices by the attention wrapper; if the current block is not a
 compatible same-device CUDA island, normal H3 attention is used.
 
+On SM75/T4, the sampler automatically applies the SageAttention 1.0.6
+low-shared-memory kernel profile before the first H3 attention call. It changes
+only the Triton pipeline stage count to `num_stages=1` in the six bundled v1
+attention kernels; `BLOCK_M`, `BLOCK_N`, tensor layouts, and quantization scale
+indexing are left unchanged. The log reports this as `Applied SageAttention
+SM75 profile`. If the installed wheel does not match the expected v1 sources,
+the toggle falls back instead of running an unverified kernel.
+
 The optional `Kaggle H3 | Optional 2x Latent Upscale` node is a separate
 post-sampling phase. It validates the final video latent, copies it to CPU,
 releases the H3 transformer/LoRA residency and CUDA caches, performs a

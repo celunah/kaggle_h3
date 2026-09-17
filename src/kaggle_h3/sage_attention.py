@@ -16,12 +16,128 @@ from __future__ import annotations
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as distribution_version
+import importlib
+from pathlib import Path
 import re
+import sys
 from typing import Any, Iterator
 
 
 class H3SageAttentionError(RuntimeError):
     """Raised when the optional SageAttention backend cannot be enabled."""
+
+
+_T4_KERNEL_FILES = (
+    "attn_qk_int8_block_varlen.py",
+    "attn_qk_int8_per_block.py",
+    "attn_qk_int8_per_block_causal.py",
+    "attn_qk_int8_per_block_causal_varlen.py",
+    "attn_qk_int8_per_block_h96.py",
+    "attn_qk_int8_per_block_h96_causal.py",
+)
+_T4_PROFILE_APPLIED = False
+
+
+def _patch_t4_kernel_sources(package_dir: Path) -> dict[str, Any]:
+    """Apply the SM75-safe SageAttention v1 Triton scheduling profile.
+
+    SageAttention 1.0.6 hardcodes four Triton pipeline stages for the larger
+    head dimensions. That profile requests 67,584 bytes of shared memory on
+    the H3 attention shape, while Turing/SM75 provides 65,536 bytes. Stage 1
+    leaves head/block geometry and quantization scale indexing unchanged while
+    fitting the T4 limit. The installed package is patched at runtime so the
+    normal dependency remains the upstream SageAttention wheel.
+    """
+
+    replacements = {
+        "num_stages=3 if head_dim == 64 else 4":
+            "num_stages=3 if head_dim == 64 else 1",
+        "num_stages=4": "num_stages=1",
+    }
+    modified_files: list[str] = []
+    already_profiled_files: list[str] = []
+    for filename in _T4_KERNEL_FILES:
+        path = package_dir / filename
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        original = path.read_text(encoding="utf-8")
+        updated = original
+        for source, target in replacements.items():
+            updated = updated.replace(source, target)
+        if updated != original:
+            path.write_text(updated, encoding="utf-8")
+            modified_files.append(filename)
+        elif "num_stages=1" in original:
+            already_profiled_files.append(filename)
+        else:
+            raise RuntimeError(
+                f"SageAttention kernel profile did not match {path}; refusing "
+                "to run an unverified SM75 kernel configuration."
+            )
+    return {
+        "name": "sm75_num_stages_1",
+        "modified_files": modified_files,
+        "already_profiled_files": already_profiled_files,
+        "block_geometry_unchanged": True,
+    }
+
+
+def _apply_t4_kernel_profile() -> dict[str, Any] | None:
+    """Patch and reload SageAttention v1 when all visible GPUs are SM75."""
+
+    global _T4_PROFILE_APPLIED
+    runtime = _cuda_runtime_status()
+    architectures = tuple(runtime.get("gpu_architectures") or ())
+    if not runtime.get("cuda_available") or not architectures:
+        return None
+    if not all(architecture == "sm75" for architecture in architectures):
+        return None
+    if _T4_PROFILE_APPLIED:
+        return {
+            "name": "sm75_num_stages_1",
+            "already_applied": True,
+            "block_geometry_unchanged": True,
+        }
+
+    try:
+        sageattention = importlib.import_module("sageattention")
+        package_dir = Path(sageattention.__file__).resolve().parent
+        profile = _patch_t4_kernel_sources(package_dir)
+
+        # SageAttention is often imported by ComfyUI at startup. Reload the
+        # six kernel modules and core after changing their source, then update
+        # ComfyUI's already-loaded attention module to use the new core entry.
+        for module_name in (
+            "sageattention.attn_qk_int8_block_varlen",
+            "sageattention.attn_qk_int8_per_block",
+            "sageattention.attn_qk_int8_per_block_causal",
+            "sageattention.attn_qk_int8_per_block_causal_varlen",
+            "sageattention.attn_qk_int8_per_block_h96",
+            "sageattention.attn_qk_int8_per_block_h96_causal",
+        ):
+            module = sys.modules.get(module_name)
+            if module is not None:
+                importlib.reload(module)
+        core = sys.modules.get("sageattention.core")
+        if core is not None:
+            core = importlib.reload(core)
+            sageattention.sageattn = core.sageattn
+            if hasattr(core, "sageattn_varlen"):
+                sageattention.sageattn_varlen = core.sageattn_varlen
+        profile["already_applied"] = False
+        profile["package_dir"] = str(package_dir)
+        _T4_PROFILE_APPLIED = True
+        print(
+            "[Kaggle H3] Applied SageAttention SM75 profile: "
+            "num_stages=1 for six Triton kernels; BLOCK_M/BLOCK_N unchanged.",
+            flush=True,
+        )
+        return profile
+    except Exception as exc:
+        raise H3SageAttentionError(
+            "Could not apply the SM75 SageAttention kernel profile: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _version_tuple(value: Any) -> tuple[int, ...] | None:
@@ -164,6 +280,10 @@ def install_h3_sage_attention() -> tuple[dict[str, Any], Any]:
             f"SageAttention={status.get('version') or 'unknown'}, "
             f"checks={compatibility}."
         )
+    if status.get("cuda_available"):
+        t4_profile = _apply_t4_kernel_profile()
+        if t4_profile is not None:
+            status["t4_kernel_profile"] = t4_profile
     if not status.get("supports_h3_packed_containers"):
         raise H3SageAttentionError(
             "SageAttention was found, but this ComfyUI build does not expose "
@@ -177,6 +297,13 @@ def install_h3_sage_attention() -> tuple[dict[str, Any], Any]:
         raise H3SageAttentionError(
             f"Could not import the ComfyUI H3 attention modules: {exc}"
         ) from exc
+
+    # ``attention_sage`` may have imported SageAttention before the profile
+    # was applied. Its function globals are the module dictionary, so replacing
+    # this binding updates the already-loaded ComfyUI attention entry point.
+    if status.get("t4_kernel_profile") is not None:
+        sageattention = importlib.import_module("sageattention")
+        attention.sageattn = sageattention.sageattn
 
     replacement = getattr(attention, "attention_sage", None)
     if not callable(replacement):
