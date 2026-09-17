@@ -763,9 +763,9 @@ def build_runtime_config(
         }
 
     # Keep the runtime config's canonical sampler as Euler.  The dedicated
-    # sampler may explicitly select ``euler_dualclock`` as an alias while
-    # retaining the same H3 ModelSamplingAV shifts and CUDA/phase contracts.
-    # This avoids embedding a second audio update in the adapter stack.
+    # sampler may explicitly select ``euler_dualclock`` at execution time;
+    # that branch replaces the native AV carry with its manual per-stream
+    # integration without changing the adapter stack or model files.
     schedule = dict(schedule)
     schedule["sampler_name"] = "euler"
 

@@ -266,13 +266,17 @@ decode. The text-encoder and VAE phases have matching cleanup paths, including
 failure cleanup, so a sampler or decode exception does not intentionally retain
 their GPU pages.
 The dedicated `Kaggle H3 | H3 Turbo Sampler` exposes `sampler_name` with
-regular `euler` as the default and optional `euler_dualclock`. Both modes use
-ComfyUI's native H3 `ModelSamplingAV` protocol: the video sigma grid drives
-the sampler, while H3 derives the audio sigma/timestep schedule from the
-video schedule. The dual-clock mode does not perform a second manual audio
-latent update, avoiding double application of the native H3 behavior. The
-sampler logs the selected mode and actual video/audio sigma and timestep
-schedules into `H3_RUNTIME_CONFIG` and the ComfyUI console.
+regular `euler` as the default and optional `euler_dualclock`. Regular Euler
+uses ComfyUI's native H3 `ModelSamplingAV` protocol. Dual-clock Euler uses the
+external H3 dual-clock integration contract: it installs a cloned flow
+sampling object with `audio_scale=1.0`, performs one joint H3 forward per
+step, and updates video with `delta_sigma_video` while updating audio with
+`delta_sigma_audio`. This prevents native audio carry from being applied a
+second time. Current `FLOW_AV` builds return raw audio velocity; older builds
+are detected and receive the legacy schedule-slope correction. The sampler
+logs the selected backend, audio-velocity protocol, and actual video/audio
+sigma and timestep schedules into `H3_RUNTIME_CONFIG` and the ComfyUI
+console.
 It also exposes `synchronize_mode`, which
 defaults to `full` so existing workflows retain the proven behavior. `full`
 keeps every device-wide block and per-step barrier. `safe` keeps every block,

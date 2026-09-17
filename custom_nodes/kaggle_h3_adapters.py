@@ -607,6 +607,377 @@ def _h3_sampler_boundary_devices(mode: str) -> tuple[int, ...]:
     return ()
 
 
+def _h3_model_uses_raw_audio_velocity(model: Any) -> bool:
+    """Detect the current H3 ``FLOW_AV`` model contract.
+
+    Current ComfyUI exposes ``MiniMaxH3.audio_scale()`` on the model wrapper.
+    When the sampler patches ``audio_scale`` to ``1.0``, the diffusion model
+    returns the raw audio-clock velocity.  Older H3 builds returned an audio
+    velocity already multiplied by ``d(sigma_audio)/d(sigma_video)`` and need
+    the legacy inverse-slope correction in the manual sampler.
+    """
+
+    current = model
+    seen: set[int] = set()
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        for candidate in (
+            current,
+            getattr(current, "model", None),
+            getattr(current, "inner_model", None),
+        ):
+            audio_scale = getattr(candidate, "audio_scale", None)
+            if callable(audio_scale):
+                return True
+        current = getattr(current, "inner_model", None)
+    return False
+
+
+def _h3_packed_stream_sizes(model: Any) -> tuple[int, int] | None:
+    """Read packed video/audio element counts retained by Comfy's guider."""
+
+    current = model
+    seen: set[int] = set()
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        conds = getattr(current, "conds", None)
+        if isinstance(conds, dict):
+            for cond_group in conds.values():
+                if not isinstance(cond_group, (list, tuple)):
+                    continue
+                for cond in cond_group:
+                    if not isinstance(cond, dict):
+                        continue
+                    model_conds = cond.get("model_conds")
+                    if not isinstance(model_conds, dict):
+                        continue
+                    shape_cond = model_conds.get("latent_shapes")
+                    shapes = getattr(shape_cond, "cond", None)
+                    if not isinstance(shapes, (list, tuple)) or len(shapes) != 2:
+                        continue
+                    try:
+                        video_shape, audio_shape = tuple(
+                            tuple(int(dim) for dim in shape) for shape in shapes
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        len(video_shape) == 5
+                        and len(audio_shape) == 4
+                        and video_shape[0] == audio_shape[0]
+                        and all(dim > 0 for dim in video_shape + audio_shape)
+                    ):
+                        return (
+                            math.prod(video_shape[1:]),
+                            math.prod(audio_shape[1:]),
+                        )
+        current = getattr(current, "inner_model", None)
+    return None
+
+
+def _h3_av_parts(
+    value: Any,
+    *,
+    name: str,
+    video_values: int | None = None,
+) -> tuple[Any, Any]:
+    """Split a current H3 AV value without moving or copying its streams."""
+
+    import torch
+
+    if bool(getattr(value, "is_nested", False)):
+        unbind = getattr(value, "unbind", None)
+        if not callable(unbind):
+            raise RuntimeError(f"H3 {name} NestedTensor does not expose unbind()")
+        streams = tuple(unbind())
+        if len(streams) != 2:
+            raise ValueError(
+                f"H3 {name} must contain exactly video+audio streams; "
+                f"got {len(streams)}"
+            )
+        return streams[0], streams[1]
+
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return value[0], value[1]
+
+    if torch.is_tensor(value):
+        if video_values is None:
+            raise ValueError(
+                f"H3 dual-clock sampler received a packed Tensor for {name} "
+                "without the video stream size. Use a native H3 AV latent or "
+                "provide ComfyUI latent-shape metadata."
+            )
+        if value.ndim != 3 or value.shape[1] != 1:
+            raise ValueError(
+                f"H3 packed {name} must have shape [batch, 1, values]; "
+                f"got {tuple(value.shape)}"
+            )
+        return value[..., :video_values], value[..., video_values:]
+
+    raise TypeError(
+        f"H3 dual-clock sampler expected a nested AV value for {name}; "
+        f"got {type(value).__name__}"
+    )
+
+
+def _h3_pack_av_parts(template: Any, video: Any, audio: Any) -> Any:
+    """Rebuild an AV value using the same container contract as ``template``."""
+
+    import torch
+
+    if bool(getattr(template, "is_nested", False)):
+        nested_type = type(template)
+        try:
+            return nested_type((video, audio))
+        except Exception:
+            try:
+                return nested_type([video, audio])
+            except Exception:
+                nested = getattr(torch, "nested", None)
+                nested_tensor = getattr(nested, "nested_tensor", None)
+                if callable(nested_tensor):
+                    return nested_tensor([video, audio], device=video.device)
+                raise RuntimeError(
+                    "H3 dual-clock sampler could not rebuild the AV NestedTensor"
+                )
+
+    if isinstance(template, tuple):
+        return (video, audio)
+    if isinstance(template, list):
+        return [video, audio]
+    if torch.is_tensor(template):
+        return torch.cat((video, audio), dim=-1)
+    raise TypeError(
+        "H3 dual-clock sampler cannot rebuild an unknown AV container "
+        f"{type(template).__name__}"
+    )
+
+
+def _h3_time_shift_slope(
+    sigma: Any, from_shift: float, to_shift: float
+) -> Any:
+    """Return the legacy ``d(sigma_audio)/d(sigma_video)`` slope."""
+
+    base_sigma = sigma / (
+        float(from_shift) + sigma * (1.0 - float(from_shift))
+    )
+    numerator = float(to_shift) * (1.0 + (float(from_shift) - 1.0) * base_sigma) ** 2
+    denominator = float(from_shift) * (1.0 + (float(to_shift) - 1.0) * base_sigma) ** 2
+    return numerator / denominator
+
+
+def _h3_native_flow_sigmas(
+    steps: int, shift_video: float, *, device: Any, dtype: Any
+) -> Any:
+    """Build the H3 flow grid used by the external dual-clock sampler."""
+
+    import torch
+
+    base_grid = torch.linspace(
+        1.0,
+        0.0,
+        int(steps) + 1,
+        device=device,
+        dtype=torch.float32,
+    )
+    shifted = float(shift_video) * base_grid / (
+        1.0 + (float(shift_video) - 1.0) * base_grid
+    )
+    return shifted.to(dtype=dtype)
+
+
+def _h3_dual_clock_euler(
+    model: Any,
+    x: Any,
+    sigmas: Any,
+    extra_args: dict[str, Any] | None = None,
+    callback: Any = None,
+    disable: Any = None,
+    *,
+    shift_video: float,
+    shift_audio: float,
+    audio_velocity_is_raw: bool,
+    video_values: int | None = None,
+):
+    """Run one joint H3 forward per step with independent AV clocks.
+
+    This is the manual dual-clock implementation used by the external H3
+    sampler family.  The model is still evaluated once on the existing
+    sharded dispatcher; only the ODE update is split into video and audio
+    stream deltas.  Current ComfyUI H3 builds are put into ``audio_scale=1``
+    mode by ``H3TurboSampler._shift_model`` so the audio velocity is not
+    carried/scaled a second time.
+    """
+
+    import torch
+    from comfy.k_diffusion import sampling as k_diffusion_sampling  # type: ignore
+
+    extra_args = {} if extra_args is None else extra_args
+    if not torch.is_tensor(sigmas) or sigmas.ndim != 1 or len(sigmas) < 2:
+        raise ValueError(
+            "H3 dual-clock sampling requires a one-dimensional sigma tensor "
+            "with at least two values."
+        )
+    if not bool(torch.isfinite(sigmas).all()):
+        raise ValueError("H3 dual-clock sigmas must all be finite.")
+
+    incoming_sigmas = sigmas
+    sigmas = _h3_native_flow_sigmas(
+        len(incoming_sigmas) - 1,
+        shift_video,
+        device=incoming_sigmas.device,
+        dtype=incoming_sigmas.dtype,
+    )
+    if not bool(torch.allclose(incoming_sigmas, sigmas, atol=1e-6, rtol=0.0)):
+        print(
+            "[Kaggle H3] euler_dualclock rebuilt the video sigma grid using "
+            f"shift={float(shift_video):g}.",
+            flush=True,
+        )
+
+    model_options = extra_args.get("model_options")
+    if isinstance(model_options, dict):
+        transformer_options = model_options.get("transformer_options")
+        if isinstance(transformer_options, dict):
+            transformer_options["sample_sigmas"] = sigmas
+
+    if video_values is None and torch.is_tensor(x):
+        packed_sizes = _h3_packed_stream_sizes(model)
+        if packed_sizes is not None:
+            video_values = packed_sizes[0]
+
+    denoise_mask = extra_args.get("denoise_mask")
+    audio_mask = None
+    if denoise_mask is not None:
+        _, audio_mask = _h3_av_parts(
+            denoise_mask,
+            name="denoise_mask",
+            video_values=video_values,
+        )
+
+    video_x, _ = _h3_av_parts(x, name="latent", video_values=video_values)
+    s_in = video_x.new_ones([video_x.shape[0]])
+    telemetry = _H3_DIFFUSION_TELEMETRY.get()
+    trange = getattr(k_diffusion_sampling, "trange", None)
+    if callable(trange):
+        step_iterator = trange(len(sigmas) - 1, disable=disable)
+    else:
+        step_iterator = range(len(sigmas) - 1)
+
+    for index in step_iterator:
+        sigma_video = sigmas[index]
+        sigma_video_next = sigmas[index + 1]
+        if telemetry is not None:
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigma_video,
+                boundary="input",
+                value=x,
+                tensor_name="sampler_input",
+            )
+
+        denoised = model(x, sigma_video * s_in, **extra_args)
+        synchronize_h3_devices(
+            _h3_sampler_boundary_devices(_H3_SAMPLER_SYNCHRONIZATION_MODE.get()),
+            reason=f"dual-clock model output boundary {index}",
+        )
+        video_x, audio_x = _h3_av_parts(
+            x, name="latent", video_values=video_values
+        )
+        video_denoised, audio_denoised = _h3_av_parts(
+            denoised, name="denoised output", video_values=video_values
+        )
+        if telemetry is not None:
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigma_video,
+                boundary="model_output",
+                value=denoised,
+                tensor_name="model_output",
+            )
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigma_video,
+                boundary="denoised",
+                value=denoised,
+                tensor_name="denoised",
+                alias_of="model_output",
+            )
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigma_video,
+                boundary="history",
+                value=None,
+                tensor_name="history",
+            )
+
+        # H3's model wrapper returns an x0/denoised-style value, so compute
+        # each stream's velocity against the video-clock input sigma first.
+        video_derivative = (video_x - video_denoised) / sigma_video
+        audio_derivative = (audio_x - audio_denoised) / sigma_video
+
+        sigma_audio = _h3_time_shift_sigma(
+            sigma_video, float(shift_video), float(shift_audio)
+        )
+        sigma_audio_next = _h3_time_shift_sigma(
+            sigma_video_next, float(shift_video), float(shift_audio)
+        )
+        slope_audio = _h3_time_shift_slope(
+            sigma_video.clamp_min(1e-6), float(shift_video), float(shift_audio)
+        )
+        if not audio_velocity_is_raw:
+            # Pre-FLOW_AV H3 returned the audio velocity multiplied by the
+            # schedule slope.  Remove that factor before integrating dt_audio.
+            slope_audio = slope_audio.to(
+                device=audio_derivative.device, dtype=audio_derivative.dtype
+            )
+            audio_derivative = audio_derivative / slope_audio
+
+        video_delta = sigma_video_next - sigma_video
+        audio_delta = sigma_audio_next - sigma_audio
+        if audio_mask is not None:
+            audio_delta = video_delta + audio_mask * (audio_delta - video_delta)
+
+        if callback is not None:
+            callback_audio = audio_x - audio_derivative * sigma_audio
+            callback(
+                {
+                    "x": x,
+                    "i": index,
+                    "sigma": sigma_video,
+                    "sigma_hat": sigma_video,
+                    "denoised": _h3_pack_av_parts(
+                        x, video_denoised, callback_audio
+                    ),
+                }
+            )
+
+        x = _h3_pack_av_parts(
+            x,
+            video_x + video_derivative * video_delta,
+            audio_x + audio_derivative * audio_delta,
+        )
+        synchronize_h3_devices(
+            _h3_sampler_boundary_devices(_H3_SAMPLER_SYNCHRONIZATION_MODE.get()),
+            reason=f"dual-clock latent update boundary {index}",
+        )
+        if telemetry is not None:
+            telemetry.record_boundary(
+                step_index=index,
+                sigma=sigma_video,
+                timestep=sigma_video_next,
+                boundary="updated_latent",
+                value=x,
+                tensor_name="updated_latent",
+            )
+
+    return x
+
+
 def _h3_res_multistep(
     model: Any,
     x: Any,
@@ -859,44 +1230,62 @@ def _h3_euler_with_telemetry(
 
 
 def _h3_prepare_sampler(
-    sampler_name: str, sampler: Any, *, dual_clock: bool = False
+    sampler_name: str,
+    sampler: Any,
+    *,
+    dual_clock: bool = False,
+    shift_video: float = 12.0,
+    shift_audio: float = 3.0,
+    audio_velocity_is_raw: bool = True,
+    video_values: int | None = None,
 ) -> Any:
     """Install H3 sampler wrappers while preserving ComfyUI's equations.
 
     Base H3 ``res_multistep`` uses the owned-history implementation. Turbo's
-    Euler sampler delegates to ComfyUI exactly when telemetry is disabled and
-    uses the mirrored implementation only for opt-in telemetry.
+    regular Euler sampler delegates to ComfyUI exactly when telemetry is
+    disabled and uses the mirrored implementation only for opt-in telemetry.
+    ``euler_dualclock`` is deliberately different: it installs the manual
+    per-stream AV Euler update instead of aliasing to stock Euler.
     """
 
-    if sampler_name == "euler":
+    if sampler_name in H3_EULER_SAMPLER_NAMES:
         original_sampler_function = getattr(sampler, "sampler_function", None)
         if not callable(original_sampler_function):
             raise RuntimeError("H3 could not access ComfyUI's Euler sampler function")
+
+        if dual_clock:
+            def dual_clock_sampler(*args: Any, **kwargs: Any):
+                return _h3_dual_clock_euler(
+                    *args,
+                    shift_video=float(shift_video),
+                    shift_audio=float(shift_audio),
+                    audio_velocity_is_raw=bool(audio_velocity_is_raw),
+                    video_values=video_values,
+                    **kwargs,
+                )
+
+            dual_clock_sampler.__name__ = "sample_h3_dual_clock_euler"
+            sampler.sampler_function = dual_clock_sampler
+            print(
+                "[Kaggle H3] euler_dualclock selected: using manual dual-clock "
+                "Euler with one joint H3 forward per step; "
+                f"audio_velocity={'raw' if audio_velocity_is_raw else 'legacy_slope_adjusted'}.",
+                flush=True,
+            )
+            return sampler
 
         def euler_sampler_with_optional_telemetry(*args: Any, **kwargs: Any):
             if _H3_DIFFUSION_TELEMETRY.get() is None:
                 return original_sampler_function(*args, **kwargs)
             return _h3_euler_with_telemetry(*args, **kwargs)
 
-        euler_sampler_with_optional_telemetry.__name__ = (
-            "sample_h3_euler_dualclock"
-            if dual_clock
-            else "sample_h3_euler"
-        )
+        euler_sampler_with_optional_telemetry.__name__ = "sample_h3_euler"
         sampler.sampler_function = euler_sampler_with_optional_telemetry
-        if dual_clock:
-            print(
-                "[Kaggle H3] euler_dualclock selected: using stock Euler with "
-                "native ModelSamplingAV video/audio clocks; no second manual "
-                "audio update is applied.",
-                flush=True,
-            )
-        else:
-            print(
-                "[Kaggle H3] Turbo Euler preserves ComfyUI execution unless "
-                "diffusion telemetry is enabled.",
-                flush=True,
-            )
+        print(
+            "[Kaggle H3] Turbo Euler preserves ComfyUI execution unless "
+            "diffusion telemetry is enabled.",
+            flush=True,
+        )
         return sampler
 
     if sampler_name != "res_multistep":
@@ -925,14 +1314,20 @@ def _h3_time_shift_sigma(
 
 
 def _h3_actual_clock_schedule(
-    sigmas: Any, *, shift_video: float, shift_audio: float
+    sigmas: Any,
+    *,
+    shift_video: float,
+    shift_audio: float,
+    latent_update: str = "native_model_sampling_av",
+    manual_audio_update: bool = False,
+    audio_velocity: str = "native_carried",
 ) -> dict[str, Any]:
-    """Describe the schedules actually used by native H3 ModelSamplingAV.
+    """Describe the video/audio schedules used by the selected H3 sampler.
 
-    The returned audio values are telemetry only.  The sampler continues to
-    advance the packed latent on ComfyUI's video sigma grid; the H3 model and
-    ``ModelSamplingAV`` carry the audio stream onto its shifted clock exactly
-    once.  This function must never be used to update the latent directly.
+    For regular Euler, the audio values describe the native ``ModelSamplingAV``
+    carry.  For dual-clock Euler, the same values are the actual per-stream
+    integration grid used by the manual update.  This function only describes
+    a schedule; it never updates a latent directly.
     """
 
     video_sigmas = [float(value) for value in sigmas]
@@ -940,22 +1335,33 @@ def _h3_actual_clock_schedule(
         _h3_time_shift_sigma(value, float(shift_video), float(shift_audio))
         for value in video_sigmas
     ]
+    video_deltas = [
+        video_sigmas[index + 1] - video_sigmas[index]
+        for index in range(len(video_sigmas) - 1)
+    ]
+    audio_deltas = [
+        audio_sigmas[index + 1] - audio_sigmas[index]
+        for index in range(len(audio_sigmas) - 1)
+    ]
     return {
         "video": {
             "sigmas": video_sigmas,
             "model_timesteps": [value * 1000.0 for value in video_sigmas],
             "flow_timesteps": [1.0 - value for value in video_sigmas],
+            "deltas": video_deltas,
         },
         "audio": {
             "sigmas": audio_sigmas,
             "model_timesteps": [value * 1000.0 for value in audio_sigmas],
             "flow_timesteps": [1.0 - value for value in audio_sigmas],
+            "deltas": audio_deltas,
         },
         "shift_video": float(shift_video),
         "shift_audio": float(shift_audio),
         "mapping": "time_shift_sigma(video_sigma, shift_video, shift_audio)",
-        "latent_update": "native_model_sampling_av",
-        "manual_audio_update": False,
+        "latent_update": str(latent_update),
+        "manual_audio_update": bool(manual_audio_update),
+        "audio_velocity": str(audio_velocity),
     }
 
 
@@ -2749,8 +3155,8 @@ class H3TurboSampler:
                     {
                         "default": "euler",
                         "tooltip": (
-                            "Euler is the default. Euler Dual-clock explicitly selects "
-                            "H3's native video/audio ModelSamplingAV protocol."
+                            "Euler uses native H3 ModelSamplingAV. Euler Dual-clock "
+                            "uses one joint H3 forward with separate video/audio ODE clocks."
                         ),
                     },
                 ),
@@ -2805,6 +3211,7 @@ class H3TurboSampler:
                     "scheduler": "simple",
                     "shift_video": 12.0,
                     "shift_audio": 3.0,
+                    "manual_dual_clock": sampler_name == "euler_dualclock",
                     "source": "production_singularity_fallback",
                 },
                 max(1, int(steps)),
@@ -2826,12 +3233,13 @@ class H3TurboSampler:
                     f"H3 Turbo schedule requires sampler Euler or Euler Dual-clock; "
                     f"got expected={expected_sampler_name!r}, selected={sampler_name!r}"
                 )
-            # Both modes use stock ComfyUI Euler.  The explicit mode changes
-            # the protocol selection and telemetry only; audio is not updated
-            # a second time outside native ModelSamplingAV.
+            # Regular Euler uses native ModelSamplingAV.  Explicit dual-clock
+            # Euler selects the manual per-stream integration path instead of
+            # silently aliasing to regular Euler.
             schedule["base_sampler_name"] = "euler"
             schedule["sampler_name"] = sampler_name
             schedule["dual_clock"] = sampler_name == "euler_dualclock"
+            schedule["manual_dual_clock"] = sampler_name == "euler_dualclock"
         elif sampler_name != schedule.get("sampler_name", sampler_name):
             raise RuntimeError(
                 f"H3 runtime config requires sampler {schedule.get('sampler_name')!r}; got {sampler_name!r}"
@@ -2840,7 +3248,7 @@ class H3TurboSampler:
 
     @staticmethod
     def _shift_model(model: Any, schedule: dict[str, Any]):
-        """Apply H3's clone-based AV sigma-shift operation exactly once.
+        """Apply H3's clone-based sigma-shift operation exactly once.
 
         Recent ComfyUI H3 builds may already carry a ``ModelSamplingAV``
         object from a native sigma-shift node.  Replacing an equivalent object
@@ -2852,32 +3260,61 @@ class H3TurboSampler:
 
         import comfy.model_sampling  # type: ignore
 
-        if not hasattr(comfy.model_sampling, "ModelSamplingAV"):
-            raise RuntimeError(
-                "This ComfyUI build does not provide ModelSamplingAV, so the "
-                "H3 dual-clock sampler cannot be enabled. Update ComfyUI or "
-                "choose a compatible H3 build."
-            )
-
         shifted = model.clone()
 
         shift_video = float(schedule["shift_video"])
         shift_audio = float(schedule["shift_audio"])
+        manual_dual_clock = bool(schedule.get("manual_dual_clock", False))
         original = shifted.get_model_object("model_sampling")
+
+        if manual_dual_clock:
+            discrete_flow = getattr(
+                comfy.model_sampling, "ModelSamplingDiscreteFlow", None
+            )
+            constant = getattr(comfy.model_sampling, "CONST", None)
+            if discrete_flow is None or constant is None:
+                raise RuntimeError(
+                    "This ComfyUI build does not provide the flow sampling "
+                    "classes required for H3 manual dual-clock Euler."
+                )
+
+            class ModelSamplingH3DualClock(discrete_flow, constant):
+                @property
+                def audio_scale(self):
+                    # The manual sampler advances audio on sigma_audio itself;
+                    # native ModelSamplingAV must not carry it again.
+                    return 1.0
+
+            model_sampling = ModelSamplingH3DualClock(model.model.model_config)
+            model_sampling.set_parameters(shift=shift_video)
+            if hasattr(original, "noise_scale"):
+                model_sampling.set_noise_scale(original.noise_scale)
+            shifted.add_object_patch("model_sampling", model_sampling)
+        else:
+            if not hasattr(comfy.model_sampling, "ModelSamplingAV"):
+                raise RuntimeError(
+                    "This ComfyUI build does not provide ModelSamplingAV, so "
+                    "the native H3 sampler cannot be enabled. Update ComfyUI."
+                )
+
         same_native_av = False
         try:
-            same_native_av = (
-                hasattr(original, "audio_scale")
-                and math.isclose(float(getattr(original, "shift")), shift_video)
-                and math.isclose(float(getattr(original, "audio_shift")), shift_audio)
-            )
+            if not manual_dual_clock:
+                same_native_av = (
+                    hasattr(original, "audio_scale")
+                    and math.isclose(float(getattr(original, "shift")), shift_video)
+                    and math.isclose(float(getattr(original, "audio_shift")), shift_audio)
+                )
         except (AttributeError, TypeError, ValueError):
             same_native_av = False
 
-        class ModelSamplingAdvanced(comfy.model_sampling.ModelSamplingAV, comfy.model_sampling.CONST):
-            pass
+        if not manual_dual_clock and not same_native_av:
+            class ModelSamplingAdvanced(
+                comfy.model_sampling.ModelSamplingAV,
+                comfy.model_sampling.CONST,
+            ):
+                pass
 
-        if not same_native_av:
             model_sampling = ModelSamplingAdvanced(model.model.model_config)
             model_sampling.set_parameters(
                 shift=shift_video,
@@ -2890,9 +3327,17 @@ class H3TurboSampler:
         transformer_options = dict(copied_options.get("transformer_options") or {})
         transformer_options["minimax_h3_sigma_shift_video"] = shift_video
         transformer_options["minimax_h3_sigma_shift_audio"] = shift_audio
+        transformer_options["kaggle_h3_dual_clock_manual"] = manual_dual_clock
         copied_options["transformer_options"] = transformer_options
         shifted.model_options = copied_options
-        if same_native_av:
+        if manual_dual_clock:
+            print(
+                "[Kaggle H3] Installed manual dual-clock flow sampling with "
+                "audio_scale=1.0; native ModelSamplingAV carry is disabled for "
+                "this sampler branch.",
+                flush=True,
+            )
+        elif same_native_av:
             print(
                 "[Kaggle H3] Reusing existing native ModelSamplingAV object; "
                 "dual-clock shifts are not applied twice.",
@@ -2918,6 +3363,7 @@ class H3TurboSampler:
         if sage_attention is not None:
             use_sage_attention = bool(sage_attention)
         sage_attention = bool(use_sage_attention)
+        import torch
         import comfy.sample  # type: ignore
         import comfy.samplers  # type: ignore
         import comfy.sampler_helpers  # type: ignore
@@ -2951,6 +3397,8 @@ class H3TurboSampler:
                 f"expected one of {candidates}"
             )
 
+        dual_clock = bool(schedule.get("dual_clock", False))
+        audio_velocity_is_raw = _h3_model_uses_raw_audio_velocity(model)
         sampling_model = self._shift_model(model, schedule)
         phase_state = None
         phase_holder: dict[str, Any] = {}
@@ -2964,25 +3412,53 @@ class H3TurboSampler:
             synchronization_mode=synchronize_mode,
         )
         try:
-            sigmas = comfy.samplers.calculate_sigmas(
-                sampling_model.get_model_object("model_sampling"),
-                str(schedule.get("scheduler", "simple")),
-                int(expected_steps),
-            ).cpu()
-            sampler_backend_name = (
-                "euler" if sampler_name == "euler_dualclock" else sampler_name
-            )
+            if dual_clock:
+                # The external H3 implementation uses the explicit shifted
+                # flow grid rather than delegating the clock split to native
+                # ModelSamplingAV.  Keep it on CPU like ComfyUI's schedules.
+                sigmas = _h3_native_flow_sigmas(
+                    int(expected_steps),
+                    float(schedule.get("shift_video", 12.0)),
+                    device="cpu",
+                    dtype=torch.float32,
+                )
+            else:
+                sigmas = comfy.samplers.calculate_sigmas(
+                    sampling_model.get_model_object("model_sampling"),
+                    str(schedule.get("scheduler", "simple")),
+                    int(expected_steps),
+                ).cpu()
             actual_clock_schedule = _h3_actual_clock_schedule(
                 sigmas,
                 shift_video=float(schedule.get("shift_video", 12.0)),
                 shift_audio=float(schedule.get("shift_audio", 3.0)),
+                latent_update=(
+                    "manual_dual_clock_euler"
+                    if dual_clock
+                    else "native_model_sampling_av"
+                ),
+                manual_audio_update=dual_clock,
+                audio_velocity=(
+                    "raw" if audio_velocity_is_raw else "legacy_slope_adjusted"
+                )
+                if dual_clock
+                else "native_carried",
             )
             sampler_selection = {
                 "requested": sampler_name,
-                "backend": sampler_backend_name,
-                "dual_clock": sampler_name == "euler_dualclock",
-                "protocol": "native_model_sampling_av",
-                "manual_audio_update": False,
+                "backend": "manual_dual_clock_euler" if dual_clock else "euler",
+                "dual_clock": dual_clock,
+                "protocol": (
+                    "manual_h3_flow_av"
+                    if dual_clock
+                    else "native_model_sampling_av"
+                ),
+                "audio_velocity": (
+                    "raw" if audio_velocity_is_raw else "legacy_slope_adjusted"
+                )
+                if dual_clock
+                else "native_carried",
+                "manual_audio_update": dual_clock,
             }
             print(
                 "[Kaggle H3] sampler selection and actual video/audio schedules: "
@@ -3000,11 +3476,6 @@ class H3TurboSampler:
                 execution["sampler_selection"] = sampler_selection
                 execution["video_audio_schedule"] = actual_clock_schedule
                 runtime_config["execution"] = execution
-            sampler = _h3_prepare_sampler(
-                sampler_backend_name,
-                comfy.samplers.sampler_object(sampler_backend_name),
-                dual_clock=bool(schedule.get("dual_clock", False)),
-            )
             guider = Guider_Basic(sampling_model)
             guider.set_conds(conditioning)
 
@@ -3019,6 +3490,14 @@ class H3TurboSampler:
             )
             latent["samples"] = latent_image_tensor
             noise_mask = latent.get("noise_mask")
+            sampler = _h3_prepare_sampler(
+                "euler_dualclock" if dual_clock else "euler",
+                comfy.samplers.sampler_object("euler"),
+                dual_clock=dual_clock,
+                shift_video=float(schedule.get("shift_video", 12.0)),
+                shift_audio=float(schedule.get("shift_audio", 3.0)),
+                audio_velocity_is_raw=audio_velocity_is_raw,
+            )
             x0_output: dict[str, Any] = {}
             callback = latent_preview.prepare_callback(
                 guider.model_patcher, sigmas.shape[-1] - 1, x0_output
@@ -3055,12 +3534,21 @@ class H3TurboSampler:
                 execution["rmsnorm_dtype_alignment"] = dict(rmsnorm_report)
                 execution["sage_attention"] = dict(sage_attention_report)
                 execution["dual_clock_sampling"] = {
-                    "requested": bool(schedule.get("dual_clock", False)),
+                    "requested": dual_clock,
                     "sampler_mode": sampler_name,
-                    "backend": "native_model_sampling_av",
+                    "backend": (
+                        "manual_dual_clock_euler"
+                        if dual_clock
+                        else "native_model_sampling_av"
+                    ),
                     "video_shift": schedule.get("shift_video"),
                     "audio_shift": schedule.get("shift_audio"),
-                    "manual_audio_update": False,
+                    "audio_velocity": (
+                        "raw" if audio_velocity_is_raw else "legacy_slope_adjusted"
+                    )
+                    if dual_clock
+                    else "native_carried",
+                    "manual_audio_update": dual_clock,
                 }
                 if diffusion_telemetry is not None and diffusion_telemetry.enabled:
                     execution["diffusion_telemetry"] = diffusion_telemetry.summary()

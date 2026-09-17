@@ -977,11 +977,19 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         module = load_node_module()
         sampler = types.SimpleNamespace(sampler_function=lambda *args, **kwargs: object())
         self.assertIs(module._h3_prepare_sampler("euler", sampler, dual_clock=True), sampler)
+        self.assertEqual(
+            sampler.sampler_function.__name__, "sample_h3_dual_clock_euler"
+        )
 
-    def test_dual_clock_schedule_derives_audio_clock_without_manual_update(self):
+    def test_dual_clock_schedule_derives_audio_clock_for_manual_update(self):
         module = load_node_module()
         schedule = module._h3_actual_clock_schedule(
-            [1.0, 0.5, 0.0], shift_video=12.0, shift_audio=3.0
+            [1.0, 0.5, 0.0],
+            shift_video=12.0,
+            shift_audio=3.0,
+            latent_update="manual_dual_clock_euler",
+            manual_audio_update=True,
+            audio_velocity="raw",
         )
         self.assertEqual(schedule["video"]["sigmas"], [1.0, 0.5, 0.0])
         for actual, expected in zip(schedule["audio"]["sigmas"], [1.0, 0.2, 0.0]):
@@ -991,8 +999,178 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
             schedule["audio"]["flow_timesteps"], [0.0, 0.8, 1.0]
         ):
             self.assertAlmostEqual(actual, expected)
-        self.assertEqual(schedule["latent_update"], "native_model_sampling_av")
-        self.assertFalse(schedule["manual_audio_update"])
+        self.assertEqual(schedule["latent_update"], "manual_dual_clock_euler")
+        self.assertTrue(schedule["manual_audio_update"])
+        self.assertEqual(schedule["audio_velocity"], "raw")
+        self.assertEqual(schedule["video"]["deltas"], [-0.5, -0.5])
+        self.assertAlmostEqual(schedule["audio"]["deltas"][0], -0.8)
+
+    def test_dual_clock_euler_updates_audio_on_its_own_clock(self):
+        module = load_node_module()
+        import torch
+
+        sampling = types.ModuleType("comfy.k_diffusion.sampling")
+        sampling.trange = lambda count, disable=None: range(count)
+        k_diffusion = types.ModuleType("comfy.k_diffusion")
+        k_diffusion.__path__ = []
+        k_diffusion.sampling = sampling
+        comfy = types.ModuleType("comfy")
+        comfy.__path__ = []
+        comfy.k_diffusion = k_diffusion
+
+        class AV:
+            is_nested = True
+
+            def __init__(self, streams):
+                self.streams = list(streams)
+
+            def unbind(self):
+                return tuple(self.streams)
+
+        class Model:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, value, _sigma, **_kwargs):
+                self.calls += 1
+                video, audio = value.unbind()
+                return AV((torch.zeros_like(video), torch.zeros_like(audio)))
+
+        modules = {
+            "comfy": comfy,
+            "comfy.k_diffusion": k_diffusion,
+            "comfy.k_diffusion.sampling": sampling,
+        }
+        with patch.dict(sys.modules, modules), patch.object(
+            module, "synchronize_h3_devices"
+        ):
+            model = Model()
+            output = module._h3_dual_clock_euler(
+                model,
+                AV((torch.ones((1, 1, 1, 1, 1)), torch.ones((1, 1, 1, 2)))),
+                torch.tensor([1.0, 0.5, 0.0]),
+                shift_video=12.0,
+                shift_audio=3.0,
+                audio_velocity_is_raw=True,
+            )
+
+        video, audio = output.unbind()
+        self.assertEqual(model.calls, 2)
+        self.assertTrue(torch.equal(video, torch.zeros_like(video)))
+        self.assertTrue(torch.allclose(audio, torch.full_like(audio, 0.140625)))
+        self.assertFalse(torch.equal(video.flatten(), audio.flatten()))
+
+    def test_dual_clock_euler_preserves_legacy_packed_latent_contract(self):
+        module = load_node_module()
+        import torch
+
+        sampling = types.ModuleType("comfy.k_diffusion.sampling")
+        sampling.trange = lambda count, disable=None: range(count)
+        k_diffusion = types.ModuleType("comfy.k_diffusion")
+        k_diffusion.__path__ = []
+        k_diffusion.sampling = sampling
+        comfy = types.ModuleType("comfy")
+        comfy.__path__ = []
+        comfy.k_diffusion = k_diffusion
+
+        class Model:
+            def __call__(self, value, _sigma, **_kwargs):
+                return torch.zeros_like(value)
+
+        modules = {
+            "comfy": comfy,
+            "comfy.k_diffusion": k_diffusion,
+            "comfy.k_diffusion.sampling": sampling,
+        }
+        with patch.dict(sys.modules, modules), patch.object(
+            module, "synchronize_h3_devices"
+        ):
+            output = module._h3_dual_clock_euler(
+                Model(),
+                torch.ones((1, 1, 3)),
+                torch.tensor([1.0, 0.5, 0.0]),
+                shift_video=12.0,
+                shift_audio=3.0,
+                audio_velocity_is_raw=True,
+                video_values=1,
+            )
+
+        self.assertEqual(tuple(output.shape), (1, 1, 3))
+        self.assertTrue(torch.equal(output[..., :1], torch.zeros((1, 1, 1))))
+        self.assertTrue(torch.allclose(output[..., 1:], torch.full((1, 1, 2), 0.140625)))
+
+    def test_manual_dual_clock_sampling_disables_native_audio_carry(self):
+        module = load_node_module()
+        import torch
+
+        model_sampling = types.ModuleType("comfy.model_sampling")
+
+        class CONST:
+            pass
+
+        class ModelSamplingDiscreteFlow(torch.nn.Module):
+            def __init__(self, _config=None):
+                super().__init__()
+                self.noise_scale = 1.0
+
+            def set_parameters(self, shift=1.0):
+                self.shift = shift
+
+            def set_noise_scale(self, value):
+                self.noise_scale = float(value)
+
+        class ModelSamplingAV(ModelSamplingDiscreteFlow):
+            def set_parameters(self, shift=1.0, audio_shift=None):
+                self.shift = shift
+                self.audio_shift = audio_shift
+
+            @property
+            def audio_scale(self):
+                return self.shift / self.audio_shift
+
+        model_sampling.CONST = CONST
+        model_sampling.ModelSamplingDiscreteFlow = ModelSamplingDiscreteFlow
+        model_sampling.ModelSamplingAV = ModelSamplingAV
+        comfy = types.ModuleType("comfy")
+        comfy.__path__ = []
+        comfy.model_sampling = model_sampling
+
+        class Patcher:
+            def __init__(self):
+                self.model = types.SimpleNamespace(model_config=object())
+                self.model_sampling = ModelSamplingAV()
+                self.model_options = {}
+
+            def clone(self):
+                return self
+
+            def get_model_object(self, name):
+                self.assert_name = name
+                return self.model_sampling
+
+            def add_object_patch(self, name, value):
+                self.patched_name = name
+                self.patched_sampling = value
+
+        with patch.dict(
+            sys.modules,
+            {"comfy": comfy, "comfy.model_sampling": model_sampling},
+        ):
+            patcher = Patcher()
+            output = module.H3TurboSampler._shift_model(
+                patcher,
+                {
+                    "shift_video": 12.0,
+                    "shift_audio": 3.0,
+                    "manual_dual_clock": True,
+                },
+            )
+
+        self.assertIs(output, patcher)
+        self.assertEqual(patcher.patched_name, "model_sampling")
+        self.assertEqual(patcher.patched_sampling.shift, 12.0)
+        self.assertEqual(patcher.patched_sampling.audio_scale, 1.0)
+        self.assertFalse(hasattr(patcher.patched_sampling, "audio_shift"))
 
     def test_res_multistep_history_isolated_from_reused_model_output_buffer(self):
         module = load_node_module()
