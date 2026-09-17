@@ -8,7 +8,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from kaggle_h3.workflow import H3Request, build_workflow
 
@@ -60,6 +60,7 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
     "KaggleH3PhaseDispatch",
     "KaggleH3AdapterStack",
     "KaggleH3TurboSampler",
+    "KaggleH3LatentUpscale2x",
     "KaggleH3VAEDecode",
     "KaggleH3AudioVAEDecode",
 }
@@ -85,6 +86,7 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertIn("KaggleH3VAELoader", module.NODE_CLASS_MAPPINGS)
         self.assertIn("KaggleH3PhaseDispatch", module.NODE_CLASS_MAPPINGS)
         self.assertIn("KaggleH3TurboSampler", module.NODE_CLASS_MAPPINGS)
+        self.assertIn("KaggleH3LatentUpscale2x", module.NODE_CLASS_MAPPINGS)
         self.assertIn("KaggleH3VAEDecode", module.NODE_CLASS_MAPPINGS)
         self.assertIn("KaggleH3AudioVAEDecode", module.NODE_CLASS_MAPPINGS)
         self.assertTrue(hasattr(module, "KaggleH3ContextLoopSampler"))
@@ -100,7 +102,8 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
             sampler_inputs["sampler_name"][0],
             ["euler", "euler_dualclock"],
         )
-        self.assertNotIn("sage_attention", sampler_inputs)
+        self.assertIn("use_sage_attention", module.H3TurboSampler.INPUT_TYPES()["optional"])
+        self.assertFalse(module.H3TurboSampler.INPUT_TYPES()["optional"]["use_sage_attention"][1]["default"])
         self.assertEqual(sampler_inputs["synchronize_mode"][0], ["full", "safe", "fast"])
         self.assertEqual(sampler_inputs["synchronize_mode"][1]["default"], "full")
         self.assertEqual(
@@ -115,7 +118,11 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
             context_sampler.RETURN_NAMES,
             ("sampled_latent", "video_latent", "audio_latent", "denoised_output"),
         )
-        self.assertNotIn("sage_attention", context_sampler.INPUT_TYPES()["required"])
+        self.assertIn("use_sage_attention", context_sampler.INPUT_TYPES()["optional"])
+        upscale_inputs = module.KaggleH3LatentUpscale2x.INPUT_TYPES()["required"]
+        self.assertEqual(upscale_inputs["source_size_preset"][0], ["240p", "360p", "480p"])
+        self.assertEqual(module.KaggleH3LatentUpscale2x.RETURN_NAMES,
+                         ("upscaled_latent", "original_latent", "H3_RUNTIME_CONFIG"))
         ref2va_inputs = module.KaggleH3Ref2VAConditioning.INPUT_TYPES()
         self.assertEqual(ref2va_inputs["required"]["size_preset"][0], ["240p", "360p", "480p"])
         self.assertEqual(ref2va_inputs["required"]["aspect_ratio"][0], ["16:9", "4:3"])
@@ -223,6 +230,69 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
                     "turbo": {"enabled": True},
                 }
             )
+
+    def test_optional_latent_upscale_returns_2x_video_and_cpu_fallback(self):
+        module = load_node_module()
+        import torch
+
+        model = object()
+        runtime_config = {"execution": {}}
+        latent = {
+            "samples": torch.zeros((1, 4, 3, 8, 10), dtype=torch.float32),
+            "_kaggle_h3_stream": "video",
+        }
+        with patch.object(
+            module,
+            "_h3_release_before_latent_upscale",
+            return_value={"patcher_cpu": True},
+        ) as release:
+            upscaled, original, returned_config = module.KaggleH3LatentUpscale2x().upscale(
+                model=model,
+                samples=latent,
+                enabled=True,
+                source_size_preset="360p",
+                aspect_ratio="16:9",
+                method="bicubic",
+                runtime_config=runtime_config,
+            )
+        release.assert_called_once_with(model)
+        self.assertEqual(tuple(upscaled["samples"].shape), (1, 4, 3, 16, 20))
+        self.assertEqual(tuple(original["samples"].shape), (1, 4, 3, 8, 10))
+        self.assertEqual(upscaled["_kaggle_h3_upscale"]["target_preset"], "720p")
+        self.assertEqual(returned_config["execution"]["latent_upscale"]["scale_factor"], 2)
+        self.assertEqual(str(original["samples"].device), "cpu")
+
+    def test_latent_upscale_releases_model_patcher_before_processing(self):
+        module = load_node_module()
+        import torch
+
+        unpatch = Mock()
+        model = types.SimpleNamespace(unpatch_model=unpatch)
+        with patch.object(module, "phase_state_for_model", return_value=None), patch.object(
+            module, "release_transformer_phase", return_value={"status": "not_started"}
+        ), patch.object(
+            module, "release_h3_runtime_resources", return_value={"status": "released"}
+        ):
+            report = module._h3_release_before_latent_upscale(model)
+        self.assertTrue(report["patcher_cpu"])
+        unpatch.assert_called_once()
+        self.assertEqual(unpatch.call_args.args[0], torch.device("cpu"))
+
+    def test_latent_upscale_fails_before_processing_on_nonfinite_input(self):
+        module = load_node_module()
+        import torch
+
+        latent = {"samples": torch.tensor([[[[float("nan")]]]])}
+        with patch.dict(os.environ, {"KAGGLE_H3_FP_DIAGNOSTICS": "1"}):
+            with self.assertRaisesRegex(FloatingPointError, "stage 'sampler_final_out'"):
+                module.KaggleH3LatentUpscale2x().upscale(
+                    model=object(),
+                    samples=latent,
+                    enabled=False,
+                    source_size_preset="360p",
+                    aspect_ratio="16:9",
+                    method="bicubic",
+                )
 
     def test_global_conditioning_routes_ref2va_autogrow_inputs_to_native(self):
         module = load_node_module()
@@ -848,7 +918,7 @@ assert set(module.NODE_CLASS_MAPPINGS) == {
         self.assertEqual(workflow["sample"]["class_type"], "KaggleH3TurboSampler")
         self.assertEqual(workflow["sample"]["inputs"]["runtime_config"], ["phase", 3])
         self.assertEqual(workflow["sample"]["inputs"]["sampler_name"], "euler")
-        self.assertNotIn("sage_attention", workflow["sample"]["inputs"])
+        self.assertFalse(workflow["sample"]["inputs"]["use_sage_attention"])
         self.assertNotIn("SamplerCustomAdvanced", {node["class_type"] for node in workflow.values()})
 
     def test_dedicated_sampler_consumes_selected_turbo_steps(self):

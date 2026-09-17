@@ -89,10 +89,16 @@ class WorkflowTests(unittest.TestCase):
             select_production_mode(
                 H3Request("base", character_references=["character.png"], turbo_mode=False)
             )
-        with self.assertRaisesRegex(ValueError, "SageAttention"):
+        self.assertEqual(
             select_production_mode(
                 H3Request("sage", character_references=["character.png"], sage_attention=True)
-            )
+            ),
+            "Ref2VA",
+        )
+        workflow = build_workflow(
+            H3Request("sage", character_references=["character.png"], sage_attention=True)
+        )
+        self.assertTrue(workflow["sample"]["inputs"]["use_sage_attention"])
         with self.assertRaisesRegex(ValueError, "explicit dimensions"):
             select_production_mode(
                 H3Request("geometry", character_references=["character.png"], width=640)
@@ -151,7 +157,7 @@ class WorkflowTests(unittest.TestCase):
         workflow = json.loads((root / "workflows" / "kaggle_h3_turbo_smoke.json").read_text(encoding="utf-8"))
         self.assertTrue(all(node.get("_meta", {}).get("title") for node in workflow.values()))
         self.assertEqual(workflow["sample"]["inputs"]["sampler_name"], "euler")
-        self.assertNotIn("sage_attention", workflow["sample"]["inputs"])
+        self.assertFalse(workflow["sample"]["inputs"]["use_sage_attention"])
         self.assertEqual(workflow["unet"]["inputs"]["model_variant"], "Ref2VA")
         self.assertNotIn("character_reference", workflow)
         self.assertNotIn("scene_reference", workflow)

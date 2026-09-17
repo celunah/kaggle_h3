@@ -55,7 +55,7 @@
     "_meta": {"title": "Kaggle H3 | Singularity Turbo Adapter Stack"}
   },
   "phase": {"class_type": "KaggleH3PhaseDispatch", "inputs": {"model": ["h3_adapter", 0], "runtime_config": ["h3_adapter", 1], "conditioning": ["h3", 0], "latent_image": ["h3", 1]}, "_meta": {"title": "Kaggle H3 | Transformer Dispatch Barrier"}},
-  "sample": {"class_type": "KaggleH3TurboSampler", "inputs": {"model": ["phase", 0], "runtime_config": ["phase", 3], "conditioning": ["phase", 1], "latent_image": ["phase", 2], "noise_seed": 42, "sampler_name": "euler", "steps": 4, "synchronize_mode": "full"}, "_meta": {"title": "Kaggle H3 | Singularity Turbo Sampler (Euler; 4 steps)"}},
+  "sample": {"class_type": "KaggleH3TurboSampler", "inputs": {"model": ["phase", 0], "runtime_config": ["phase", 3], "conditioning": ["phase", 1], "latent_image": ["phase", 2], "noise_seed": 42, "sampler_name": "euler", "steps": 4, "synchronize_mode": "full", "use_sage_attention": false}, "_meta": {"title": "Kaggle H3 | Singularity Turbo Sampler (Euler; 4 steps)"}},
   "decode": {"class_type": "KaggleH3VAEDecode", "inputs": {"samples": ["sample", 0], "vae": ["vae_video", 0], "device_id": 1}, "_meta": {"title": "Kaggle H3 | Video Decode (GPU1)"}},
   "decode_audio": {"class_type": "KaggleH3AudioVAEDecode", "inputs": {"samples": ["sample", 1], "vae": ["vae_audio", 0], "device_id": 0, "mute_generated_audio": false, "runtime_config": ["h3_adapter", 1]}, "_meta": {"title": "Kaggle H3 | Audio Decode (GPU0; optional mute)"}},
   "video": {"class_type": "CreateVideo", "inputs": {"images": ["decode", 0], "fps": 24.0, "audio": ["decode_audio", 0], "bit_depth": 8, "color_space": "sRGB"}, "_meta": {"title": "Output | Video + Audio"}},

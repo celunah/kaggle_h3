@@ -9,6 +9,7 @@ ComfyUI does not mistake them for separate custom nodes.
 from __future__ import annotations
 
 from contextvars import ContextVar
+import gc
 import json
 import math
 import os
@@ -2761,6 +2762,16 @@ class H3TurboSampler:
             },
             "optional": {
                 "runtime_config": ("H3_RUNTIME_CONFIG",),
+                "use_sage_attention": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Use T4-compatible SageAttention v1 when available; "
+                            "otherwise fall back to normal H3 attention."
+                        ),
+                    },
+                ),
             }
         }
 
@@ -2899,10 +2910,14 @@ class H3TurboSampler:
         sampler_name: str,
         steps: int = 20,
         synchronize_mode: str = "full",
-        sage_attention: bool = False,
+        use_sage_attention: bool = False,
+        sage_attention: bool | None = None,
     ):
-        if bool(sage_attention):
-            raise RuntimeError("SageAttention is not part of the production H3 profile yet.")
+        # ``sage_attention`` remains a private compatibility alias for older
+        # API callers.  The ComfyUI-facing control is use_sage_attention.
+        if sage_attention is not None:
+            use_sage_attention = bool(sage_attention)
+        sage_attention = bool(use_sage_attention)
         import comfy.sample  # type: ignore
         import comfy.samplers  # type: ignore
         import comfy.sampler_helpers  # type: ignore
@@ -3180,6 +3195,225 @@ class H3TurboSampler:
         return (video_output, audio_output, denoised)
 
 
+_H3_LATENT_UPSCALE_TARGETS = {
+    "240p": "480p",
+    "360p": "720p",
+    "480p": "960p",
+}
+
+
+def _h3_release_before_latent_upscale(model: Any) -> dict[str, Any]:
+    """Release H3 transformer/LoRA residency before the post-sample phase."""
+
+    report: dict[str, Any] = {
+        "transformer": None,
+        "runtime": None,
+        "patcher_cpu": False,
+        "cuda_cache_cleared": False,
+    }
+    try:
+        state = phase_state_for_model(model)
+    except Exception as exc:
+        state = None
+        report["state_lookup_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        report["transformer"] = release_transformer_phase(state)
+    except Exception as exc:
+        report["transformer_error"] = f"{type(exc).__name__}: {exc}"
+
+    # The sampler normally performs this cleanup already.  Repeat the safe,
+    # idempotent runtime release here because this node is the explicit phase
+    # boundary before a potentially expensive upscale.
+    try:
+        patcher = getattr(model, "patcher", model)
+        unpatch = getattr(patcher, "unpatch_model", None)
+        if callable(unpatch):
+            import torch  # type: ignore
+
+            unpatch(torch.device("cpu"), unpatch_weights=True)
+            report["patcher_cpu"] = True
+    except Exception as exc:
+        report["patcher_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        report["runtime"] = release_h3_runtime_resources()
+    except Exception as exc:
+        report["runtime_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            for device_id in range(int(torch.cuda.device_count())):
+                torch.cuda.synchronize(torch.device("cuda", device_id))
+            torch.cuda.empty_cache()
+            report["cuda_cache_cleared"] = True
+    except Exception as exc:
+        report["cuda_cleanup_error"] = f"{type(exc).__name__}: {exc}"
+    gc.collect()
+    print(
+        "[Kaggle H3] Released H3 diffusion model and LoRA before latent "
+        f"upscaling; patcher_cpu={report['patcher_cpu']}, "
+        f"cuda_cache_cleared={report['cuda_cache_cleared']}.",
+        flush=True,
+    )
+    return report
+
+
+def _h3_cpu_latent_upscale(tensor: Any, method: str) -> Any:
+    """Upscale only spatial latent dimensions on CPU, preserving time."""
+
+    import torch  # type: ignore
+    import torch.nn.functional as functional  # type: ignore
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError("H3 latent upscaling requires a video torch.Tensor")
+    if bool(getattr(tensor, "is_nested", False)):
+        raise ValueError("H3 latent upscaling requires one unpacked video latent stream")
+    if tensor.ndim not in {4, 5}:
+        raise ValueError(
+            "H3 latent upscaling expects [B,C,H,W] or [B,C,T,H,W], "
+            f"got shape={tuple(tensor.shape)}"
+        )
+    if not (tensor.is_floating_point() or tensor.is_complex()):
+        raise TypeError(f"H3 latent upscaling requires a floating tensor, got {tensor.dtype}")
+    if tensor.is_complex():
+        raise TypeError("H3 latent upscaling does not support complex latents")
+
+    work = tensor.detach().to("cpu")
+    original_dtype = work.dtype
+    # CPU interpolation kernels are not consistently implemented for BF16 or
+    # FP16 across Kaggle's PyTorch builds.  This does not alter H3 sampling;
+    # the result is converted back to the original latent dtype afterward.
+    if original_dtype in {torch.float16, torch.bfloat16}:
+        work = work.to(torch.float32)
+    with torch.no_grad():
+        if work.ndim == 5:
+            output = functional.interpolate(
+                work,
+                scale_factor=(1.0, 2.0, 2.0),
+                mode="trilinear",
+                align_corners=False,
+            )
+        else:
+            output = functional.interpolate(
+                work,
+                scale_factor=2.0,
+                mode=str(method),
+                align_corners=False,
+            )
+    return output.to(dtype=original_dtype)
+
+
+class KaggleH3LatentUpscale2x:
+    """Optional CPU 2x spatial latent upscale after H3 sampling.
+
+    This is intentionally a stateless latent upscaler rather than a second
+    learned checkpoint. It keeps the H3 model/LoRA and video VAE out of memory
+    during the post-sample resize, while the downstream Kaggle video VAE node
+    remains responsible for decode, finite checks, and CPU handoff.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "samples": ("LATENT",),
+                "enabled": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Release H3, then apply optional 2x spatial latent upscaling.",
+                    },
+                ),
+                "source_size_preset": (
+                    ["240p", "360p", "480p"],
+                    {"default": "360p"},
+                ),
+                "aspect_ratio": (["16:9", "4:3"], {"default": "16:9"}),
+                "method": (
+                    ["bicubic", "bilinear"],
+                    {"default": "bicubic"},
+                ),
+            },
+            "optional": {"runtime_config": ("H3_RUNTIME_CONFIG",)},
+        }
+
+    RETURN_TYPES = ("LATENT", "LATENT", "H3_RUNTIME_CONFIG")
+    RETURN_NAMES = ("upscaled_latent", "original_latent", "H3_RUNTIME_CONFIG")
+    FUNCTION = "upscale"
+    CATEGORY = "latent/MiniMax H3"
+
+    def upscale(
+        self,
+        model: Any,
+        samples: dict[str, Any],
+        enabled: bool,
+        source_size_preset: str,
+        aspect_ratio: str,
+        method: str,
+        runtime_config: dict[str, Any] | None = None,
+    ):
+        video_tensor = _h3_stream_tensor(samples, "video")
+        validate_finite(video_tensor, "sampler_final_out", tensor_name="latent_upscale_input")
+        if not bool(enabled):
+            print("[Kaggle H3] 2x latent upscaling disabled; retaining original result.", flush=True)
+            return dict(samples), dict(samples), runtime_config
+
+        source_preset = str(source_size_preset)
+        if source_preset not in _H3_LATENT_UPSCALE_TARGETS:
+            raise ValueError(f"Unsupported H3 latent upscale source preset: {source_preset!r}")
+        target_preset = _H3_LATENT_UPSCALE_TARGETS[source_preset]
+        source_shape = tuple(getattr(video_tensor, "shape", ()))
+        source_cpu = video_tensor.detach().to("cpu").clone()
+        validate_finite(source_cpu, "sampler_final_out", tensor_name="latent_upscale_cpu_input")
+        original = dict(samples)
+        original["samples"] = source_cpu
+        original["_kaggle_h3_upscale"] = {
+            "enabled": False,
+            "source_preset": source_preset,
+            "target_preset": target_preset,
+            "aspect_ratio": str(aspect_ratio),
+            "source_shape": source_shape,
+            "device": "cpu",
+        }
+        del video_tensor
+        release_report = _h3_release_before_latent_upscale(model)
+
+        print(
+            "[Kaggle H3] Latent upscaler loaded: backend=cpu_interpolate, "
+            f"method={method}, scale=2x, {source_preset}->{target_preset}, tiled=False.",
+            flush=True,
+        )
+        try:
+            upscaled_tensor = _h3_cpu_latent_upscale(source_cpu, method)
+            validate_finite(upscaled_tensor, "latent_upscale_out", tensor_name="upscaled_latent")
+        finally:
+            print("[Kaggle H3] Latent upscaler unloaded; CPU fallback retained.", flush=True)
+            gc.collect()
+
+        upscaled = dict(original)
+        upscaled["samples"] = upscaled_tensor
+        upscaled["_kaggle_h3_upscale"] = {
+            "enabled": True,
+            "backend": "cpu_interpolate",
+            "method": str(method),
+            "scale_factor": 2,
+            "source_preset": source_preset,
+            "target_preset": target_preset,
+            "aspect_ratio": str(aspect_ratio),
+            "source_shape": source_shape,
+            "output_shape": tuple(upscaled_tensor.shape),
+            "device": "cpu",
+            "tiled": False,
+            "h3_release": release_report,
+        }
+        if isinstance(runtime_config, dict):
+            execution = dict(runtime_config.get("execution") or {})
+            execution["latent_upscale"] = dict(upscaled["_kaggle_h3_upscale"])
+            runtime_config["execution"] = execution
+        return upscaled, original, runtime_config
+
+
 def _h3_context_loop_validate_runtime_config(
     runtime_config: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -3270,7 +3504,16 @@ class KaggleH3ContextLoopSampler:
                     {"default": "full"},
                 ),
             },
-            "optional": {"runtime_config": ("H3_RUNTIME_CONFIG",)},
+            "optional": {
+                "runtime_config": ("H3_RUNTIME_CONFIG",),
+                "use_sage_attention": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Use SageAttention v1 when available; safely fall back otherwise.",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("LATENT", "LATENT", "LATENT", "LATENT")
@@ -3298,6 +3541,7 @@ class KaggleH3ContextLoopSampler:
         steps: int,
         synchronize_mode: str,
         runtime_config: dict[str, Any] | None = None,
+        use_sage_attention: bool = False,
     ):
         runtime_config = _h3_context_loop_validate_runtime_config(runtime_config)
         video_latent, audio_latent, denoised = H3TurboSampler().sample(
@@ -3309,6 +3553,7 @@ class KaggleH3ContextLoopSampler:
             sampler_name=sampler_name,
             steps=steps,
             synchronize_mode=synchronize_mode,
+            use_sage_attention=use_sage_attention,
         )
         sampled_latent = _h3_context_loop_pack_latent(video_latent, audio_latent)
         if not isinstance(denoised, dict) or "samples" not in denoised:
@@ -3331,6 +3576,7 @@ NODE_CLASS_MAPPINGS = {
     "KaggleH3PhaseDispatch": KaggleH3PhaseDispatch,
     "KaggleH3AdapterStack": H3AdapterStack,
     "KaggleH3TurboSampler": H3TurboSampler,
+    "KaggleH3LatentUpscale2x": KaggleH3LatentUpscale2x,
     "KaggleH3VAEDecode": H3VAEDecode,
     "KaggleH3AudioVAEDecode": H3AudioVAEDecode,
 }
@@ -3344,6 +3590,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "KaggleH3PhaseDispatch": "Kaggle H3 | Transformer Dispatch Barrier",
     "KaggleH3AdapterStack": "Kaggle H3 | Adapter Stack",
     "KaggleH3TurboSampler": "Kaggle H3 | Turbo Sampler",
+    "KaggleH3LatentUpscale2x": "Kaggle H3 | Optional 2x Latent Upscale",
     "KaggleH3VAEDecode": "Kaggle H3 | Video VAE Decode (GPU1)",
     "KaggleH3AudioVAEDecode": "Kaggle H3 | Audio VAE Decode (GPU0)",
 }

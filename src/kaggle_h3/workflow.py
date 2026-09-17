@@ -174,8 +174,6 @@ def select_production_mode(request: H3Request) -> str:
         raise ValueError("The production Kaggle H3 workflow requires Ref2VA conditioning.")
     if request.model_profile != "singularity":
         raise ValueError("The production Kaggle H3 workflow requires the Singularity model profile.")
-    if request.sage_attention:
-        raise ValueError("SageAttention is not part of the production H3 profile yet.")
     if request.sampler_name not in PRODUCTION_SAMPLER_NAMES:
         raise ValueError(
             "Production H3 supports sampler 'euler' or 'euler_dualclock'; "
@@ -504,6 +502,7 @@ def build_workflow(
             "sampler_name": request.sampler_name,
             "steps": quality_steps(request),
             "synchronize_mode": request.synchronize_mode,
+            "use_sage_attention": bool(request.sage_attention),
         },
     }
     # The stock H3 video VAE is an FP16 checkpoint.  Use the local decoder
@@ -613,7 +612,6 @@ def validate_production_workflow_shape(workflow: dict[str, Any]) -> dict[str, An
         "fp8": "FP8",
         "720p": "720p",
         "res_multistep": "non-Turbo res_multistep",
-        "sage_attention": "SageAttention",
     }
     for token, label in forbidden.items():
         if token in serialized:

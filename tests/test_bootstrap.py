@@ -58,7 +58,7 @@ node_path = root / "custom_nodes" / "kaggle_h3_adapters.py"
 spec = importlib.util.spec_from_file_location("installed_h3_node", node_path)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-assert len(module.NODE_CLASS_MAPPINGS) == 10
+assert len(module.NODE_CLASS_MAPPINGS) == 11
 """
             environment = os.environ.copy()
             environment.pop("PYTHONPATH", None)

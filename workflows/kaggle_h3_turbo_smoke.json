@@ -94,7 +94,8 @@
       "noise_seed": 7,
       "sampler_name": "euler",
       "steps": 4,
-      "synchronize_mode": "full"
+      "synchronize_mode": "full",
+      "use_sage_attention": false
     },
     "_meta": {"title": "Kaggle H3 | Singularity Turbo Sampler (Euler; 4 steps)"}
   },

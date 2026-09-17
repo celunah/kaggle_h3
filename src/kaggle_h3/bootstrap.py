@@ -448,6 +448,7 @@ def install_h3_adapter_node(
             "KaggleH3PhaseDispatch",
             "KaggleH3AdapterStack",
             "KaggleH3TurboSampler",
+            "KaggleH3LatentUpscale2x",
             "KaggleH3VAEDecode",
             "KaggleH3AudioVAEDecode",
             "KaggleH3ContextLoopSampler",
