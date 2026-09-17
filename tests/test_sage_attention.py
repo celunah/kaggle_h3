@@ -59,6 +59,16 @@ class SageAttentionTests(unittest.TestCase):
         self.assertTrue(status["available"])
         self.assertTrue(status["supports_h3_packed_containers"])
 
+    def test_distribution_metadata_is_used_when_module_has_no_version(self):
+        modules, _model, _original, _masked = self._fake_modules()
+        del modules["sageattention"].__version__
+        with patch.dict(sys.modules, modules, clear=False), patch(
+            "kaggle_h3.sage_attention.distribution_version", return_value="1.0.6"
+        ):
+            status = sage_attention_status()
+        self.assertEqual(status["version"], "1.0.6")
+        self.assertTrue(status["sage_v1_compatible"])
+
     def test_install_patches_only_h3_model_and_restores(self):
         modules, model, original, original_masked = self._fake_modules()
         with patch.dict(sys.modules, modules, clear=False), patch(

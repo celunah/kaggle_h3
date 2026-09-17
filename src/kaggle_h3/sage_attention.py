@@ -14,6 +14,8 @@ running a different attention backend.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as distribution_version
 import re
 from typing import Any, Iterator
 
@@ -60,6 +62,7 @@ def sage_attention_status() -> dict[str, Any]:
         "comfy_attention_sage": False,
         "supports_h3_packed_containers": False,
         "implementation": "SageAttention v1",
+        "sage_v1_compatible": False,
         "triton_version": None,
         "triton_compatible": False,
         "cuda_available": False,
@@ -73,6 +76,13 @@ def sage_attention_status() -> dict[str, Any]:
 
         status["package"] = "sageattention"
         status["version"] = getattr(sageattention, "__version__", None)
+        if not status["version"]:
+            # SageAttention 1.0.6 exposes no __version__ attribute in its
+            # module; the installed distribution metadata is authoritative.
+            try:
+                status["version"] = distribution_version("sageattention")
+            except PackageNotFoundError:
+                status["version"] = None
         status["available"] = callable(getattr(sageattention, "sageattn", None))
         sage_version = _version_tuple(status["version"])
         status["sage_v1_compatible"] = bool(
@@ -141,11 +151,18 @@ def install_h3_sage_attention() -> tuple[dict[str, Any], Any]:
             "and Triton before enabling the sampler toggle."
         )
     if status.get("cuda_available") and not status.get("runtime_compatible"):
+        compatibility = {
+            "sage_v1": bool(status.get("sage_v1_compatible")),
+            "triton_3_1_or_3_2": bool(status.get("triton_compatible")),
+            "all_gpus_sm75": bool(status.get("t4_architecture_compatible")),
+        }
         raise H3SageAttentionError(
             "SageAttention v1 is installed, but the current runtime is not "
             "T4-compatible: require sm75 plus Triton 3.1 or 3.2; "
             f"got architectures={status.get('gpu_architectures') or 'unknown'}, "
-            f"Triton={status.get('triton_version') or 'unknown'}."
+            f"Triton={status.get('triton_version') or 'unknown'}, "
+            f"SageAttention={status.get('version') or 'unknown'}, "
+            f"checks={compatibility}."
         )
     if not status.get("supports_h3_packed_containers"):
         raise H3SageAttentionError(
